@@ -18,6 +18,8 @@ from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
 from nanoresearch.schemas.manifest import PipelineStage
 from nanoresearch.schemas.paper import PaperSkeleton, Section
 
+from nanoresearch.skill_prompts import WRITING_SKILL
+
 logger = logging.getLogger(__name__)
 
 # Configurable limits
@@ -26,6 +28,8 @@ MAX_LATEX_FIX_ATTEMPTS = 3
 
 SECTION_SYSTEM_PROMPT = """You are a senior researcher writing for a top-tier venue (NeurIPS, ICML, ACL, CVPR).
 Write in formal academic English. Use LaTeX formatting for math equations.
+
+""" + WRITING_SKILL + """
 You MUST use the EXACT citation keys provided in the reference list below.
 Do NOT invent citation keys. Only use keys from the provided list.
 Output ONLY the section content as plain LaTeX paragraphs (no \\section command, no JSON wrapping).
@@ -846,6 +850,13 @@ Instructions: {instructions}
 
 Research Context:
 {context}{prior_ctx}
+
+PROCESS (follow the two-stage approach from the system prompt):
+1. Mentally outline the key points, arguments, and citations for this section.
+2. Convert into flowing academic prose — every sentence connects logically to the next.
+   Use transitions (however, moreover, in contrast, subsequently).
+   Integrate citations naturally within sentences, not as disconnected lists.
+   NO bullet points in the output — only LaTeX paragraphs.
 
 IMPORTANT: Use ONLY the citation keys listed in the CITATION KEYS section above.
 For example, write \\cite{{dokholyan1998}} NOT \\cite{{1}} or \\cite{{XXXX}}.

@@ -24,22 +24,11 @@ MAX_LATEX_FIX_ATTEMPTS = 3  # compile-fix loop iterations
 MIN_SECTION_SCORE = 8  # Sections scoring below this get revised
 CONVERGENCE_THRESHOLD = 0.3  # Stop if avg score improves by less than this
 
-REVIEW_SYSTEM_PROMPT = """You are an expert academic paper reviewer for a top-tier venue (NeurIPS, ICML, CVPR, ACL).
+from nanoresearch.skill_prompts import REVIEW_SKILL
 
-Scoring rubric per section:
-  9-10: Publication-ready, minor polishing only
-  7-8:  Solid but has identifiable weaknesses
-  5-6:  Significant issues that need addressing
-  3-4:  Major rewrite needed
-  1-2:  Fundamentally flawed
+REVIEW_SYSTEM_PROMPT = f"""You are an expert academic paper reviewer for a top-tier venue (NeurIPS, ICML, CVPR, ACL).
 
-Evaluation criteria:
-- **Technical correctness**: Are claims supported? Are equations correct?
-- **Completeness**: Are all necessary details present (datasets, baselines, ablations)?
-- **Clarity**: Is the writing clear, precise, and well-organized?
-- **Citations**: Are key works cited? Are citation keys valid?
-- **Reproducibility**: Could someone reproduce the experiments from the description?
-- **Consistency**: Same notation and terminology across sections?
+{REVIEW_SKILL}
 
 Always respond in valid JSON format."""
 
@@ -460,6 +449,35 @@ class ReviewAgent(BaseResearchAgent):
             }
         return None
 
+    # Section → relevant ScholarEval dimensions for focused review
+    _SECTION_REVIEW_FOCUS: dict[str, str] = {
+        "Introduction": (
+            "Focus on: Problem Formulation (clarity, significance, novelty), "
+            "Literature context (are key works cited?), and Writing Quality (logical flow from "
+            "problem→gap→contribution)."
+        ),
+        "Related Work": (
+            "Focus on: Literature Review (comprehensive? thematic synthesis or study-by-study listing?), "
+            "Citations (seminal papers missing? balanced perspectives?), "
+            "and whether it clearly positions the proposed method vs. prior work."
+        ),
+        "Method": (
+            "Focus on: Methodology (rigor, reproducibility, appropriateness), "
+            "technical correctness (equations correct? notation consistent?), "
+            "and completeness (all components described? design choices justified?)."
+        ),
+        "Experiments": (
+            "Focus on: Data/Evidence (datasets appropriate? baselines sufficient?), "
+            "Analysis (ablations for each contribution? statistical rigor? error bars?), "
+            "Results (clear presentation? tables/figures well-designed?), "
+            "and cross-check: every contribution from Intro must have corresponding evidence here."
+        ),
+        "Conclusion": (
+            "Focus on: Writing Quality (concise summary? no over-claiming?), "
+            "limitations honestly acknowledged, and future directions are specific not generic."
+        ),
+    }
+
     async def _review_single_section(
         self,
         heading: str,
@@ -469,6 +487,13 @@ class ReviewAgent(BaseResearchAgent):
         review_config: Any,
     ) -> SectionReview:
         """Review a single section of the paper."""
+        # Pick section-specific review focus
+        focus = ""
+        for key, guidance in self._SECTION_REVIEW_FOCUS.items():
+            if key.lower() in heading.lower():
+                focus = f"\n\nSECTION-SPECIFIC FOCUS:\n{guidance}"
+                break
+
         prompt = f"""Review the following section of an academic paper:
 
 Section: {heading}
@@ -481,17 +506,18 @@ Research context:
 - Topic: {str(ideation_output.get('topic', 'Unknown'))[:500]}
 - Hypothesis: {str(ideation_output.get('selected_hypothesis', 'Unknown'))[:500]}
 - Method: {str((experiment_blueprint.get('proposed_method') or {}).get('name', 'Unknown'))[:500]}
+{focus}
 
 Provide:
-1. A quality score (1-10) using the rubric
-2. Up to 5 specific issues (be concrete)
-3. Up to 3 actionable suggestions
+1. A quality score (1-10) using the ScholarEval rubric in the system prompt
+2. Up to 5 specific issues — each must state: what is wrong, why it matters, and how to fix it
+3. Up to 3 actionable suggestions for improvement
 
 Return JSON:
 {{
     "section": "{heading}",
     "score": 7,
-    "issues": ["Issue 1"],
+    "issues": ["Issue 1: [problem]. This matters because [impact]. Fix: [specific action]."],
     "suggestions": ["Suggestion 1"]
 }}"""
 

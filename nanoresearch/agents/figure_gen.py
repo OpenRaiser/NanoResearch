@@ -322,6 +322,14 @@ SAVE:
 - The script must be fully self-contained (define data inline, no external files).
 - plt.close(fig) after saving to free memory.
 
+QUALITY CHECKLIST (verify before outputting):
+- All axes have descriptive labels WITH units ("Accuracy (%)", "Latency (ms)")
+- Error bars present when std is available (define SD/SEM in caption)
+- No title inside figure (LaTeX caption serves as title)
+- Redundant encoding: line styles + markers + colors for accessibility
+- Figure readable in grayscale (hatching patterns for bar charts)
+- Consistent color assignment: proposed method always COLORS[0]
+
 Output ONLY the Python code, no markdown fences, no explanation."""
 
 # Per-chart-type prompts: detailed academic-quality instructions for each chart type

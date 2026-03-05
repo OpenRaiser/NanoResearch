@@ -66,10 +66,14 @@ async def _get_github_search():
     return _github_search
 
 
-IDEATION_SYSTEM_PROMPT = """You are a research ideation assistant. Your task is to:
+from nanoresearch.skill_prompts import IDEATION_SKILL
+
+IDEATION_SYSTEM_PROMPT = f"""You are a research ideation assistant for top-tier AI venues. Your task is to:
 1. Generate effective search queries for the given research topic
 2. Analyze retrieved papers to identify research gaps
 3. Formulate novel hypotheses that address those gaps
+
+{IDEATION_SKILL}
 
 Always respond in valid JSON format matching the schema provided."""
 
