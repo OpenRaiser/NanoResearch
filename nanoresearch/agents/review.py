@@ -100,25 +100,27 @@ class ReviewAgent(BaseResearchAgent):
             low_sections = [
                 sr for sr in review.section_reviews if sr.score < MIN_SECTION_SCORE
             ]
-            # Include all consistency issues (regex + claim + figure) for loop control
-            all_consistency = review.consistency_issues
-            if not low_sections and not all_consistency:
+            # Only continue if there are sections to revise.
+            # Consistency issues alone cannot drive revision (no sections to modify),
+            # they are informational and included in the revision prompt.
+            if not low_sections:
                 break
 
             revision_round += 1
             # Clear per-round revised sections to avoid stale accumulation
             round_revised: dict[str, str] = {}
+            consistency = review.consistency_issues
             self.log(
                 f"Revision round {revision_round}: "
                 f"revising {len(low_sections)} sections, "
-                f"{len(consistency_issues)} consistency issues"
+                f"{len(consistency)} consistency issues"
             )
 
             for section_review in low_sections:
                 # Collect consistency issues relevant to this section
                 # Include issues without locations as potentially relevant to any section
                 section_consistency = [
-                    ci for ci in all_consistency
+                    ci for ci in consistency
                     if not getattr(ci, 'locations', []) or any(
                         section_review.section.lower() in loc.lower()
                         for loc in getattr(ci, 'locations', [])
@@ -149,35 +151,99 @@ class ReviewAgent(BaseResearchAgent):
 
             # Re-review revised sections with LLM
             re_review = await self._review_paper(current_tex, ideation_output, experiment_blueprint)
+
+            # Monotonic score guarantee: if a section's score decreased after
+            # revision, try meta-refine (diagnose + retry), then revert if still no good.
+            sections_to_meta_refine: list[tuple[SectionReview, SectionReview, str]] = []
             for new_sr in re_review.section_reviews:
                 for old_sr in review.section_reviews:
-                    if old_sr.section == new_sr.section:
+                    if old_sr.section != new_sr.section:
+                        continue
+
+                    if new_sr.score < old_sr.score:
+                        # Score decreased — queue for meta-refine
+                        failed_text = round_revised.get(old_sr.section, "")
+                        if failed_text:
+                            sections_to_meta_refine.append((old_sr, new_sr, failed_text))
+                        else:
+                            # No revision text to analyze, just revert
+                            logger.warning(
+                                "Score regression: '%s' %d → %d, reverting",
+                                old_sr.section, old_sr.score, new_sr.score,
+                            )
+                    else:
+                        # Score maintained or improved — accept new review
                         old_sr.score = new_sr.score
                         old_sr.issues = new_sr.issues
                         old_sr.suggestions = new_sr.suggestions
-                        break
+                        if hasattr(new_sr, '_strengths'):
+                            old_sr._strengths = new_sr._strengths  # type: ignore[attr-defined]
+                    break
 
-            # Validate review coherence: flag score-vs-issues mismatches
-            for sr in review.section_reviews:
-                if sr.score >= 8 and len(sr.issues) > 3:
-                    logger.warning(
-                        "Review coherence: %s scored %d but has %d issues",
-                        sr.section, sr.score, len(sr.issues),
+            # Meta-refine: diagnose failed revisions, retry with improved prompt
+            reverted_any = False
+            for old_sr, new_sr, failed_text in sections_to_meta_refine:
+                self.log(
+                    f"  '{old_sr.section}' score dropped {old_sr.score}→{new_sr.score}, "
+                    f"running meta-refine"
+                )
+                refined = await self._meta_refine_revision(
+                    current_tex, old_sr, new_sr, failed_text,
+                    ideation_output,
+                )
+                if refined:
+                    # Apply refined revision and re-score just this section
+                    test_tex = self._apply_revisions(
+                        paper_tex,
+                        {**review.revised_sections, old_sr.section: refined},
                     )
-                    sr.score = min(sr.score, 7)  # cap score if too many issues
-                elif sr.score < MIN_SECTION_SCORE and len(sr.issues) == 0:
-                    logger.warning(
-                        "Review coherence: %s scored %d but has 0 issues, injecting generic issues",
-                        sr.section, sr.score,
+                    sections_list = self._extract_sections(test_tex)
+                    section_content = self._get_full_section_content(
+                        sections_list, old_sr.section
                     )
-                    sr.issues = [
-                        f"Section '{sr.section}' scored {sr.score}/10. "
-                        "Improve clarity, depth, citations, and remove placeholder text."
-                    ]
-                    sr.suggestions = [
-                        "Rewrite with concrete data, proper references, and "
-                        "remove any 'results pending' or LLM artifact text."
-                    ]
+                    if section_content:
+                        review_config = self.config.for_stage("review")
+                        rescore = await self._review_single_section(
+                            old_sr.section, section_content,
+                            ideation_output, experiment_blueprint, review_config,
+                        )
+                        if rescore.score >= old_sr.score:
+                            # Meta-refine succeeded
+                            self.log(
+                                f"  '{old_sr.section}' meta-refine succeeded: "
+                                f"{old_sr.score}→{rescore.score}"
+                            )
+                            old_sr.score = rescore.score
+                            old_sr.issues = rescore.issues
+                            old_sr.suggestions = rescore.suggestions
+                            if hasattr(rescore, '_strengths'):
+                                old_sr._strengths = rescore._strengths  # type: ignore[attr-defined]
+                            round_revised[old_sr.section] = refined
+                            review.revised_sections[old_sr.section] = refined
+                            continue
+
+                # Meta-refine failed or not attempted — revert
+                self.log(
+                    f"  '{old_sr.section}' meta-refine failed, reverting to original"
+                )
+                if old_sr.section in round_revised:
+                    del round_revised[old_sr.section]
+                    review.revised_sections.pop(old_sr.section, None)
+                reverted_any = True
+
+            # If we reverted any sections, re-apply revisions from scratch
+            if reverted_any:
+                current_tex = self._apply_revisions(paper_tex, review.revised_sections)
+                review.consistency_issues = self._run_consistency_checks(current_tex)
+                review.consistency_issues.extend(
+                    self._check_claim_result_consistency(current_tex, experiment_blueprint)
+                )
+                review.consistency_issues.extend(
+                    self._check_figure_text_alignment(current_tex)
+                )
+            elif round_revised:
+                # All sections accepted (no reverts) — update current_tex
+                current_tex = self._apply_revisions(paper_tex, review.revised_sections)
 
             # Convergence check: stop if score barely improved or degraded
             new_avg = (
@@ -285,6 +351,31 @@ class ReviewAgent(BaseResearchAgent):
             content = tex[start:end].strip()
             sections.append((heading, content, level))
         return sections
+
+    @staticmethod
+    def _get_full_section_content(
+        sections: list[tuple[str, str, int]], heading: str
+    ) -> str:
+        """Get the full content of a top-level section including its subsections.
+
+        Merges subsection content back into the parent section so the reviewer
+        sees the complete section, not just the intro paragraph.
+        """
+        for i, (h, c, level) in enumerate(sections):
+            if h != heading:
+                continue
+            if level != 0:
+                return c  # Subsection — return as-is
+            # Merge all following subsections until the next level=0
+            merged = c
+            for j in range(i + 1, len(sections)):
+                if sections[j][2] == 0:
+                    break
+                sub_h, sub_c, sub_lvl = sections[j]
+                sub_prefix = "\\sub" * sub_lvl + "section"
+                merged += f"\n\n\\{sub_prefix}{{{sub_h}}}\n{sub_c}"
+            return merged
+        return ""
 
     async def _build_review_tools(self) -> ToolRegistry | None:
         """Build a ToolRegistry with search tools for reviewing.
@@ -450,16 +541,20 @@ class ReviewAgent(BaseResearchAgent):
         experiment_blueprint: dict,
         review_config: Any,
     ) -> SectionReview:
-        """Review a single section of the paper."""
+        """Review a single section of the paper.
+
+        Returns a SectionReview with detailed feedback including strengths
+        (to be preserved during revision) and structured issues.
+        """
         # Per-section specialized system prompt
         section_review_system = get_review_system_prompt(heading)
 
-        prompt = f"""Review the following section of an academic paper:
+        prompt = f"""Review the following section of an academic paper for a top-tier AI venue.
 
 Section: {heading}
 
 ```latex
-{content[:8000]}
+{content[:12000]}
 ```
 
 Research context:
@@ -467,16 +562,29 @@ Research context:
 - Hypothesis: {str(ideation_output.get('selected_hypothesis', 'Unknown'))[:500]}
 - Method: {str((experiment_blueprint.get('proposed_method') or {}).get('name', 'Unknown'))[:500]}
 
-Provide:
-1. A quality score (1-10) using the scoring rubric
-2. Up to 5 specific issues — each must state: what is wrong, why it matters, and how to fix it
-3. Up to 3 actionable suggestions for improvement
+Provide a thorough review with:
+1. **Score** (1-10): Use the rubric strictly. Justify your score.
+2. **Strengths** (up to 3): What this section does WELL — these must be PRESERVED during any revision.
+3. **Must-fix issues** (up to 5): Each must state: [PROBLEM] what is wrong → [IMPACT] why it matters → [FIX] specific action to take.
+4. **Optional suggestions** (up to 3): Nice-to-have improvements.
+
+IMPORTANT scoring guidelines:
+- 9-10: Publication-ready, only cosmetic tweaks needed
+- 7-8: Solid work with minor fixable issues
+- 5-6: Significant problems but recoverable
+- 3-4: Major rewrite needed
+- 1-2: Fundamentally flawed
+- Score should reflect SEVERITY, not just the NUMBER of issues
+  (1 critical flaw like missing experiments > 5 minor typos)
+- Justify your score — explain which specific issues drive it down
 
 Return JSON:
 {{
     "section": "{heading}",
     "score": 7,
-    "issues": ["Issue 1: [problem]. This matters because [impact]. Fix: [specific action]."],
+    "score_justification": "Brief explanation of why this score",
+    "strengths": ["Strength 1: what is good and must be preserved"],
+    "issues": ["Issue 1: [PROBLEM] ... [IMPACT] ... [FIX] ..."],
     "suggestions": ["Suggestion 1"]
 }}"""
 
@@ -501,12 +609,49 @@ Return JSON:
             score = int(float(raw_score))
         except (TypeError, ValueError):
             score = 5
-        return SectionReview(
+
+        # Coerce issues/strengths to list[str] — LLM may return list[dict]
+        raw_issues = result.get("issues", [])[:5]
+        issues = []
+        for item in raw_issues:
+            if isinstance(item, str):
+                issues.append(item)
+            elif isinstance(item, dict):
+                # Flatten dict like {"issue": "...", "impact": "...", "fix": "..."}
+                parts = [f"[{k.upper()}] {v}" for k, v in item.items() if v]
+                issues.append(" → ".join(parts) if parts else str(item))
+            else:
+                issues.append(str(item))
+
+        raw_strengths = result.get("strengths", [])[:3]
+        strengths = [s if isinstance(s, str) else str(s) for s in raw_strengths]
+
+        # Coerce suggestions to list[str] — same dict issue as issues
+        raw_suggestions = result.get("suggestions", [])[:3]
+        suggestions = []
+        for item in raw_suggestions:
+            if isinstance(item, str):
+                suggestions.append(item)
+            elif isinstance(item, dict):
+                parts = [f"[{k.upper()}] {v}" for k, v in item.items() if v]
+                suggestions.append(" → ".join(parts) if parts else str(item))
+            else:
+                suggestions.append(str(item))
+
+        # Only fix the one truly contradictory case: zero issues but low score
+        if len(issues) == 0 and score < 7:
+            score = 7
+
+        sr = SectionReview(
             section=result.get("section", heading),
             score=max(1, min(10, score)),
-            issues=result.get("issues", [])[:5],
-            suggestions=result.get("suggestions", [])[:3],
+            issues=issues,
+            suggestions=suggestions,
         )
+        # Store strengths and justification as extra attributes for revision use
+        sr._strengths = strengths  # type: ignore[attr-defined]
+        sr._score_justification = result.get("score_justification", "")  # type: ignore[attr-defined]
+        return sr
 
     async def _review_paper(
         self,
@@ -518,10 +663,16 @@ Return JSON:
         sections = self._extract_sections(paper_tex)
         review_config = self.config.for_stage("review")
 
-        # Review only top-level sections (level=0), skip sub/subsub sections
-        main_sections = [
-            (h, c) for h, c, level in sections if level == 0
-        ]
+        # Build top-level sections with full content (including subsections).
+        # _extract_sections splits at every \section/\subsection boundary,
+        # so a \section{Method} followed by \subsection{...} would only contain
+        # the intro paragraph. We merge subsection content back into the parent.
+        main_sections: list[tuple[str, str]] = []
+        for h, _c, level in sections:
+            if level == 0:
+                merged = self._get_full_section_content(sections, h)
+                main_sections.append((h, merged))
+
         # If no main sections found, use all (capped at 10 to avoid runaway)
         if not main_sections:
             main_sections = [(h, c) for h, c, _lvl in sections[:10]]
@@ -570,7 +721,12 @@ Return JSON:
         ideation_output: dict,
         consistency_issues: list | None = None,
     ) -> str:
-        """Revise a single section based on reviewer feedback."""
+        """Revise a single section based on reviewer feedback.
+
+        Uses the WRITING-stage LLM (typically a strong generation model) rather
+        than the review-stage LLM, because revision is a generation task, not
+        an evaluation task.
+        """
         consistency_block = ""
         if consistency_issues:
             ci_texts = [
@@ -585,6 +741,16 @@ Return JSON:
         # Truncate issues/suggestions to avoid prompt overflow
         issues_json = json.dumps(section_review.issues[:10], indent=2)
         suggestions_json = json.dumps(section_review.suggestions[:10], indent=2)
+
+        # Extract strengths if available (set by _review_single_section)
+        strengths = getattr(section_review, '_strengths', [])
+        strengths_block = ""
+        if strengths:
+            strengths_json = json.dumps(strengths, indent=2)
+            strengths_block = (
+                f"\n\nStrengths to PRESERVE (do NOT change these aspects):\n{strengths_json}\n"
+                f"These were identified as good by the reviewer. Your revision must keep them intact."
+            )
 
         # Section-specific revision guidance
         section_guidance = self._get_section_revision_guidance(section_review.section)
@@ -604,14 +770,24 @@ Return JSON:
 
         prompt = f"""Revise the "{section_review.section}" section of this paper.
 
-Issues found:
+=== REVIEWER FEEDBACK ===
+Issues to FIX (mandatory):
 {issues_json}
 
-Suggestions:
-{suggestions_json}{consistency_block}
+Suggestions (optional improvements):
+{suggestions_json}{consistency_block}{strengths_block}
 
+=== REVISION GUIDELINES ===
 {section_guidance}
 {bib_keys}
+
+=== CRITICAL RULES ===
+1. Fix ALL listed issues — each one must be addressed
+2. PRESERVE all strengths identified by the reviewer
+3. Do NOT introduce new problems (vague claims, broken LaTeX, removed content)
+4. Do NOT remove or modify \\begin{{figure}}...\\end{{figure}} or \\begin{{table}}...\\end{{table}} blocks
+5. Keep the same overall structure and length (±20%)
+6. Use ONLY citation keys from the paper's bibliography
 
 Current paper (LaTeX):
 ```latex
@@ -621,18 +797,110 @@ Current paper (LaTeX):
 Research topic: {ideation_output.get('topic', '')}
 
 Write an improved version of the "{section_review.section}" section.
-Output ONLY the LaTeX content for this section (no \\section command, just the body text).
-IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begin{{table}}...\\end{{table}} blocks, you MUST preserve them in your output. Do NOT remove figures or tables."""
+Output ONLY the LaTeX content for this section (no \\section{{}} command, just the body text).
+If the section contains \\subsection{{}} commands, include them in your output."""
 
-        review_config = self.config.for_stage("review")
+        # Use REVISION-stage LLM — strong at generation + reasoning
+        revision_config = self.config.for_stage("revision")
         try:
             revised = await self.generate(
-                REVISION_SYSTEM_PROMPT, prompt, stage_override=review_config
+                REVISION_SYSTEM_PROMPT, prompt, stage_override=revision_config
             )
             return revised.strip()
         except Exception as e:
             logger.warning("Failed to revise section '%s': %s", section_review.section, e)
             return ""
+
+    async def _meta_refine_revision(
+        self,
+        paper_tex: str,
+        old_review: SectionReview,
+        new_review: SectionReview,
+        failed_revision: str,
+        ideation_output: dict,
+    ) -> str | None:
+        """Diagnose why a revision degraded quality, then retry with extra constraints.
+
+        This is the runtime prompt self-optimization loop:
+        1. LLM analyzes old review vs new review to find what the revision broke
+        2. Generates extra constraints to prevent the same mistakes
+        3. Retries revision with the augmented prompt
+        """
+        section_name = old_review.section
+        old_strengths = getattr(old_review, '_strengths', [])
+
+        # Step 1: Diagnose with review-stage LLM (cheap + fast)
+        diagnosis_prompt = f"""A revision of the "{section_name}" section made the paper WORSE.
+
+BEFORE revision (score {old_review.score}/10):
+- Strengths: {json.dumps(old_strengths, ensure_ascii=False)}
+- Issues: {json.dumps(old_review.issues[:5], ensure_ascii=False)}
+
+AFTER revision (score {new_review.score}/10):
+- New issues: {json.dumps(new_review.issues[:5], ensure_ascii=False)}
+
+Failed revision text (first 3000 chars):
+{failed_revision[:3000]}
+
+Analyze what the revision did WRONG. Common mistakes:
+- Removed specific data/numbers and replaced with vague language
+- Deleted citations or technical details
+- Introduced generic filler ("it is worth noting", "interestingly")
+- Broke LaTeX formatting or removed figures/tables
+- Over-simplified technical content
+- Changed notation inconsistently
+
+Return JSON:
+{{
+    "diagnosis": "What specifically went wrong with this revision",
+    "extra_constraints": [
+        "Constraint 1: Do NOT ...",
+        "Constraint 2: MUST keep ...",
+        "Constraint 3: ..."
+    ]
+}}"""
+
+        review_config = self.config.for_stage("review")
+        try:
+            result = await self.generate_json(
+                "You are a meta-reviewer analyzing why a paper revision failed. "
+                "Be specific about what went wrong and provide actionable constraints.",
+                diagnosis_prompt,
+                stage_override=review_config,
+            )
+        except Exception as exc:
+            logger.warning("Meta-refine diagnosis failed for '%s': %s", section_name, exc)
+            return None
+
+        diagnosis = result.get("diagnosis", "unknown")
+        extra_constraints = result.get("extra_constraints", [])
+        self.log(f"  '{section_name}' diagnosis: {diagnosis[:120]}")
+
+        if not extra_constraints:
+            return None
+
+        # Step 2: Retry revision with extra constraints appended
+        constraints_block = "\n".join(f"- {c}" for c in extra_constraints[:5])
+        augmented_review = SectionReview(
+            section=old_review.section,
+            score=old_review.score,
+            issues=old_review.issues,
+            suggestions=old_review.suggestions + [
+                f"[META-REFINE] Previous revision failed because: {diagnosis}. "
+                f"Extra constraints:\n{constraints_block}"
+            ],
+        )
+        # Carry over strengths
+        augmented_review._strengths = old_strengths  # type: ignore[attr-defined]
+
+        self.log(f"  '{section_name}' retrying revision with {len(extra_constraints)} extra constraints")
+        try:
+            return await self._revise_section(
+                paper_tex, augmented_review, ideation_output,
+            )
+        except Exception as exc:
+            logger.warning("Meta-refine retry failed for '%s': %s", section_name, exc)
+            return None
 
     @staticmethod
     def _get_section_revision_guidance(section_name: str) -> str:
@@ -998,146 +1266,156 @@ IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begi
         return result
 
     async def _fix_latex_errors(self, tex_source: str, error_log: str) -> str | None:
-        """Ask the LLM to fix LaTeX compilation errors with root-cause analysis.
+        """Fix LaTeX compilation errors using surgical line-level replacement.
 
-        Feeds the compilation error + LaTeX source to the LLM, gets back
-        the corrected full LaTeX document.
+        Instead of asking the LLM to return the entire document, we:
+        1. Extract the error line number from the error log
+        2. Send only ±10 lines around the error to the LLM
+        3. LLM returns ONLY the fixed lines
+        4. We splice them back into the original document
+
+        Falls back to full-document mode only when no line number is found.
         """
-        # Truncate very long error logs to fit in context
         if len(error_log) > 3000:
             error_log = error_log[:1500] + "\n...[truncated]...\n" + error_log[-1500:]
 
-        # Root-cause analysis: classify the error type for targeted fix
-        error_lower = error_log.lower()
-        targeted_guidance = ""
-        if "missing \\begin{document}" in error_lower or "missing begin{document}" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: The LaTeX file is missing or has a corrupted preamble. "
-                "This usually means non-LaTeX content (e.g., HTML comments, XML tags, "
-                "meta-commentary text) appears BEFORE \\begin{document}. "
-                "FIX: Ensure the file starts with \\documentclass and that NOTHING except "
-                "valid LaTeX preamble commands appears before \\begin{document}.\n"
-            )
-        elif "undefined control sequence" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: An undefined LaTeX command is used. "
-                "FIX: Check for typos in command names, ensure required packages are loaded, "
-                "or replace with standard alternatives.\n"
-            )
-        elif "mismatched" in error_lower or "begin" in error_lower and "end" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: Mismatched \\begin/\\end environments. "
-                "FIX: Ensure every \\begin{X} has a matching \\end{X}. Check for nested "
-                "environments that are not properly closed.\n"
-            )
-        elif "unicode" in error_lower or "utf" in error_lower or "character" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: Unicode characters that LaTeX cannot handle. "
-                "FIX: Replace em-dash (\u2014) with ---, en-dash (\u2013) with --, "
-                "smart quotes with standard quotes, Greek letters with \\alpha etc.\n"
-            )
-
-        system = (
-            "You are a LaTeX expert. Fix the compilation errors in the given LaTeX source.\n"
-            "Return the COMPLETE fixed LaTeX document. Do NOT omit any sections.\n"
-            "Do NOT wrap in markdown fences. Output ONLY the LaTeX source.\n"
-            "The output must start with \\documentclass and end with \\end{document}.\n"
-            "Do NOT include any HTML comments, XML tags, or non-LaTeX content.\n\n"
-            "Common fixes:\n"
-            "- Replace Unicode characters (em-dash, en-dash, smart quotes, Greek letters) "
-            "with LaTeX commands\n"
-            "- Fix unescaped special characters: % # & _ $ { }\n"
-            "- Fix mismatched \\begin/\\end environments\n"
-            "- Fix malformed table/tabular environments\n"
-            "- Remove or replace unsupported packages\n"
-            "- Add missing packages (e.g. \\usepackage{bm} for \\bm command)\n"
-            "- Fix \\includegraphics paths\n"
-            "- Fix malformed \\cite, \\ref, \\label commands\n\n"
-            "Overfull hbox fixes:\n"
-            "- Tables: add \\small, \\setlength{\\tabcolsep}{4pt}, @{} in column spec, "
-            "or wrap in \\resizebox{\\textwidth}{!}{...}\n"
-            "- Long inline math: break into \\begin{align} or \\begin{multline}\n"
-            "- Long text: rewrite the sentence shorter or add \\linebreak"
-        )
-
-        # Smart truncation: extract error line and send a focused window
-        # This avoids sending the entire 60KB+ document and expecting 60KB+ back
+        # Extract error line number
         error_line = None
         line_match = re.search(r'(?:line\s+|l\.)(\d+)', error_log)
         if line_match:
             error_line = int(line_match.group(1))
 
         tex_lines = tex_source.split('\n')
-        if error_line and len(tex_source) > 30000:
-            # Convert to 0-indexed
-            err_idx = max(0, error_line - 1)
-            # Send preamble (first 50 lines) + window around error + last 30 lines
-            preamble_end = min(50, len(tex_lines))
-            window_start = max(0, err_idx - 30)
-            window_end = min(len(tex_lines), err_idx + 30)
-            # Ensure window_start <= window_end
-            if window_start < preamble_end and window_end > preamble_end:
-                window_start = preamble_end  # avoid overlapping preamble
-            elif window_end <= preamble_end:
-                # Error is in the preamble — just extend preamble to cover it
-                preamble_end = window_end
-                window_start = window_end  # no separate window needed
-            tail_start = max(window_end, len(tex_lines) - 30)
 
-            focused_lines = tex_lines[:preamble_end]
-            if window_start > preamble_end:
-                focused_lines.append(f"% ... [lines {preamble_end+1}-{window_start} omitted] ...")
-            focused_lines.extend(tex_lines[window_start:window_end])
-            if tail_start > window_end:
-                focused_lines.append(f"% ... [lines {window_end+1}-{tail_start} omitted] ...")
-            focused_lines.extend(tex_lines[tail_start:])
-            tex_for_prompt = '\n'.join(focused_lines)
+        # Classify error for targeted guidance
+        error_lower = error_log.lower()
+        targeted_hint = ""
+        if "invalid character" in error_lower or "unicode" in error_lower or "character" in error_lower:
+            targeted_hint = (
+                "Likely cause: Unicode characters (em-dash, en-dash, smart quotes, "
+                "non-ASCII). Replace with LaTeX equivalents: --- for em-dash, -- for "
+                "en-dash, standard quotes, \\alpha etc."
+            )
+        elif "undefined control sequence" in error_lower:
+            targeted_hint = "Likely cause: Typo in command name or missing \\usepackage."
+        elif "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
+            targeted_hint = "Likely cause: Mismatched \\begin/\\end environments."
+        elif "missing \\begin{document}" in error_lower:
+            targeted_hint = "Likely cause: Non-LaTeX content before \\begin{document}."
+
+        # ---- Surgical mode: line number known ----
+        if error_line and error_line <= len(tex_lines):
+            err_idx = error_line - 1  # 0-indexed
+            window_radius = 10
+            win_start = max(0, err_idx - window_radius)
+            win_end = min(len(tex_lines), err_idx + window_radius + 1)
+            snippet_lines = tex_lines[win_start:win_end]
+
+            # Number lines for clarity
+            numbered = "\n".join(
+                f"{win_start + i + 1:>5}: {line}"
+                for i, line in enumerate(snippet_lines)
+            )
+
+            system = (
+                "You are a LaTeX error fixer. You will receive a small snippet of "
+                "LaTeX lines around an error. Fix ONLY the broken lines.\n\n"
+                "Rules:\n"
+                "- Return ONLY the fixed lines (same count as input, no line numbers)\n"
+                "- Do NOT add or remove lines — keep exactly the same number of lines\n"
+                "- Do NOT wrap in markdown fences\n"
+                "- Change as little as possible — only fix the error"
+            )
 
             prompt = (
-                f"The following LaTeX document failed to compile at line {error_line}.\n\n"
-                f"=== COMPILATION ERROR ===\n{error_log}\n=== END ERROR ===\n"
-                f"{targeted_guidance}\n"
-                f"I'm showing the preamble + a window around the error line + the end of the document.\n"
-                f"=== LATEX SOURCE (focused) ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
-                f"Fix the error and return the COMPLETE fixed LaTeX document.\n"
-                f"The document MUST start with \\documentclass and end with \\end{{document}}.\n"
-                f"For omitted sections, reproduce them exactly as they were."
+                f"LaTeX compilation error at line {error_line}:\n"
+                f"{error_log}\n\n"
+                f"{targeted_hint}\n\n"
+                f"Lines {win_start + 1}-{win_end} of the document:\n"
+                f"{numbered}\n\n"
+                f"Return the fixed version of these {len(snippet_lines)} lines. "
+                f"Output EXACTLY {len(snippet_lines)} lines, no more, no less."
+            )
+
+            revision_config = self.config.for_stage("revision")
+            try:
+                fixed_text = await self.generate(
+                    system, prompt, stage_override=revision_config
+                )
+                fixed_text = fixed_text.strip()
+                # Strip markdown fences
+                if fixed_text.startswith("```"):
+                    flines = fixed_text.split("\n")
+                    flines = flines[1:]
+                    if flines and flines[-1].strip().startswith("```"):
+                        flines = flines[:-1]
+                    fixed_text = "\n".join(flines)
+                # Strip any line number prefixes the LLM might add
+                fixed_lines = fixed_text.split('\n')
+                cleaned = []
+                for fl in fixed_lines:
+                    stripped = re.sub(r'^\s*\d+\s*:\s?', '', fl)
+                    cleaned.append(stripped)
+                fixed_lines = cleaned
+
+                # Validate: should be roughly same line count
+                if abs(len(fixed_lines) - len(snippet_lines)) <= 2:
+                    # Splice back
+                    new_lines = tex_lines[:win_start] + fixed_lines + tex_lines[win_end:]
+                    result = '\n'.join(new_lines)
+                    self.log(
+                        f"  Surgical fix: replaced lines {win_start+1}-{win_end} "
+                        f"({len(snippet_lines)}→{len(fixed_lines)} lines)"
+                    )
+                    return result
+                else:
+                    self.log(
+                        f"  Surgical fix line count mismatch: "
+                        f"expected ~{len(snippet_lines)}, got {len(fixed_lines)}, "
+                        f"falling back to full-document mode"
+                    )
+            except Exception as exc:
+                self.log(f"  Surgical fix failed: {exc}, falling back")
+
+        # ---- Fallback: no line number or surgical fix failed ----
+        # Send a compact snippet (preamble + end) and ask for full doc
+        if len(tex_source) > 40000:
+            tex_for_prompt = (
+                '\n'.join(tex_lines[:80])
+                + "\n% ... [middle omitted] ...\n"
+                + '\n'.join(tex_lines[-50:])
             )
         else:
-            # Fallback for short documents or no line number
-            if len(tex_source) > 50000:
-                tex_source = tex_source[:25000] + "\n...[truncated]...\n" + tex_source[-25000:]
-            prompt = (
-                f"The following LaTeX document failed to compile.\n\n"
-                f"=== COMPILATION ERROR ===\n{error_log}\n=== END ERROR ===\n"
-                f"{targeted_guidance}\n"
-                f"=== LATEX SOURCE ===\n{tex_source}\n=== END SOURCE ===\n\n"
-                f"Fix ALL errors and return the complete corrected LaTeX document.\n"
-                f"The document MUST start with \\documentclass and end with \\end{{document}}."
-            )
+            tex_for_prompt = tex_source
 
-        review_config = self.config.for_stage("review")
+        system = (
+            "You are a LaTeX expert. Fix the compilation errors.\n"
+            "Return the COMPLETE fixed LaTeX document.\n"
+            "Do NOT wrap in markdown fences. Output ONLY LaTeX source.\n"
+            "Must start with \\documentclass and end with \\end{document}."
+        )
+        prompt = (
+            f"=== ERROR ===\n{error_log}\n=== END ERROR ===\n"
+            f"{targeted_hint}\n\n"
+            f"=== LATEX SOURCE ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
+            f"Fix the error and return the complete document."
+        )
+
+        revision_config = self.config.for_stage("revision")
         try:
             fixed = await self.generate(
-                system, prompt, stage_override=review_config
+                system, prompt, stage_override=revision_config
             )
-            # Strip markdown fences if present
             fixed = fixed.strip()
             if fixed.startswith("```"):
-                lines = fixed.split("\n")
-                lines = lines[1:]
+                lines = fixed.split("\n")[1:]
                 if lines and lines[-1].strip().startswith("```"):
                     lines = lines[:-1]
                 fixed = "\n".join(lines)
-            # Strip any leading non-LaTeX content (meta-commentary, HTML, etc.)
             if "\\documentclass" in fixed:
                 idx = fixed.index("\\documentclass")
                 if idx > 0:
-                    discarded = fixed[:idx].strip()
-                    if discarded:
-                        self.log(f"  Stripping {len(discarded)} chars of non-LaTeX preamble")
                     fixed = fixed[idx:]
-            # Sanity check: must contain \documentclass
             if "\\documentclass" not in fixed:
                 self.log("  LLM fix missing \\documentclass, discarding")
                 return None
@@ -1166,11 +1444,37 @@ IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begi
             body_start = 0
 
         for heading, new_content in revised_sections.items():
-            pattern = (
-                r"(\\(?:sub){0,2}section\*?\{" + re.escape(heading) + r"\})"
-                r"(.*?)"
-                r"(?=\\(?:sub){0,2}section\*?\{|\\end\{document\}|\\bibliography)"
+            # Determine the level of the section being revised
+            # by finding its command in the document
+            esc_heading = re.escape(heading)
+            heading_match = re.search(
+                r"\\((?:sub){0,2})section\*?\{" + esc_heading + r"\}",
+                result[body_start:],
             )
+            if not heading_match:
+                logger.warning(
+                    "Cannot find section '%s' in paper — revision discarded", heading
+                )
+                continue
+
+            section_level = heading_match.group(1).count("sub")
+
+            # For top-level sections (\section{}), match everything up to the
+            # next \section{} (same level), \end{document}, or \bibliography.
+            # This includes all subsections within it.
+            if section_level == 0:
+                pattern = (
+                    r"(\\section\*?\{" + esc_heading + r"\})"
+                    r"(.*?)"
+                    r"(?=\\section\*?\{|\\end\{document\}|\\bibliography)"
+                )
+            else:
+                # For subsections, match up to the next same-or-higher-level section
+                pattern = (
+                    r"(\\(?:sub){0,2}section\*?\{" + esc_heading + r"\})"
+                    r"(.*?)"
+                    r"(?=\\(?:sub){0,2}section\*?\{|\\end\{document\}|\\bibliography)"
+                )
             match = re.search(pattern, result[body_start:], re.DOTALL)
             if not match:
                 logger.warning(

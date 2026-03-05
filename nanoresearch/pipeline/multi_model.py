@@ -80,16 +80,24 @@ class ModelDispatcher:
         timeout = config.timeout or self._config.timeout
         client = self._get_client(timeout)
 
+        _m = config.model.lower()
+        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+
         kwargs: dict[str, Any] = {
             "model": config.model,
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": config.max_tokens,
         }
-        # Some models (Codex, o-series) don't support temperature
-        if config.temperature is not None:
+        if is_thinking:
+            # Thinking models: use max_completion_tokens so thinking budget
+            # is separate from visible output (supported by most proxies)
+            kwargs["max_completion_tokens"] = config.max_tokens
+        else:
+            kwargs["max_tokens"] = config.max_tokens
+        # Some models (Codex, o-series, thinking) don't support temperature
+        if config.temperature is not None and not is_thinking:
             kwargs["temperature"] = config.temperature
         if json_mode:
             kwargs["response_format"] = {"type": "json_object"}
@@ -114,6 +122,11 @@ class ModelDispatcher:
                 return content
             except Exception as exc:
                 last_exc = exc
+                # Fallback: if proxy rejects max_completion_tokens, switch to max_tokens
+                if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
+                    logger.info("Proxy doesn't support max_completion_tokens, falling back to max_tokens")
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
                     logger.warning(
@@ -149,12 +162,18 @@ class ModelDispatcher:
         timeout = config.timeout or self._config.timeout
         client = self._get_client(timeout)
 
+        _m = config.model.lower()
+        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+
         kwargs: dict[str, Any] = {
             "model": config.model,
             "messages": messages,
-            "max_tokens": config.max_tokens,
         }
-        if config.temperature is not None:
+        if is_thinking:
+            kwargs["max_completion_tokens"] = config.max_tokens
+        else:
+            kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None and not is_thinking:
             kwargs["temperature"] = config.temperature
         if tools:
             kwargs["tools"] = tools
@@ -179,6 +198,10 @@ class ModelDispatcher:
                 return response.choices[0].message
             except Exception as exc:
                 last_exc = exc
+                if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
+                    logger.info("Proxy doesn't support max_completion_tokens, falling back to max_tokens")
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
                     logger.warning(
@@ -275,10 +298,6 @@ class ModelDispatcher:
             ],
             "generationConfig": {
                 "responseModalities": ["TEXT", "IMAGE"],
-                "imageConfig": {
-                    "aspectRatio": config.aspect_ratio,
-                    "imageSize": config.image_size,
-                },
             },
         }
 

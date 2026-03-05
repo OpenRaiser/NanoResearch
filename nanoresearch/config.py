@@ -94,7 +94,15 @@ class ResearchConfig(BaseModel):
     )
     review: StageModelConfig = Field(
         default_factory=lambda: StageModelConfig(
-            model="deepseek-ai/DeepSeek-V3.2",
+            model="gemini-3.1-flash-lite-preview",
+            temperature=0.3,
+            max_tokens=16384,
+            timeout=300.0,
+        )
+    )
+    revision: StageModelConfig = Field(
+        default_factory=lambda: StageModelConfig(
+            model="gemini-3-pro-preview-thinking",
             temperature=0.3,
             max_tokens=16384,
             timeout=600.0,
@@ -179,6 +187,7 @@ class ResearchConfig(BaseModel):
             "figure_gen": self.figure_gen,
             "evidence_extraction": self.evidence_extraction,
             "review": self.review,
+            "revision": self.revision,
         }
         if stage_name not in mapping:
             raise ValueError(f"Unknown stage: {stage_name}. Valid: {list(mapping)}")

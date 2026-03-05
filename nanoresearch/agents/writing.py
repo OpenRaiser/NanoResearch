@@ -1136,135 +1136,149 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         return result  # pragma: no cover
 
     async def _fix_latex_errors(self, tex_source: str, error_log: str) -> str | None:
-        """Ask the LLM to fix LaTeX compilation errors with root-cause analysis."""
-        # Truncate very long error logs to fit in context
+        """Fix LaTeX compilation errors using surgical line-level replacement.
+
+        Instead of asking the LLM to return the entire document, we:
+        1. Extract the error line number from the error log
+        2. Send only ±10 lines around the error to the LLM
+        3. LLM returns ONLY the fixed lines
+        4. We splice them back into the original document
+
+        Falls back to full-document mode only when no line number is found.
+        """
         if len(error_log) > 3000:
             error_log = error_log[:1500] + "\n...[truncated]...\n" + error_log[-1500:]
 
-        # Root-cause analysis: classify the error type for targeted fix
-        error_lower = error_log.lower()
-        targeted_guidance = ""
-        if "missing \\begin{document}" in error_lower or "missing begin{document}" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: The LaTeX file is missing or has a corrupted preamble. "
-                "This usually means non-LaTeX content (e.g., HTML comments, XML tags, "
-                "meta-commentary text) appears BEFORE \\begin{document}. "
-                "FIX: Ensure the file starts with \\documentclass and that NOTHING except "
-                "valid LaTeX preamble commands appears before \\begin{document}.\n"
-            )
-        elif "undefined control sequence" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: An undefined LaTeX command is used. "
-                "FIX: Check for typos in command names, ensure required packages are loaded, "
-                "or replace with standard alternatives.\n"
-            )
-        elif "mismatched" in error_lower or "begin" in error_lower and "end" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: Mismatched \\begin/\\end environments. "
-                "FIX: Ensure every \\begin{X} has a matching \\end{X}. Check for nested "
-                "environments that are not properly closed.\n"
-            )
-        elif "unicode" in error_lower or "utf" in error_lower or "character" in error_lower:
-            targeted_guidance = (
-                "\nDIAGNOSIS: Unicode characters that LaTeX cannot handle. "
-                "FIX: Replace em-dash (—) with ---, en-dash (–) with --, "
-                "smart quotes with standard quotes, Greek letters with \\alpha etc.\n"
-            )
-
-        system = (
-            "You are a LaTeX expert. Fix the compilation errors in the given LaTeX source.\n"
-            "Return the COMPLETE fixed LaTeX document. Do NOT omit any sections.\n"
-            "Do NOT wrap in markdown fences. Output ONLY the LaTeX source.\n"
-            "The output must start with \\documentclass and end with \\end{document}.\n"
-            "Do NOT include any HTML comments, XML tags, or non-LaTeX content.\n\n"
-            "Common fixes:\n"
-            "- Replace Unicode characters (em-dash, en-dash, smart quotes, Greek letters) "
-            "with LaTeX commands\n"
-            "- Fix unescaped special characters: % # & _ $ { }\n"
-            "- Fix mismatched \\begin/\\end environments\n"
-            "- Fix malformed table/tabular environments\n"
-            "- Remove or replace unsupported packages\n"
-            "- Fix \\includegraphics paths\n"
-            "- Fix malformed \\cite, \\ref, \\label commands\n\n"
-            "Overfull hbox fixes:\n"
-            "- Tables: add \\small, \\setlength{\\tabcolsep}{4pt}, @{} in column spec, "
-            "or wrap in \\resizebox{\\textwidth}{!}{...}\n"
-            "- Long inline math: break into \\begin{align} or \\begin{multline}\n"
-            "- Long text: rewrite the sentence shorter or add \\linebreak"
-        )
-
-        # Smart truncation: extract error line and send a focused window
+        # Extract error line number
         error_line = None
         line_match = re.search(r'(?:line\s+|l\.)(\d+)', error_log)
         if line_match:
             error_line = int(line_match.group(1))
 
         tex_lines = tex_source.split('\n')
-        if error_line and len(tex_source) > 30000:
-            # Convert to 0-indexed
-            err_idx = max(0, error_line - 1)
-            preamble_end = min(50, len(tex_lines))
-            window_start = max(0, err_idx - 30)
-            window_end = min(len(tex_lines), err_idx + 30)
-            # Ensure window_start <= window_end
-            if window_start < preamble_end and window_end > preamble_end:
-                window_start = preamble_end  # avoid overlapping preamble
-            elif window_end <= preamble_end:
-                # Error is in the preamble — just extend preamble to cover it
-                preamble_end = window_end
-                window_start = window_end  # no separate window needed
-            tail_start = max(window_end, len(tex_lines) - 30)
 
-            focused_lines = tex_lines[:preamble_end]
-            if window_start > preamble_end:
-                focused_lines.append(f"% ... [lines {preamble_end+1}-{window_start} omitted] ...")
-            focused_lines.extend(tex_lines[window_start:window_end])
-            if tail_start > window_end:
-                focused_lines.append(f"% ... [lines {window_end+1}-{tail_start} omitted] ...")
-            focused_lines.extend(tex_lines[tail_start:])
-            tex_for_prompt = '\n'.join(focused_lines)
+        # Classify error for targeted guidance
+        error_lower = error_log.lower()
+        targeted_hint = ""
+        if "invalid character" in error_lower or "unicode" in error_lower or "character" in error_lower:
+            targeted_hint = (
+                "Likely cause: Unicode characters (em-dash, en-dash, smart quotes, "
+                "non-ASCII). Replace with LaTeX equivalents: --- for em-dash, -- for "
+                "en-dash, standard quotes, \\alpha etc."
+            )
+        elif "undefined control sequence" in error_lower:
+            targeted_hint = "Likely cause: Typo in command name or missing \\usepackage."
+        elif "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
+            targeted_hint = "Likely cause: Mismatched \\begin/\\end environments."
+        elif "missing \\begin{document}" in error_lower:
+            targeted_hint = "Likely cause: Non-LaTeX content before \\begin{document}."
+
+        # ---- Surgical mode: line number known ----
+        if error_line and error_line <= len(tex_lines):
+            err_idx = error_line - 1  # 0-indexed
+            window_radius = 10
+            win_start = max(0, err_idx - window_radius)
+            win_end = min(len(tex_lines), err_idx + window_radius + 1)
+            snippet_lines = tex_lines[win_start:win_end]
+
+            # Number lines for clarity
+            numbered = "\n".join(
+                f"{win_start + i + 1:>5}: {line}"
+                for i, line in enumerate(snippet_lines)
+            )
+
+            system = (
+                "You are a LaTeX error fixer. You will receive a small snippet of "
+                "LaTeX lines around an error. Fix ONLY the broken lines.\n\n"
+                "Rules:\n"
+                "- Return ONLY the fixed lines (same count as input, no line numbers)\n"
+                "- Do NOT add or remove lines — keep exactly the same number of lines\n"
+                "- Do NOT wrap in markdown fences\n"
+                "- Change as little as possible — only fix the error"
+            )
 
             prompt = (
-                f"The following LaTeX document failed to compile at line {error_line}.\n\n"
-                f"=== COMPILATION ERROR ===\n{error_log}\n=== END ERROR ===\n"
-                f"{targeted_guidance}\n"
-                f"I'm showing the preamble + a window around the error line + the end.\n"
-                f"=== LATEX SOURCE (focused) ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
-                f"Fix the error and return the COMPLETE fixed LaTeX document.\n"
-                f"The document MUST start with \\documentclass and end with \\end{{document}}.\n"
-                f"For omitted sections, reproduce them exactly as they were."
+                f"LaTeX compilation error at line {error_line}:\n"
+                f"{error_log}\n\n"
+                f"{targeted_hint}\n\n"
+                f"Lines {win_start + 1}-{win_end} of the document:\n"
+                f"{numbered}\n\n"
+                f"Return the fixed version of these {len(snippet_lines)} lines. "
+                f"Output EXACTLY {len(snippet_lines)} lines, no more, no less."
+            )
+
+            try:
+                fixed_text = await self.generate(system, prompt)
+                fixed_text = fixed_text.strip()
+                # Strip markdown fences
+                if fixed_text.startswith("```"):
+                    flines = fixed_text.split("\n")
+                    flines = flines[1:]
+                    if flines and flines[-1].strip().startswith("```"):
+                        flines = flines[:-1]
+                    fixed_text = "\n".join(flines)
+                # Strip any line number prefixes the LLM might add
+                fixed_lines = fixed_text.split('\n')
+                cleaned = []
+                for fl in fixed_lines:
+                    stripped = re.sub(r'^\s*\d+\s*:\s?', '', fl)
+                    cleaned.append(stripped)
+                fixed_lines = cleaned
+
+                # Validate: should be roughly same line count
+                if abs(len(fixed_lines) - len(snippet_lines)) <= 2:
+                    # Splice back
+                    new_lines = tex_lines[:win_start] + fixed_lines + tex_lines[win_end:]
+                    result = '\n'.join(new_lines)
+                    self.log(
+                        f"  Surgical fix: replaced lines {win_start+1}-{win_end} "
+                        f"({len(snippet_lines)}→{len(fixed_lines)} lines)"
+                    )
+                    return result
+                else:
+                    self.log(
+                        f"  Surgical fix line count mismatch: "
+                        f"expected ~{len(snippet_lines)}, got {len(fixed_lines)}, "
+                        f"falling back to full-document mode"
+                    )
+            except Exception as exc:
+                self.log(f"  Surgical fix failed: {exc}, falling back")
+
+        # ---- Fallback: no line number or surgical fix failed ----
+        if len(tex_source) > 40000:
+            tex_for_prompt = (
+                '\n'.join(tex_lines[:80])
+                + "\n% ... [middle omitted] ...\n"
+                + '\n'.join(tex_lines[-50:])
             )
         else:
-            if len(tex_source) > 50000:
-                tex_source = tex_source[:25000] + "\n...[truncated]...\n" + tex_source[-25000:]
-            prompt = (
-                f"The following LaTeX document failed to compile.\n\n"
-                f"=== COMPILATION ERROR ===\n{error_log}\n=== END ERROR ===\n"
-                f"{targeted_guidance}\n"
-                f"=== LATEX SOURCE ===\n{tex_source}\n=== END SOURCE ===\n\n"
-                f"Fix ALL errors and return the complete corrected LaTeX document.\n"
-                f"The document MUST start with \\documentclass and end with \\end{{document}}."
-            )
+            tex_for_prompt = tex_source
+
+        system = (
+            "You are a LaTeX expert. Fix the compilation errors.\n"
+            "Return the COMPLETE fixed LaTeX document.\n"
+            "Do NOT wrap in markdown fences. Output ONLY LaTeX source.\n"
+            "Must start with \\documentclass and end with \\end{document}."
+        )
+        prompt = (
+            f"=== ERROR ===\n{error_log}\n=== END ERROR ===\n"
+            f"{targeted_hint}\n\n"
+            f"=== LATEX SOURCE ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
+            f"Fix the error and return the complete document."
+        )
 
         try:
             fixed = await self.generate(system, prompt)
-            # Strip markdown fences if present
             fixed = fixed.strip()
             if fixed.startswith("```"):
-                lines = fixed.split("\n")
-                lines = lines[1:]
+                lines = fixed.split("\n")[1:]
                 if lines and lines[-1].strip().startswith("```"):
                     lines = lines[:-1]
                 fixed = "\n".join(lines)
-            # Strip any leading non-LaTeX content (meta-commentary, HTML, etc.)
             if "\\documentclass" in fixed:
                 idx = fixed.index("\\documentclass")
                 if idx > 0:
-                    discarded = fixed[:idx].strip()
-                    if discarded:
-                        self.log(f"  Stripping {len(discarded)} chars of non-LaTeX preamble")
                     fixed = fixed[idx:]
-            # Sanity check: must contain \documentclass
             if "\\documentclass" not in fixed:
                 self.log("  LLM fix missing \\documentclass, discarding")
                 return None
@@ -1307,6 +1321,10 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         ]
         for pat in _LLM_ARTIFACT_PATTERNS:
             text = re.sub(pat, '', text, flags=re.IGNORECASE | re.MULTILINE)
+
+        # ── 0b. Strip control characters (U+0000–U+001F except \n \r \t) ──
+        # LLMs occasionally emit invisible control chars that crash tectonic
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
 
         # ── 1. Unicode replacements ──
         text = text.replace("\u2014", "---")  # em-dash

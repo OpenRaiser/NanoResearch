@@ -99,7 +99,7 @@ def _load_workspace_safe(path: Path) -> Workspace:
 @app.command()
 def run(
     topic: str = typer.Option(..., "--topic", "-t", help="Research topic"),
-    format: str = typer.Option("arxiv", "--format", "-f", help="Paper format (auto-discovered from templates directory)"),
+    format: str = typer.Option(None, "--format", "-f", help="Paper format (auto-discovered from templates directory)"),
     config_path: Path = typer.Option(None, "--config", "-c", help="Path to config file"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Validate config and exit without running"),
@@ -113,16 +113,16 @@ def run(
         raise typer.Exit(1)
     topic = topic.strip()
 
-    # Validate format
-    from nanoresearch.templates import get_available_formats
-
-    valid_formats = get_available_formats()
-    if format not in valid_formats:
-        console.print(f"[red]Error:[/red] --format must be one of {valid_formats}")
-        raise typer.Exit(1)
-
     config = _load_config_safe(config_path)
-    config.template_format = format
+
+    # Only override template_format if user explicitly passed --format
+    if format is not None:
+        from nanoresearch.templates import get_available_formats
+        valid_formats = get_available_formats()
+        if format not in valid_formats:
+            console.print(f"[red]Error:[/red] --format must be one of {valid_formats}")
+            raise typer.Exit(1)
+        config.template_format = format
 
     if dry_run:
         console.print(Panel(

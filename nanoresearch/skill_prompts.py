@@ -164,9 +164,18 @@ def get_writing_system_prompt(section_heading: str) -> str:
 # REVIEW — per-section system prompts
 # ═══════════════════════════════════════════════════════════════════════════════
 _REVIEW_SHARED = (
-    "\n\nSCORING: 9-10=publication-ready, 7-8=solid with fixable issues, "
-    "5-6=significant problems, 3-4=major rewrite, 1-2=fundamentally flawed.\n"
-    "Every issue MUST state: (a) what is wrong, (b) why it matters, (c) how to fix it.\n"
+    "\n\nSCORING RUBRIC (be consistent — score must match the issues you find):\n"
+    "  9-10 = Publication-ready: only cosmetic tweaks, no substantive issues\n"
+    "  7-8  = Solid: minor fixable issues, core content is strong\n"
+    "  5-6  = Significant problems: needs substantial revision but recoverable\n"
+    "  3-4  = Major rewrite: fundamental issues in structure or content\n"
+    "  1-2  = Fundamentally flawed: wrong approach or missing core content\n\n"
+    "CONSISTENCY RULES:\n"
+    "- Score reflects SEVERITY, not count: 1 critical flaw > 5 minor typos\n"
+    "- If you find zero issues, score MUST be >= 7\n"
+    "- Justify every score by referencing specific issues or strengths\n"
+    "- ALWAYS list strengths — what is good MUST be preserved during revision\n\n"
+    "Every issue MUST state: [PROBLEM] what is wrong → [IMPACT] why it matters → [FIX] specific action.\n"
     "Always respond in valid JSON."
 )
 
@@ -325,12 +334,19 @@ Output ONLY the abstract text."""
 # ═══════════════════════════════════════════════════════════════════════════════
 REVISION_SYSTEM = r"""You are an expert academic paper writer revising a section for a top-tier AI venue.
 
-Your revision must:
-- Fix ALL issues listed by the reviewer
+REVISION PRINCIPLES (in priority order):
+1. PRESERVE strengths: The reviewer identified what is GOOD — do NOT change those parts
+2. FIX issues: Address each listed issue with a concrete change
+3. DO NO HARM: Do NOT introduce new problems (vague claims, broken LaTeX, lost content)
+4. MINIMAL CHANGES: Change only what is needed to fix the issues, leave everything else intact
+
+RULES:
 - Maintain LaTeX formatting and notation consistency
 - Use \citet{} for subject citations, \citep{} for parenthetical
 - Be specific and quantitative — no vague claims
 - Use ONLY citation keys from the paper's bibliography
 - PRESERVE all \begin{figure}...\end{figure} and \begin{table}...\end{table} blocks
+- Keep the same overall length (±20%) — do not dramatically shorten or expand
+- Do NOT add placeholder text like "results pending", "to be updated", etc.
 
 Output ONLY the revised LaTeX content. No explanation, no markdown fences."""

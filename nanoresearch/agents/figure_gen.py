@@ -28,6 +28,8 @@ CHART_EXEC_TIMEOUT = 60  # seconds for subprocess chart execution
 MAX_IMAGE_PROMPT_LEN = 3800
 MAX_EVIDENCE_TRAINING_LOG_ENTRIES = 50  # cap training log in evidence block
 MAX_EVIDENCE_BLOCK_LEN = 8000  # cap total evidence block length
+MAX_IMAGE_RETRIES = 2  # retries before LLM diagnosis
+MAX_OPTIMIZED_PROMPT_LEN = 1500  # shorter prompt for retry after diagnosis
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -850,7 +852,12 @@ class FigureAgent(BaseResearchAgent):
                 figure_results[fig_key] = result
 
         self.log(f"Figure generation complete: {len(figure_results)} figures")
-        return {"figures": figure_results}
+
+        # Persist output so that resume can reload it
+        output = {"figures": figure_results}
+        self.workspace.write_json("drafts/figure_output.json", output)
+
+        return output
 
     # -----------------------------------------------------------------------
     # Figure planning
@@ -1367,7 +1374,11 @@ class FigureAgent(BaseResearchAgent):
         ai_image_type: str = "generic",
         caption: str = "",
     ) -> dict[str, Any]:
-        """Generate a single figure via AI image model (Gemini)."""
+        """Generate a single figure via AI image model (Gemini).
+
+        Flow: generate prompt → try Gemini (with retries) → if all fail,
+        LLM diagnoses error & optimizes prompt → retry → fallback to code chart.
+        """
         # Look up the template for this AI figure type
         template = AI_FIGURE_TEMPLATES.get(ai_image_type, AI_FIGURE_TEMPLATES["generic"])
 
@@ -1416,20 +1427,115 @@ class FigureAgent(BaseResearchAgent):
             f"figures/{filename_stem}_prompt.txt", image_prompt
         )
 
-        # Step 2: Generate image via Gemini
+        # Step 2: Generate image via Gemini with retry loop
         figure_gen_config = self.config.for_stage("figure_gen")
-        b64_images = await self._dispatcher.generate_image(
-            figure_gen_config, prompt=image_prompt,
+        last_error = ""
+
+        for attempt in range(MAX_IMAGE_RETRIES + 1):
+            try:
+                b64_images = await self._dispatcher.generate_image(
+                    figure_gen_config, prompt=image_prompt,
+                )
+                if b64_images:
+                    self.log(f"  {fig_key} image generated on attempt {attempt + 1}")
+                    return self._save_figure_files(
+                        fig_key, filename_stem,
+                        caption or description,
+                        base64.b64decode(b64_images[0]),
+                    )
+                last_error = "API returned no image data"
+            except Exception as exc:
+                last_error = str(exc)
+
+            self.log(f"  {fig_key} attempt {attempt + 1}/{MAX_IMAGE_RETRIES + 1} failed: {last_error}")
+
+        # Step 3: All retries failed — LLM diagnoses and optimizes the prompt
+        self.log(f"  {fig_key} all {MAX_IMAGE_RETRIES + 1} attempts failed, running LLM diagnosis")
+        optimized_prompt = await self._diagnose_and_optimize_prompt(
+            fig_key, image_prompt, last_error, description,
         )
 
-        if not b64_images:
-            self.log(f"  WARNING: No image generated for {fig_key}")
-            return {"prompt": image_prompt, "error": "No image returned"}
+        if optimized_prompt:
+            self.workspace.write_text(
+                f"figures/{filename_stem}_prompt_optimized.txt", optimized_prompt
+            )
+            # Step 4: Retry with optimized prompt (2 more attempts)
+            for opt_attempt in range(2):
+                try:
+                    b64_images = await self._dispatcher.generate_image(
+                        figure_gen_config, prompt=optimized_prompt,
+                    )
+                    if b64_images:
+                        self.log(f"  {fig_key} succeeded with optimized prompt (attempt {opt_attempt + 1})")
+                        return self._save_figure_files(
+                            fig_key, filename_stem,
+                            caption or description,
+                            base64.b64decode(b64_images[0]),
+                        )
+                except Exception as exc:
+                    self.log(f"  {fig_key} optimized attempt {opt_attempt + 1} failed: {exc}")
 
-        # Step 3: Save PNG + PDF (use caption if provided, else description)
-        return self._save_figure_files(fig_key, filename_stem,
-                                       caption or description,
-                                       base64.b64decode(b64_images[0]))
+        # Step 5: Final fallback — code-generated placeholder
+        self.log(f"  {fig_key} all AI generation attempts exhausted, using fallback")
+        return self._generate_fallback_chart(fig_key, filename_stem, caption or description)
+
+    async def _diagnose_and_optimize_prompt(
+        self,
+        fig_key: str,
+        original_prompt: str,
+        last_error: str,
+        figure_description: str,
+    ) -> str | None:
+        """Use LLM to diagnose why image generation failed and produce a shorter, optimized prompt."""
+        diagnosis_system = (
+            "You are an expert at debugging AI image generation failures. "
+            "Analyze the error and the original prompt, then produce an optimized "
+            "prompt that avoids the issue while preserving the figure's scientific content."
+        )
+        diagnosis_user = (
+            f"The Gemini image generation API failed for figure '{fig_key}'.\n\n"
+            f"Error: {last_error[:500]}\n\n"
+            f"Original prompt ({len(original_prompt)} characters):\n"
+            f"---\n{original_prompt[:3000]}\n---\n\n"
+            f"Figure purpose: {figure_description[:500]}\n\n"
+            f"Common failure causes:\n"
+            f"1. Prompt too long or complex (Gemini image gen works best with <1500 chars)\n"
+            f"2. Too many specific layout instructions (pixel sizes, hex colors, font specs)\n"
+            f"3. Requesting text rendering that the model can't do well\n"
+            f"4. Content that triggers safety filters\n\n"
+            f"Tasks:\n"
+            f"1. Diagnose the most likely cause of failure\n"
+            f"2. Write an OPTIMIZED prompt (800-1200 characters) that:\n"
+            f"   - Preserves the SAME figure content (method names, components, data flow)\n"
+            f"   - Uses simpler, more descriptive language\n"
+            f"   - Removes pixel-level instructions, specific hex codes, font sizes\n"
+            f"   - Describes WHAT to draw, not HOW to render it\n"
+            f"   - Keeps it as a clean, 2D scientific diagram\n\n"
+            f"Return JSON:\n"
+            f'{{"diagnosis": "brief explanation", "optimized_prompt": "the new prompt"}}'
+        )
+
+        figure_prompt_config = self.config.for_stage("figure_prompt")
+        try:
+            result = await self.generate_json(
+                diagnosis_system, diagnosis_user, stage_override=figure_prompt_config,
+            )
+            diagnosis = result.get("diagnosis", "unknown")
+            optimized = result.get("optimized_prompt", "")
+            self.log(f"  {fig_key} diagnosis: {diagnosis}")
+
+            if not optimized:
+                return None
+
+            # Enforce length limit on optimized prompt
+            if len(optimized) > MAX_OPTIMIZED_PROMPT_LEN:
+                optimized = optimized[:MAX_OPTIMIZED_PROMPT_LEN].rsplit(" ", 1)[0]
+
+            self.log(f"  {fig_key} optimized prompt: {len(optimized)} chars")
+            return optimized
+        except Exception as exc:
+            self.log(f"  {fig_key} prompt diagnosis failed: {exc}")
+            return None
 
     # -----------------------------------------------------------------------
     # Code-generated charts (executed in subprocess)
