@@ -54,6 +54,18 @@ SUBPROCESS_OUTPUT_LIMIT = 5000
 LLM_CONTEXT_TRUNCATION = 4000
 STDERR_SNIPPET_LIMIT = 2000
 
+
+def _decode_bytes(data: bytes | str, limit: int = 0) -> str:
+    """Decode subprocess output bytes to str safely on Windows (GBK fallback)."""
+    if isinstance(data, str):
+        return data[:limit] if limit else data
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = data.decode("latin-1", errors="replace")
+    return text[:limit] if limit else text
+
+
 PROJECT_PLAN_SYSTEM_PROMPT = """You are an ML project architect. Given an experiment blueprint, design a complete, runnable Python project structure.
 
 Output a JSON object with:
@@ -826,20 +838,20 @@ Output ONLY valid JSON array."""
                     [venv_python, "main.py", "--quick-eval"],
                     cwd=str(code_dir),
                     capture_output=True,
-                    text=True,
+                    text=False,
                     timeout=timeout,
                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 ),
             )
             return {
                 "returncode": proc_result.returncode,
-                "stdout": proc_result.stdout[:SUBPROCESS_OUTPUT_LIMIT],
-                "stderr": proc_result.stderr[:SUBPROCESS_OUTPUT_LIMIT],
+                "stdout": _decode_bytes(proc_result.stdout, SUBPROCESS_OUTPUT_LIMIT),
+                "stderr": _decode_bytes(proc_result.stderr, SUBPROCESS_OUTPUT_LIMIT),
             }
         except subprocess.TimeoutExpired:
             self.log(f"Quick-eval timed out after {timeout}s")
             return {"returncode": -1, "stdout": "", "stderr": f"Timeout after {timeout}s"}
-        except OSError as e:
+        except Exception as e:
             self.log(f"Quick-eval subprocess error: {e}")
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
@@ -1093,7 +1105,7 @@ Output ONLY the fixed Python code, no markdown fences."""
                      "-r", str(req_file), "--quiet"],
                     cwd=str(code_dir),
                     capture_output=True,
-                    text=True,
+                    text=False,
                 ),
             )
             if proc_result.returncode == 0:
@@ -1101,9 +1113,9 @@ Output ONLY the fixed Python code, no markdown fences."""
             else:
                 self.log(
                     f"pip install failed (rc={proc_result.returncode}): "
-                    f"{proc_result.stderr[:500]}"
+                    f"{_decode_bytes(proc_result.stderr, 500)}"
                 )
-        except (OSError, subprocess.SubprocessError) as e:
+        except Exception as e:
             self.log(f"pip install error: {e}")
 
         return venv_python
@@ -1119,19 +1131,19 @@ Output ONLY the fixed Python code, no markdown fences."""
                     [python, "main.py", "--dry-run"],
                     cwd=str(code_dir),
                     capture_output=True,
-                    text=True,
+                    text=False,
                     timeout=DRY_RUN_TIMEOUT_SECONDS,
                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 ),
             )
             return {
                 "returncode": proc_result.returncode,
-                "stdout": proc_result.stdout[:SUBPROCESS_OUTPUT_LIMIT],
-                "stderr": proc_result.stderr[:SUBPROCESS_OUTPUT_LIMIT],
+                "stdout": _decode_bytes(proc_result.stdout, SUBPROCESS_OUTPUT_LIMIT),
+                "stderr": _decode_bytes(proc_result.stderr, SUBPROCESS_OUTPUT_LIMIT),
             }
         except subprocess.TimeoutExpired:
             return {"returncode": -1, "stdout": "", "stderr": f"Timeout after {DRY_RUN_TIMEOUT_SECONDS}s"}
-        except OSError as e:
+        except Exception as e:
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
 
     @staticmethod
