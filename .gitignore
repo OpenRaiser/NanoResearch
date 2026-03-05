@@ -34,6 +34,12 @@ outputs/
 *.fdb_latexmk
 *.synctex.gz
 
+# Archives
+*.zip
+
+# NeurIPS raw template (usable copy lives in nanoresearch/templates/)
+templates/
+
 # OS
 .DS_Store
 Thumbs.db
