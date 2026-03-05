@@ -66,17 +66,15 @@ async def _get_github_search():
     return _github_search
 
 
-from nanoresearch.skill_prompts import IDEATION_SKILL
+from nanoresearch.skill_prompts import (
+    IDEATION_QUERY_SYSTEM,
+    IDEATION_ANALYSIS_SYSTEM,
+    IDEATION_MUST_CITE_SYSTEM,
+    IDEATION_EVIDENCE_SYSTEM,
+)
 
-IDEATION_SYSTEM_PROMPT = """You are a research ideation assistant. Your task is to:
-1. Generate effective search queries for the given research topic
-2. Analyze retrieved papers to identify research gaps
-3. Formulate novel hypotheses that address those gaps
-
-Always respond in valid JSON format matching the schema provided."""
-
-# IDEATION_SKILL is injected into user prompts of _analyze_and_hypothesize(),
-# not into the system prompt (which is reused across many calls).
+# Legacy alias — some internal methods still reference this.
+IDEATION_SYSTEM_PROMPT = IDEATION_QUERY_SYSTEM
 
 
 class IdeationAgent(BaseResearchAgent):
@@ -468,7 +466,7 @@ frequently cited and essential for any research in this area.
 Return JSON: {{"must_cite_titles": ["Paper Title 1", "Paper Title 2", ...]}}"""
 
         try:
-            result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+            result = await self.generate_json(IDEATION_MUST_CITE_SYSTEM, prompt)
             return result.get("must_cite_titles", [])
         except Exception as e:
             logger.warning("[%s] Must-cite extraction failed: %s", self.stage.value, e)
@@ -593,8 +591,6 @@ I searched using these queries: {json.dumps(queries)}
 Here are the retrieved papers:
 {papers_text}
 
-{IDEATION_SKILL}
-
 Analyze these papers and produce a JSON object with:
 1. "survey_summary": A 300-500 word narrative summarizing the state of the field.
    Include what methods dominate (e.g. "80% of papers use X"), which datasets are standard,
@@ -634,7 +630,7 @@ Return ONLY valid JSON."""
             tools = await self._build_search_tools()
             if len(tools) > 0:
                 react_result = await self.generate_with_tools(
-                    IDEATION_SYSTEM_PROMPT, prompt, tools, max_tool_rounds=5
+                    IDEATION_ANALYSIS_SYSTEM, prompt, tools, max_tool_rounds=5
                 )
                 # Try to parse as JSON
                 text = react_result.strip()
@@ -653,13 +649,13 @@ Return ONLY valid JSON."""
                         "falling back to standard generation. Output preview: %r",
                         self.stage.value, e, text[:200],
                     )
-                    result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+                    result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
             else:
-                result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+                result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
         except Exception as e:
             logger.warning("[%s] ReAct tool-use failed, falling back to standard generation: %s",
                            self.stage.value, e)
-            result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+            result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
 
         # Build PaperReference list
         paper_refs = []
@@ -757,13 +753,7 @@ Return ONLY valid JSON."""
 
         papers_text = "\n\n".join(paper_blocks)
 
-        system_prompt = (
-            "You are a precise scientific data extractor. Your task is to extract "
-            "ONLY quantitative metrics that are EXPLICITLY stated in paper abstracts. "
-            "Do NOT estimate, infer, or invent any numbers. If an abstract does not "
-            "contain explicit numeric results, skip it entirely.\n\n"
-            "Always respond in valid JSON format."
-        )
+        system_prompt = IDEATION_EVIDENCE_SYSTEM
 
         prompt = f"""Extract quantitative results from these paper abstracts.
 

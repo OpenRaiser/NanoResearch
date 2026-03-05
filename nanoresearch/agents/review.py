@@ -24,26 +24,11 @@ MAX_LATEX_FIX_ATTEMPTS = 3  # compile-fix loop iterations
 MIN_SECTION_SCORE = 8  # Sections scoring below this get revised
 CONVERGENCE_THRESHOLD = 0.3  # Stop if avg score improves by less than this
 
-from nanoresearch.skill_prompts import get_review_guidance
+from nanoresearch.skill_prompts import get_review_system_prompt, REVISION_SYSTEM
 
-REVIEW_SYSTEM_PROMPT = """You are an expert academic paper reviewer for a top-tier venue (NeurIPS, ICML, CVPR, ACL).
-Evaluate technical correctness, completeness, clarity, citations, reproducibility, and consistency.
-Always respond in valid JSON format."""
-
-REVISION_SYSTEM_PROMPT = """You are an expert academic paper writer revising a section for a top-tier AI venue (NeurIPS, ICML, CVPR, ACL).
-
-Your revision must meet publication-ready standards:
-- Fix ALL issues listed by the reviewer
-- Maintain LaTeX formatting and notation consistency with the rest of the paper
-- Use \\citet{} for grammatical-subject citations, \\citep{} for parenthetical
-- Keep notation consistent: \\mathbf{x} for vectors, \\mathbf{W} for matrices
-- Include equations with \\begin{equation} and reference them with Eq.~\\eqref{}
-- Be specific and quantitative — avoid vague claims like "significant improvement"
-- Every claim must be supported by evidence or citations
-- Use ONLY citation keys from the paper's bibliography — do NOT invent new ones
-- Match the writing quality of published papers at NeurIPS/ICML
-
-Output ONLY the revised section content (LaTeX formatted). No explanation, no markdown fences."""
+# Generic fallback (used by compile-fix and other non-section calls)
+REVIEW_SYSTEM_PROMPT = get_review_system_prompt("_default")
+REVISION_SYSTEM_PROMPT = REVISION_SYSTEM
 
 
 class ReviewAgent(BaseResearchAgent):
@@ -456,8 +441,8 @@ class ReviewAgent(BaseResearchAgent):
         review_config: Any,
     ) -> SectionReview:
         """Review a single section of the paper."""
-        # Per-call skill guidance (~150 tokens, not in system prompt)
-        skill_guidance = get_review_guidance(heading)
+        # Per-section specialized system prompt
+        section_review_system = get_review_system_prompt(heading)
 
         prompt = f"""Review the following section of an academic paper:
 
@@ -471,9 +456,9 @@ Research context:
 - Topic: {str(ideation_output.get('topic', 'Unknown'))[:500]}
 - Hypothesis: {str(ideation_output.get('selected_hypothesis', 'Unknown'))[:500]}
 - Method: {str((experiment_blueprint.get('proposed_method') or {}).get('name', 'Unknown'))[:500]}
-{skill_guidance}
+
 Provide:
-1. A quality score (1-10) where 9-10=publication-ready, 7-8=solid, 5-6=significant issues, 3-4=major rewrite, 1-2=flawed
+1. A quality score (1-10) using the scoring rubric
 2. Up to 5 specific issues — each must state: what is wrong, why it matters, and how to fix it
 3. Up to 3 actionable suggestions for improvement
 
@@ -487,12 +472,12 @@ Return JSON:
 
         try:
             result = await self.generate_json(
-                REVIEW_SYSTEM_PROMPT, prompt, stage_override=review_config
+                section_review_system, prompt, stage_override=review_config
             )
         except Exception:
             # JSON parse failed — try repair
             raw = await self.generate(
-                REVIEW_SYSTEM_PROMPT, prompt, json_mode=True,
+                section_review_system, prompt, json_mode=True,
                 stage_override=review_config,
             )
             result = self._repair_truncated_json(raw)
