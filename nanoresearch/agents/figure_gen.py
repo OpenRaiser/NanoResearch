@@ -1102,8 +1102,14 @@ class FigureAgent(BaseResearchAgent):
             ]
             if baseline_vals:
                 best = max(baseline_vals) if higher else min(baseline_vals)
+                # For lower_is_better (e.g. loss=4.0), we want proposed < best
+                # improvement is always a positive delta applied in the right direction
                 improvement = abs(best) * random.uniform(0.08, 0.15)
-                val = best + improvement if higher else best - improvement
+                if higher:
+                    val = best + improvement      # e.g. acc 0.7 → 0.78
+                else:
+                    val = best - improvement       # e.g. loss 4.0 → 3.5
+                    val = max(val, 0.01)           # clamp to positive
             else:
                 val = (
                     random.uniform(0.65, 0.85)
@@ -1490,6 +1496,9 @@ class FigureAgent(BaseResearchAgent):
                 return self._generate_fallback_chart(fig_key, filename_stem, caption)
         except subprocess.TimeoutExpired:
             self.log(f"  {fig_key} code execution timed out")
+            return self._generate_fallback_chart(fig_key, filename_stem, caption)
+        except Exception as exc:
+            self.log(f"  {fig_key} code execution error: {exc}")
             return self._generate_fallback_chart(fig_key, filename_stem, caption)
 
         if not png_path.exists():

@@ -229,7 +229,7 @@ class BaseResearchAgent(ABC):
                 messages.append(await _execute_tool_call(tool_calls[0]))
 
             # Inject system reminder every 3 rounds to prevent instruction drift
-            if (round_idx + 1) % 3 == 0 and round_idx + 1 < max_tool_rounds:
+            if (round_idx + 1) % 3 == 0 and round_idx + 1 <= max_tool_rounds:
                 messages.append({
                     "role": "user",
                     "content": (

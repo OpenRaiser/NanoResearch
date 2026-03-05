@@ -18,101 +18,24 @@ from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
 from nanoresearch.schemas.manifest import PipelineStage
 from nanoresearch.schemas.paper import PaperSkeleton, Section
 
+from nanoresearch.skill_prompts import (
+    get_writing_system_prompt,
+    ABSTRACT_SYSTEM,
+    TITLE_SYSTEM,
+)
+
 logger = logging.getLogger(__name__)
 
 # Configurable limits
 MAX_PAPERS_FOR_CITATIONS = 50
 MAX_LATEX_FIX_ATTEMPTS = 3
 
-SECTION_SYSTEM_PROMPT = """You are a senior researcher writing for a top-tier venue (NeurIPS, ICML, ACL, CVPR).
-Write in formal academic English. Use LaTeX formatting for math equations.
-You MUST use the EXACT citation keys provided in the reference list below.
-Do NOT invent citation keys. Only use keys from the provided list.
-Output ONLY the section content as plain LaTeX paragraphs (no \\section command, no JSON wrapping).
-
-CRITICAL: Do NOT include any meta-commentary, thinking, or planning text in your output.
-Never write phrases like "I now have sufficient...", "Let me compose...", "I see the paper ID...",
-"I need to look up...", "I will now write...". These are NOT part of the paper.
-Your output goes DIRECTLY into the LaTeX file — every character you write will be compiled.
-
-LATEX FORMATTING RULES:
-- Use --- for em-dashes (no spaces), -- for en-dashes (NOT Unicode characters)
-- Escape percent signs as \\% (NOT bare %)
-- Use LaTeX commands for special characters
-- Use \\begin{equation} for single equations, \\begin{align} for multi-line (NEVER eqnarray)
-- Use non-breaking spaces before references: Figure~\\ref{}, Table~\\ref{}, Section~\\ref{}, Eq.~\\eqref{}
-- Every \\ref and \\cite must resolve --- no "?" in output
-
-CITATION CONVENTIONS:
-- Use \\citet{key} when author is the grammatical subject: "\\citet{smith2023} showed that..."
-- Use \\citep{key} for parenthetical citations: "...as shown previously~\\citep{smith2023}"
-- NEVER use citations as nouns: wrong "the method of \\citep{x}", correct "the method of \\citet{x}"
-- When citing multiple works: \\citep{key1, key2, key3}
-
-MATH NOTATION (ISO 80000-2):
-- Vectors: bold lowercase (\\mathbf{x} or \\bm{x})
-- Matrices: bold uppercase (\\mathbf{W})
-- Scalars: italic lowercase (x, n, \\alpha)
-- Sets/spaces: calligraphic (\\mathcal{X})
-- Operators: roman type (\\operatorname{softmax}, \\mathrm{ReLU})
-- Subscripts for labels: roman (L_{\\mathrm{total}}, \\theta_{\\mathrm{init}})
-- Use \\mathbb{R} for real numbers, \\mathbb{E} for expectation
-
-TABLE WIDTH RULES (prevent Overfull hbox):
-- Always wrap tables in \\begin{table}[H] \\small ... \\end{table}
-- Use \\setlength{\\tabcolsep}{4pt} inside the table environment
-- Start tabular with @{} and end with @{} to remove outer padding
-- Keep column headers SHORT (max ~10 chars); put units on a second line
-- If >5 data columns, wrap the tabular in \\resizebox{\\textwidth}{!}{...}
-- Use abbreviated row labels (e.g., "w/o constr. opt." not "without constrained optimization (greedy allocation)")
-- NEVER let a table exceed \\textwidth --- check mentally before outputting
-- Prefer 'l' alignment for method names, 'c' for metrics
-- For wide tables with many metrics, consider splitting into two tables
-
-WRITING QUALITY GUIDELINES:
-- Write assertively: "we demonstrate", "experiments show", "our method achieves"
-- Every claim must be supported by data or citations
-- Distinguish strong claims (with direct evidence) from tentative ones ("may be explained by")
-- Use precise quantitative language: "improves by 3.2\\%" not "significantly improves"
-- Logical flow: each paragraph should begin with a topic sentence and end connecting to the next
-- Avoid vague filler: no "it is well known that", "in recent years", "has attracted attention"
-- AVOID AI-SOUNDING PHRASES: never use "delve into", "it is worth noting that", "this paper presents",
-  "to address this challenge", "leverage", "utilize" (use "use"), "facilitate", "in the realm of",
-  "harness the power of", "a paradigm shift", "pave the way". Write like a real researcher, not a chatbot.
-- Technical depth: include equations, algorithmic details, and implementation specifics where appropriate
-- Use active voice: "We propose..." not "It is proposed that..."
-- Keep notation consistent across all sections --- same symbol must mean the same thing everywhere
-- CROSS-SECTION CONSISTENCY: every contribution listed in Introduction MUST have corresponding
-  experimental evidence in Experiments (ablation or main result). Every method component in Method
-  MUST be referenced in either main results or ablation study."""
-
-ABSTRACT_SYSTEM_PROMPT = """You are a senior researcher writing an abstract for a top-tier venue.
-Write exactly 150-250 words in a SINGLE paragraph following this 4-6 sentence structure:
-
-Sentence 1 (Problem): State the research problem and why it matters.
-Sentence 2 (Gap): What current methods do and their specific limitation.
-Sentence 3 (Method): "We propose [METHOD NAME], which..." --- describe the core idea, name key submodules, and explain how they connect.
-Sentence 4 (Results): "Experiments on [DATASETS] show that [METHOD] achieves [KEY METRIC VALUES], outperforming [BEST BASELINE] by X%."
-Sentence 5-6 (optional): Additional key finding or broader implication.
-
-Rules:
-- Self-contained: NO citations, NO figure references, NO undefined acronyms
-- Define acronyms on first use: "Large Language Models (LLMs)"
-- Use assertive language: "we propose", "we demonstrate", "achieves", "outperforms"
-- Method sentence must name specific submodules and their logical relationship
-- Results sentence MUST include concrete dataset names and quantitative numbers
-- Must contain: problem, method, key results, and principal conclusion (ICML standard)
-- Use --- for em-dashes, -- for en-dashes (NOT Unicode)
-Output ONLY the abstract text."""
-
-TITLE_SYSTEM_PROMPT = """You are a senior researcher writing for a top-tier venue (NeurIPS, ICML, ACL, CVPR).
-Generate a concise paper title (8-15 words).
-Rules:
-- Include the method/framework name if available
-- Signal the key contribution (e.g., "via ...", "for ...", "with ...")
-- No generic fillers ("A Novel...", "An Approach to...")
-- Match the style of best papers at top venues
-Output ONLY the title text, nothing else."""
+# Legacy aliases — now each section gets its own system prompt via
+# get_writing_system_prompt(heading), but some internal methods still
+# need a generic prompt for non-section tasks (e.g., LaTeX fix).
+SECTION_SYSTEM_PROMPT = get_writing_system_prompt("_default")
+ABSTRACT_SYSTEM_PROMPT = ABSTRACT_SYSTEM
+TITLE_SYSTEM_PROMPT = TITLE_SYSTEM
 
 # Section specs: (heading, label, writing_instructions, related_figures)
 # related_figures: list of figure keys to embed WITHIN this section
@@ -852,6 +775,9 @@ Every component listed above should appear in the ablation table.
                 + "\n=== END PREVIOUS SECTIONS ===\n"
             )
 
+        # Per-section specialized system prompt (replaces generic SECTION_SYSTEM_PROMPT)
+        section_system = get_writing_system_prompt(heading)
+
         prompt = f"""Write the "{heading}" section for this paper.
 
 Instructions: {instructions}
@@ -876,14 +802,14 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                         "or look up recent results, use the tools before writing."
                     )
                     return (await self.generate_with_tools(
-                        SECTION_SYSTEM_PROMPT, tool_prompt, tools,
+                        section_system, tool_prompt, tools,
                         max_tool_rounds=10,
                     )).strip()
             except Exception as e:
                 logger.warning("Tool-augmented writing failed for %s, falling back: %s", heading, e)
 
         try:
-            return (await self.generate(SECTION_SYSTEM_PROMPT, prompt)).strip()
+            return (await self.generate(section_system, prompt)).strip()
         except Exception as e:
             logger.warning("Section generation failed for %s: %s", heading, e)
             return f"% Section generation failed: {heading}"
@@ -955,7 +881,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
     # ---- missing citation resolver -------------------------------------------
 
     _CITE_KEY_RE = re.compile(r"\\cite[tp]?\{([^}]+)\}")
-    _BIB_KEY_RE = re.compile(r"@\w+\{([^,\s]+)")
+    _BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)")
 
     async def _resolve_missing_citations(
         self, latex: str, bibtex: str
@@ -990,9 +916,12 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         self.log(f"Resolving {len(missing)} missing citation(s): {sorted(missing)}")
 
-        # 3. Try to resolve each missing key
+        # 3. Try to resolve each missing key (skip if already added by a prior call)
         new_entries: list[str] = []
         for key in sorted(missing):
+            # Double-check key isn't already in bibtex (guards against duplicate calls)
+            if re.search(r'@\w+\s*\{\s*' + re.escape(key) + r'\s*,', bibtex):
+                continue
             entry = await self._resolve_single_citation(key)
             new_entries.append(entry)
 
@@ -1272,9 +1201,18 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         tex_lines = tex_source.split('\n')
         if error_line and len(tex_source) > 30000:
+            # Convert to 0-indexed
+            err_idx = max(0, error_line - 1)
             preamble_end = min(50, len(tex_lines))
-            window_start = max(preamble_end, error_line - 30)
-            window_end = min(len(tex_lines), error_line + 30)
+            window_start = max(0, err_idx - 30)
+            window_end = min(len(tex_lines), err_idx + 30)
+            # Ensure window_start <= window_end
+            if window_start < preamble_end and window_end > preamble_end:
+                window_start = preamble_end  # avoid overlapping preamble
+            elif window_end <= preamble_end:
+                # Error is in the preamble — just extend preamble to cover it
+                preamble_end = window_end
+                window_start = window_end  # no separate window needed
             tail_start = max(window_end, len(tex_lines) - 30)
 
             focused_lines = tex_lines[:preamble_end]

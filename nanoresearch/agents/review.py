@@ -24,39 +24,11 @@ MAX_LATEX_FIX_ATTEMPTS = 3  # compile-fix loop iterations
 MIN_SECTION_SCORE = 8  # Sections scoring below this get revised
 CONVERGENCE_THRESHOLD = 0.3  # Stop if avg score improves by less than this
 
-REVIEW_SYSTEM_PROMPT = """You are an expert academic paper reviewer for a top-tier venue (NeurIPS, ICML, CVPR, ACL).
+from nanoresearch.skill_prompts import get_review_system_prompt, REVISION_SYSTEM
 
-Scoring rubric per section:
-  9-10: Publication-ready, minor polishing only
-  7-8:  Solid but has identifiable weaknesses
-  5-6:  Significant issues that need addressing
-  3-4:  Major rewrite needed
-  1-2:  Fundamentally flawed
-
-Evaluation criteria:
-- **Technical correctness**: Are claims supported? Are equations correct?
-- **Completeness**: Are all necessary details present (datasets, baselines, ablations)?
-- **Clarity**: Is the writing clear, precise, and well-organized?
-- **Citations**: Are key works cited? Are citation keys valid?
-- **Reproducibility**: Could someone reproduce the experiments from the description?
-- **Consistency**: Same notation and terminology across sections?
-
-Always respond in valid JSON format."""
-
-REVISION_SYSTEM_PROMPT = """You are an expert academic paper writer revising a section for a top-tier AI venue (NeurIPS, ICML, CVPR, ACL).
-
-Your revision must meet publication-ready standards:
-- Fix ALL issues listed by the reviewer
-- Maintain LaTeX formatting and notation consistency with the rest of the paper
-- Use \\citet{} for grammatical-subject citations, \\citep{} for parenthetical
-- Keep notation consistent: \\mathbf{x} for vectors, \\mathbf{W} for matrices
-- Include equations with \\begin{equation} and reference them with Eq.~\\eqref{}
-- Be specific and quantitative — avoid vague claims like "significant improvement"
-- Every claim must be supported by evidence or citations
-- Use ONLY citation keys from the paper's bibliography — do NOT invent new ones
-- Match the writing quality of published papers at NeurIPS/ICML
-
-Output ONLY the revised section content (LaTeX formatted). No explanation, no markdown fences."""
+# Generic fallback (used by compile-fix and other non-section calls)
+REVIEW_SYSTEM_PROMPT = get_review_system_prompt("_default")
+REVISION_SYSTEM_PROMPT = REVISION_SYSTEM
 
 
 class ReviewAgent(BaseResearchAgent):
@@ -128,7 +100,9 @@ class ReviewAgent(BaseResearchAgent):
             low_sections = [
                 sr for sr in review.section_reviews if sr.score < MIN_SECTION_SCORE
             ]
-            if not low_sections and not consistency_issues:
+            # Include all consistency issues (regex + claim + figure) for loop control
+            all_consistency = review.consistency_issues
+            if not low_sections and not all_consistency:
                 break
 
             revision_round += 1
@@ -142,9 +116,10 @@ class ReviewAgent(BaseResearchAgent):
 
             for section_review in low_sections:
                 # Collect consistency issues relevant to this section
+                # Include issues without locations as potentially relevant to any section
                 section_consistency = [
-                    ci for ci in consistency_issues
-                    if any(
+                    ci for ci in all_consistency
+                    if not getattr(ci, 'locations', []) or any(
                         section_review.section.lower() in loc.lower()
                         for loc in getattr(ci, 'locations', [])
                     )
@@ -161,10 +136,16 @@ class ReviewAgent(BaseResearchAgent):
             if round_revised:
                 current_tex = self._apply_revisions(current_tex, round_revised)
 
-            # Re-run consistency checks after revision
-            consistency_issues = self._run_consistency_checks(current_tex)
-            if consistency_issues:
-                self.log(f"  {len(consistency_issues)} consistency issues remain after revision")
+            # Re-run all consistency checks after revision
+            review.consistency_issues = self._run_consistency_checks(current_tex)
+            review.consistency_issues.extend(
+                self._check_claim_result_consistency(current_tex, experiment_blueprint)
+            )
+            review.consistency_issues.extend(
+                self._check_figure_text_alignment(current_tex)
+            )
+            if review.consistency_issues:
+                self.log(f"  {len(review.consistency_issues)} consistency issues remain after revision")
 
             # Re-review revised sections with LLM
             re_review = await self._review_paper(current_tex, ideation_output, experiment_blueprint)
@@ -286,8 +267,9 @@ class ReviewAgent(BaseResearchAgent):
         Handles \\section{} (level=0), \\subsection{} (level=1),
         and \\subsubsection{} (level=2).
         """
+        # Use a pattern that handles nested braces (e.g. \section{Method for \textbf{X}})
         pattern = re.compile(
-            r"\\((?:sub){0,2})section\*?\{([^}]+)\}",
+            r"\\((?:sub){0,2})section\*?\{((?:[^{}]|\{[^{}]*\})+)\}",
         )
         matches = list(pattern.finditer(tex))
         if not matches:
@@ -469,6 +451,9 @@ class ReviewAgent(BaseResearchAgent):
         review_config: Any,
     ) -> SectionReview:
         """Review a single section of the paper."""
+        # Per-section specialized system prompt
+        section_review_system = get_review_system_prompt(heading)
+
         prompt = f"""Review the following section of an academic paper:
 
 Section: {heading}
@@ -483,26 +468,26 @@ Research context:
 - Method: {str((experiment_blueprint.get('proposed_method') or {}).get('name', 'Unknown'))[:500]}
 
 Provide:
-1. A quality score (1-10) using the rubric
-2. Up to 5 specific issues (be concrete)
-3. Up to 3 actionable suggestions
+1. A quality score (1-10) using the scoring rubric
+2. Up to 5 specific issues — each must state: what is wrong, why it matters, and how to fix it
+3. Up to 3 actionable suggestions for improvement
 
 Return JSON:
 {{
     "section": "{heading}",
     "score": 7,
-    "issues": ["Issue 1"],
+    "issues": ["Issue 1: [problem]. This matters because [impact]. Fix: [specific action]."],
     "suggestions": ["Suggestion 1"]
 }}"""
 
         try:
             result = await self.generate_json(
-                REVIEW_SYSTEM_PROMPT, prompt, stage_override=review_config
+                section_review_system, prompt, stage_override=review_config
             )
         except Exception:
             # JSON parse failed — try repair
             raw = await self.generate(
-                REVIEW_SYSTEM_PROMPT, prompt, json_mode=True,
+                section_review_system, prompt, json_mode=True,
                 stage_override=review_config,
             )
             result = self._repair_truncated_json(raw)
@@ -865,6 +850,9 @@ IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begi
             # Create a temporary WritingAgent-like resolver
             new_entries: list[str] = []
             for key in sorted(missing):
+                # Skip if already present (guards against duplicate calls)
+                if re.search(r'@\w+\s*\{\s*' + re.escape(key) + r'\s*,', bib_content):
+                    continue
                 entry = await self._resolve_single_citation_key(key)
                 new_entries.append(entry)
 
@@ -1081,10 +1069,19 @@ IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begi
 
         tex_lines = tex_source.split('\n')
         if error_line and len(tex_source) > 30000:
+            # Convert to 0-indexed
+            err_idx = max(0, error_line - 1)
             # Send preamble (first 50 lines) + window around error + last 30 lines
             preamble_end = min(50, len(tex_lines))
-            window_start = max(preamble_end, error_line - 30)
-            window_end = min(len(tex_lines), error_line + 30)
+            window_start = max(0, err_idx - 30)
+            window_end = min(len(tex_lines), err_idx + 30)
+            # Ensure window_start <= window_end
+            if window_start < preamble_end and window_end > preamble_end:
+                window_start = preamble_end  # avoid overlapping preamble
+            elif window_end <= preamble_end:
+                # Error is in the preamble — just extend preamble to cover it
+                preamble_end = window_end
+                window_start = window_end  # no separate window needed
             tail_start = max(window_end, len(tex_lines) - 30)
 
             focused_lines = tex_lines[:preamble_end]
@@ -1175,45 +1172,52 @@ IMPORTANT: If the section contains \\begin{{figure}}...\\end{{figure}} or \\begi
                 r"(?=\\(?:sub){0,2}section\*?\{|\\end\{document\}|\\bibliography)"
             )
             match = re.search(pattern, result[body_start:], re.DOTALL)
-            if match:
-                old_content = match.group(2)
-                abs_start = body_start + match.start(2)
-                abs_end = body_start + match.end(2)
+            if not match:
+                logger.warning(
+                    "Cannot find section '%s' in paper — revision discarded", heading
+                )
+                continue
 
-                # Preserve figure/table environments from old content
-                # that may have been dropped by the revision LLM
-                old_figures = re.findall(
-                    r'(\\begin\{figure\}.*?\\end\{figure\})',
-                    old_content, re.DOTALL,
-                )
-                old_tables = re.findall(
-                    r'(\\begin\{table\}.*?\\end\{table\})',
-                    old_content, re.DOTALL,
-                )
-                preserved = []
-                for fig_block in old_figures:
-                    # Only preserve if new content doesn't already have this figure
-                    label_match = re.search(r'\\label\{([^}]+)\}', fig_block)
-                    if label_match:
-                        label = label_match.group(1)
-                        if label not in new_content:
-                            preserved.append(fig_block)
-                    elif 'includegraphics' in fig_block and 'includegraphics' not in new_content:
+            old_content = match.group(2)
+            abs_start = body_start + match.start(2)
+            abs_end = body_start + match.end(2)
+
+            # Preserve figure/table environments from old content
+            # that may have been dropped by the revision LLM
+            old_figures = re.findall(
+                r'(\\begin\{figure\*?\}.*?\\end\{figure\*?\})',
+                old_content, re.DOTALL,
+            )
+            old_tables = re.findall(
+                r'(\\begin\{table\*?\}.*?\\end\{table\*?\})',
+                old_content, re.DOTALL,
+            )
+            preserved = []
+            for fig_block in old_figures:
+                # Only preserve if new content doesn't already have this figure
+                label_match = re.search(r'\\label\{([^}]+)\}', fig_block)
+                if label_match:
+                    label = label_match.group(1)
+                    if label not in new_content:
                         preserved.append(fig_block)
-                for tbl_block in old_tables:
-                    label_match = re.search(r'\\label\{([^}]+)\}', tbl_block)
-                    if label_match:
-                        label = label_match.group(1)
-                        if label not in new_content:
-                            preserved.append(tbl_block)
+                elif 'includegraphics' in fig_block and 'includegraphics' not in new_content:
+                    preserved.append(fig_block)
+            for tbl_block in old_tables:
+                label_match = re.search(r'\\label\{([^}]+)\}', tbl_block)
+                if label_match:
+                    label = label_match.group(1)
+                    if label not in new_content:
+                        preserved.append(tbl_block)
+                elif 'caption' in tbl_block and '\\begin{tabular}' not in new_content:
+                    preserved.append(tbl_block)
 
-                suffix = ""
-                if preserved:
-                    suffix = "\n\n" + "\n\n".join(preserved)
+            suffix = ""
+            if preserved:
+                suffix = "\n\n" + "\n\n".join(preserved)
 
-                result = (
-                    result[:abs_start]
-                    + "\n" + new_content + suffix + "\n\n"
-                    + result[abs_end:]
-                )
+            result = (
+                result[:abs_start]
+                + "\n" + new_content + suffix + "\n\n"
+                + result[abs_end:]
+            )
         return result

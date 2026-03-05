@@ -66,12 +66,15 @@ async def _get_github_search():
     return _github_search
 
 
-IDEATION_SYSTEM_PROMPT = """You are a research ideation assistant. Your task is to:
-1. Generate effective search queries for the given research topic
-2. Analyze retrieved papers to identify research gaps
-3. Formulate novel hypotheses that address those gaps
+from nanoresearch.skill_prompts import (
+    IDEATION_QUERY_SYSTEM,
+    IDEATION_ANALYSIS_SYSTEM,
+    IDEATION_MUST_CITE_SYSTEM,
+    IDEATION_EVIDENCE_SYSTEM,
+)
 
-Always respond in valid JSON format matching the schema provided."""
+# Legacy alias — some internal methods still reference this.
+IDEATION_SYSTEM_PROMPT = IDEATION_QUERY_SYSTEM
 
 
 class IdeationAgent(BaseResearchAgent):
@@ -102,6 +105,13 @@ class IdeationAgent(BaseResearchAgent):
             papers = cached["papers"]
             logger.info("[%s] Using cached: %d queries, %d papers",
                         self.stage.value, len(queries), len(papers))
+            # Restore must_cites from cache, or re-extract if not cached
+            must_cites = cached.get("must_cites", [])
+            if not must_cites:
+                must_cites = await self._extract_must_cites(
+                    [p for p in papers if "survey" in (p.get("title", "") or "").lower()
+                     or "review" in (p.get("title", "") or "").lower()]
+                )
         else:
             # Step 1: Generate search queries
             queries = await self._generate_queries(topic)
@@ -139,11 +149,12 @@ class IdeationAgent(BaseResearchAgent):
             else:
                 must_cites = []
 
-            # Cache search results for retry
+            # Cache search results for retry (including must_cites)
             try:
                 cache_path.parent.mkdir(parents=True, exist_ok=True)
                 cache_path.write_text(
-                    json.dumps({"queries": queries, "papers": papers},
+                    json.dumps({"queries": queries, "papers": papers,
+                                "must_cites": must_cites},
                                ensure_ascii=False, default=str),
                     encoding="utf-8",
                 )
@@ -154,9 +165,8 @@ class IdeationAgent(BaseResearchAgent):
         # Step 3: LLM analysis — gaps + hypotheses (with ReAct tool use)
         output = await self._analyze_and_hypothesize(topic, queries, papers)
 
-        # Store must-cite titles (computed during search phase)
-        if cached is None:
-            output.must_cites = must_cites
+        # Store must-cite titles
+        output.must_cites = must_cites
 
         # Step 4: Extract quantitative evidence from paper abstracts
         evidence = await self._extract_evidence(papers)
@@ -456,7 +466,7 @@ frequently cited and essential for any research in this area.
 Return JSON: {{"must_cite_titles": ["Paper Title 1", "Paper Title 2", ...]}}"""
 
         try:
-            result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+            result = await self.generate_json(IDEATION_MUST_CITE_SYSTEM, prompt)
             return result.get("must_cite_titles", [])
         except Exception as e:
             logger.warning("[%s] Must-cite extraction failed: %s", self.stage.value, e)
@@ -620,7 +630,7 @@ Return ONLY valid JSON."""
             tools = await self._build_search_tools()
             if len(tools) > 0:
                 react_result = await self.generate_with_tools(
-                    IDEATION_SYSTEM_PROMPT, prompt, tools, max_tool_rounds=5
+                    IDEATION_ANALYSIS_SYSTEM, prompt, tools, max_tool_rounds=5
                 )
                 # Try to parse as JSON
                 text = react_result.strip()
@@ -639,13 +649,13 @@ Return ONLY valid JSON."""
                         "falling back to standard generation. Output preview: %r",
                         self.stage.value, e, text[:200],
                     )
-                    result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+                    result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
             else:
-                result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+                result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
         except Exception as e:
             logger.warning("[%s] ReAct tool-use failed, falling back to standard generation: %s",
                            self.stage.value, e)
-            result = await self.generate_json(IDEATION_SYSTEM_PROMPT, prompt)
+            result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
 
         # Build PaperReference list
         paper_refs = []
@@ -743,13 +753,7 @@ Return ONLY valid JSON."""
 
         papers_text = "\n\n".join(paper_blocks)
 
-        system_prompt = (
-            "You are a precise scientific data extractor. Your task is to extract "
-            "ONLY quantitative metrics that are EXPLICITLY stated in paper abstracts. "
-            "Do NOT estimate, infer, or invent any numbers. If an abstract does not "
-            "contain explicit numeric results, skip it entirely.\n\n"
-            "Always respond in valid JSON format."
-        )
+        system_prompt = IDEATION_EVIDENCE_SYSTEM
 
         prompt = f"""Extract quantitative results from these paper abstracts.
 
