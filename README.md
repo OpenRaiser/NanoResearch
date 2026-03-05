@@ -1,0 +1,185 @@
+# NanoResearch
+
+AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
+
+## What It Does
+
+Give NanoResearch a research topic, and it will:
+
+1. **Ideation** — Search arXiv + Semantic Scholar, identify research gaps, generate hypotheses
+2. **Planning** — Design a complete experiment blueprint (datasets, baselines, metrics, ablations)
+3. **Experiment** — Generate a runnable code project (12+ files with model, trainer, evaluation)
+4. **Figures** — Create architecture diagrams (Gemini AI) + data visualization charts (LLM-generated code)
+5. **Writing** — Write a full LaTeX paper section-by-section, compile to PDF
+
+```
+Topic → IDEATION → PLANNING → EXPERIMENT → FIGURE_GEN → WRITING → paper.pdf
+```
+
+## Quick Start
+
+### Install
+
+```bash
+git clone https://github.com/your-org/nanoresearch.git
+cd nanoresearch
+pip install -e ".[dev]"
+```
+
+### Configure
+
+Create `~/.nanobot/config.json`:
+
+```json
+{
+  "research": {
+    "base_url": "https://your-api-endpoint/v1/",
+    "api_key": "your-api-key",
+    "timeout": 180.0,
+    "ideation":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.5 },
+    "planning":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.2, "timeout": 300.0 },
+    "experiment":    { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.1, "timeout": 600.0 },
+    "writing":       { "model": "claude-sonnet-4-6", "temperature": 0.4, "max_tokens": 16384, "timeout": 600.0 },
+    "code_gen":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.1, "max_tokens": 16384, "timeout": 600.0 },
+    "figure_prompt": { "model": "gpt-5.2", "temperature": 0.5, "max_tokens": 4096, "timeout": 300.0 },
+    "figure_code":   { "model": "gpt-5.2-codex", "temperature": null, "max_tokens": 16384, "timeout": 600.0 },
+    "figure_gen": {
+      "model": "gemini-3.1-flash-image-preview",
+      "image_backend": "gemini",
+      "temperature": null,
+      "timeout": 300.0,
+      "aspect_ratio": "16:9",
+      "image_size": "1024x1024"
+    }
+  }
+}
+```
+
+Or use environment variables: `NANORESEARCH_BASE_URL`, `NANORESEARCH_API_KEY`, `NANORESEARCH_TIMEOUT`.
+
+### Run
+
+```bash
+# Full pipeline
+nanoresearch run --topic "Your Research Topic" --verbose
+
+# Resume from checkpoint (if a stage fails)
+nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --verbose
+
+# Check status
+nanoresearch status --workspace ~/.nanobot/workspace/research/{session_id}
+
+# List all sessions
+nanoresearch list
+
+# Export to clean folder
+nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
+```
+
+### Output
+
+```
+my_paper/
+├── paper.pdf          # Compiled paper
+├── paper.tex          # LaTeX source
+├── references.bib     # Bibliography
+├── figures/           # Architecture diagram (AI) + charts (seaborn)
+├── code/              # Runnable experiment project
+│   ├── main.py
+│   ├── src/{model,dataset,trainer,evaluate,utils}.py
+│   ├── config/default.yaml
+│   └── scripts/{train.sh,run_ablation.sh}
+├── data/              # Structured intermediate data (JSON)
+└── manifest.json      # Full pipeline execution record
+```
+
+## Multi-Model Routing
+
+Each pipeline stage can use a different LLM optimized for that task:
+
+| Stage | Purpose | Recommended Model |
+|-------|---------|-------------------|
+| `ideation` | Literature search + hypothesis | DeepSeek-V3.2 |
+| `planning` | Experiment design | DeepSeek-V3.2 |
+| `experiment` | Code project generation | DeepSeek-V3.2 / Codex |
+| `writing` | LaTeX paper sections | Claude Sonnet 4.6 |
+| `figure_prompt` | Architecture diagram prompt | GPT-5.2 |
+| `figure_code` | Chart plotting code | Codex |
+| `figure_gen` | AI image generation | Gemini Flash |
+
+All models are accessed through a single OpenAI-compatible API endpoint. Set `temperature: null` for models that don't support it (e.g., Codex, o-series).
+
+## Hybrid Figure Generation
+
+NanoResearch uses a hybrid approach for figures:
+
+- **Architecture diagram** (`fig1`): AI image generation via Gemini native API — produces a visual model overview
+- **Results chart** (`fig2`): LLM generates a complete Python plotting script with synthetic data, executed to produce a publication-quality grouped bar chart
+- **Ablation chart** (`fig3`): Same approach — LLM-generated code creates an ablation study bar chart
+
+The generated plotting scripts are saved alongside the figures for reproducibility.
+
+## Checkpoint / Resume
+
+Every stage saves its output to disk. If a stage fails (API timeout, rate limit, etc.), resume from the last completed checkpoint:
+
+```bash
+nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id}
+```
+
+The pipeline skips already-completed stages and continues from where it left off.
+
+## Project Structure
+
+```
+nanoresearch/
+├── nanoresearch/              # Main package
+│   ├── cli.py                # CLI commands (run, resume, status, list, export)
+│   ├── config.py             # Per-stage model routing + global config
+│   ├── agents/               # 5 pipeline agents
+│   │   ├── base.py          # BaseResearchAgent (shared LLM call logic)
+│   │   ├── ideation.py      # Literature search + hypothesis generation
+│   │   ├── planning.py      # Experiment blueprint design
+│   │   ├── experiment.py    # Code project generation (two-phase)
+│   │   ├── figure_gen.py    # Hybrid figure generation (AI + code)
+│   │   └── writing.py       # Section-by-section paper writing + PDF compilation
+│   ├── pipeline/             # Infrastructure
+│   │   ├── orchestrator.py  # Stage scheduling + retry + checkpoint
+│   │   ├── state.py         # Pipeline state machine
+│   │   ├── workspace.py     # Workspace directory + manifest management
+│   │   └── multi_model.py   # OpenAI + Gemini API dispatcher
+│   └── schemas/              # Pydantic data models
+│       ├── manifest.py      # Stage enum + state transitions + manifest
+│       ├── ideation.py      # PaperReference, IdeationOutput
+│       ├── experiment.py    # ExperimentBlueprint, Dataset, Metric
+│       └── paper.py         # PaperSkeleton, Section, Figure
+├── mcp_server/               # MCP tool server
+│   ├── server.py            # JSON-RPC 2.0 stdio server
+│   └── tools/               # arXiv search, Semantic Scholar, LaTeX, PDF compile
+├── tests/                    # 60 tests
+├── outputs/                  # Example pipeline outputs
+└── pyproject.toml
+```
+
+## Requirements
+
+- Python >= 3.10
+- An OpenAI-compatible API endpoint (self-hosted or cloud)
+- `tectonic` or `pdflatex` for PDF compilation (optional — paper.tex works standalone)
+
+### Install tectonic (recommended)
+
+```bash
+conda install -c conda-forge tectonic
+```
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+pytest tests/ -v  # 60 tests
+```
+
+## License
+
+MIT

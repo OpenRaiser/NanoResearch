@@ -1,0 +1,13 @@
+{
+  "research": {
+    "base_url": "https://your-api-endpoint/v1/",
+    "api_key": "your-api-key-here",
+    "timeout": 180.0,
+    "ideation":   { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.5, "max_tokens": 8192 },
+    "planning":   { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.2, "max_tokens": 8192 },
+    "experiment": { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.1, "max_tokens": 8192 },
+    "writing":    { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.4, "max_tokens": 16384 },
+    "templateFormat": "arxiv",
+    "maxRetries": 2
+  }
+}

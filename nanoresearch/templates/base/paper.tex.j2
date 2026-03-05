@@ -1,0 +1,63 @@
+<# Base paper template for NanoResearch #>
+<# Uses custom Jinja2 delimiters: <% %> for blocks, << >> for variables, <# #> for comments #>
+\documentclass{article}
+
+%% ---- Standard Packages ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{booktabs}
+\usepackage{xcolor}
+
+\geometry{margin=1in}
+
+\title{<< title >>}
+\author{<%- for author in authors %>
+<< author >><% if not loop.last %> \and <% endif %>
+<%- endfor %>}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+%% ---- Abstract ----
+\begin{abstract}
+<< abstract >>
+\end{abstract}
+
+%% ---- Sections ----
+<% for section in sections %>
+\section{<< section.heading >>}\label{<< section.label >>}
+
+<< section.content >>
+
+<% for subsection in section.subsections %>
+\subsection{<< subsection.heading >>}\label{<< subsection.label >>}
+
+<< subsection.content >>
+
+<% endfor %>
+<% endfor %>
+
+%% ---- Figures ----
+<% for figure in figures %>
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=<< figure.width >>\textwidth]{<< figure.filename >>}
+    \caption{<< figure.caption >>}
+    \label{fig:<< figure.figure_id >>}
+\end{figure}
+
+<% endfor %>
+
+%% ---- References ----
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
