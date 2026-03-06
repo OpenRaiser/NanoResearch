@@ -26,6 +26,7 @@ _CB_THRESHOLD = 3       # consecutive 429s before tripping
 _CB_COOLDOWN = 60.0     # seconds to pause after tripping
 _consecutive_429s = 0
 _circuit_open_until = 0.0  # monotonic timestamp
+_circuit_lock = asyncio.Lock()
 
 
 async def _circuit_breaker_check() -> bool:
@@ -39,21 +40,22 @@ async def _circuit_breaker_check() -> bool:
     return False
 
 
-def _circuit_breaker_record(status_code: int) -> None:
+async def _circuit_breaker_record(status_code: int) -> None:
     """Record a response status for circuit breaker logic."""
     global _consecutive_429s, _circuit_open_until
-    if status_code == 429:
-        _consecutive_429s += 1
-        if _consecutive_429s >= _CB_THRESHOLD:
-            _circuit_open_until = time.monotonic() + _CB_COOLDOWN
-            logger.warning(
-                "S2 circuit breaker TRIPPED after %d consecutive 429s, "
-                "pausing all S2 calls for %.0fs",
-                _consecutive_429s, _CB_COOLDOWN,
-            )
-            _consecutive_429s = 0  # reset after tripping
-    else:
-        _consecutive_429s = 0  # reset on success
+    async with _circuit_lock:
+        if status_code == 429:
+            _consecutive_429s += 1
+            if _consecutive_429s >= _CB_THRESHOLD:
+                _circuit_open_until = time.monotonic() + _CB_COOLDOWN
+                logger.warning(
+                    "S2 circuit breaker TRIPPED after %d consecutive 429s, "
+                    "pausing all S2 calls for %.0fs",
+                    _consecutive_429s, _CB_COOLDOWN,
+                )
+                _consecutive_429s = 0  # reset after tripping
+        else:
+            _consecutive_429s = 0  # reset on success
 
 S2_API_URL = "https://api.semanticscholar.org/graph/v1"
 S2_FIELDS = "paperId,title,authors,year,abstract,venue,citationCount,url,externalIds,citations,references"
@@ -90,7 +92,7 @@ async def search_semantic_scholar(
                 params=params, headers=headers,
                 max_retries=6,
             )
-            _circuit_breaker_record(resp.status_code)
+            await _circuit_breaker_record(resp.status_code)
             resp.raise_for_status()
             data = resp.json()
     except httpx.TimeoutException:
@@ -134,7 +136,7 @@ async def get_paper_details(paper_id: str) -> dict[str, Any]:
                 headers=headers,
                 max_retries=6,
             )
-            _circuit_breaker_record(resp.status_code)
+            await _circuit_breaker_record(resp.status_code)
             resp.raise_for_status()
             data = resp.json()
     except httpx.HTTPStatusError as exc:
@@ -154,6 +156,119 @@ async def get_paper_details(paper_id: str) -> dict[str, Any]:
         for r in data.get("references", []) or []
     ]
     return result
+
+
+async def get_papers_batch(
+    paper_ids: list[str],
+    fields: str = "paperId,title,authors,year,abstract,venue,citationCount,url,externalIds",
+) -> list[dict[str, Any]]:
+    """Fetch details for multiple papers in a single request (up to 500).
+
+    Uses POST /paper/batch — consumes only 1 API call for up to 500 papers.
+
+    Args:
+        paper_ids: List of paper IDs (S2 IDs, ArXiv:XXX, DOI:XXX, etc.).
+        fields: Comma-separated fields to return.
+
+    Returns:
+        List of paper metadata dicts (in same order as input; None for not-found).
+    """
+    if not paper_ids:
+        return []
+
+    await _circuit_breaker_check()
+    await _limiter.acquire()
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("S2_API_KEY", "")
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    # S2 batch limit is 500
+    results: list[dict[str, Any]] = []
+    for i in range(0, len(paper_ids), 500):
+        chunk = paper_ids[i:i + 500]
+        if i > 0:
+            await _limiter.acquire()
+        try:
+            async with get_http_client() as client:
+                resp = await fetch_with_retry(
+                    client.post,
+                    f"{S2_API_URL}/paper/batch",
+                    params={"fields": fields},
+                    json={"ids": chunk},
+                    headers=headers,
+                    max_retries=6,
+                )
+                await _circuit_breaker_record(resp.status_code)
+                resp.raise_for_status()
+                data = resp.json()
+        except httpx.HTTPStatusError as exc:
+            logger.warning("S2 batch HTTP %d for %d papers", exc.response.status_code, len(chunk))
+            results.extend([{}] * len(chunk))
+            continue
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("S2 batch failed: %s", exc)
+            results.extend([{}] * len(chunk))
+            continue
+
+        for item in data:
+            if item is None:
+                results.append({})
+            else:
+                results.append(_normalize_paper(item))
+    return results
+
+
+async def search_paper_by_title(
+    title: str,
+    fields: str = "paperId,title,authors,year,abstract,venue,citationCount,url,externalIds",
+) -> dict[str, Any] | None:
+    """Find a single paper by closest title match.
+
+    Uses GET /paper/search/match — more precise than keyword search for
+    known titles, and returns only 1 result (1 API call).
+
+    Args:
+        title: The paper title to search for.
+        fields: Comma-separated fields to return.
+
+    Returns:
+        Paper metadata dict, or None if no match found.
+    """
+    await _circuit_breaker_check()
+    await _limiter.acquire()
+    headers = {}
+    api_key = os.environ.get("S2_API_KEY", "")
+    if api_key:
+        headers["x-api-key"] = api_key
+
+    try:
+        async with get_http_client() as client:
+            resp = await fetch_with_retry(
+                client.get,
+                f"{S2_API_URL}/paper/search/match",
+                params={"query": title[:200], "fields": fields},
+                headers=headers,
+                max_retries=6,
+            )
+            await _circuit_breaker_record(resp.status_code)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code == 404:
+            return None
+        logger.warning("S2 title match HTTP %d for: %s", exc.response.status_code, title[:60])
+        return None
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("S2 title match failed for '%s': %s", title[:60], exc)
+        return None
+
+    matches = data.get("data", [])
+    if matches:
+        return _normalize_paper(matches[0])
+    return None
 
 
 def _normalize_paper(p: dict) -> dict[str, Any]:

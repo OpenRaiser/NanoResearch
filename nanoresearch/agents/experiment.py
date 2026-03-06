@@ -335,11 +335,26 @@ class ExperimentAgent(BaseResearchAgent):
                 )
             else:
                 # ---- Round 2+: iterative improvement ----
-                prev_analysis = iteration_state.rounds[-1].analysis
+                prev_round = iteration_state.rounds[-1]
+                prev_analysis = prev_round.analysis
                 history_summary = self._build_history_summary(iteration_state.rounds)
 
+                # If previous round failed preflight, inject the error into context
+                preflight_error_ctx = ""
+                if prev_round.preflight and prev_round.preflight.overall_status == "failed":
+                    failures = []
+                    for chk in prev_round.preflight.checks:
+                        if chk.status == "failed":
+                            failures.append(f"- [{chk.check_name}] {chk.message}")
+                    preflight_error_ctx = (
+                        "\n== PREFLIGHT FAILURES (must fix these first!) ==\n"
+                        + "\n".join(failures)
+                        + "\n== END PREFLIGHT FAILURES =="
+                    )
+
                 hypothesis = await self._generate_iteration_hypothesis(
-                    prev_analysis, history_summary, blueprint_summary
+                    prev_analysis, history_summary, blueprint_summary,
+                    preflight_error_ctx=preflight_error_ctx,
                 )
                 hypothesis.round_number = round_num
 
@@ -543,6 +558,7 @@ class ExperimentAgent(BaseResearchAgent):
         analysis: FeedbackAnalysis | None,
         history_summary: str,
         blueprint: str,
+        preflight_error_ctx: str = "",
     ) -> ExperimentHypothesis:
         """LLM generates the next iteration hypothesis from feedback."""
         analysis_text = ""
@@ -558,7 +574,7 @@ class ExperimentAgent(BaseResearchAgent):
             )
 
         prompt = f"""Based on the previous experiment round's feedback, generate a hypothesis for the next improvement iteration.
-
+{preflight_error_ctx}
 == Previous Analysis ==
 {analysis_text or "No analysis available."}
 
@@ -614,7 +630,13 @@ Output a JSON object with:
         code_dir: Path,
         venv_python: str,
     ) -> list[str]:
-        """LLM modifies specific files based on the hypothesis (not full regeneration)."""
+        """LLM modifies specific files using search-replace edits (OpenClaw style).
+
+        Uses precise search-replace blocks instead of full file rewrites to:
+        1. Reduce token usage (LLM only outputs the diff, not entire files)
+        2. Avoid accidental deletion of unchanged code
+        3. Make changes auditable
+        """
         # Collect current file contents for context
         file_contents: dict[str, str] = {}
         for py_file in code_dir.rglob("*.py"):
@@ -624,26 +646,25 @@ Output a JSON object with:
             try:
                 rel = str(py_file.relative_to(code_dir)).replace("\\", "/")
                 content = py_file.read_text(encoding="utf-8", errors="replace")
-                file_contents[rel] = content[:3000]  # truncate for context
+                file_contents[rel] = content
             except OSError:
                 continue
 
-        # Also include config/default.yaml
-        yaml_path = code_dir / "config" / "default.yaml"
-        if yaml_path.exists():
-            try:
-                file_contents["config/default.yaml"] = yaml_path.read_text(
-                    encoding="utf-8", errors="replace"
-                )[:2000]
-            except OSError:
-                pass
+        # Also include config and other non-py files
+        for pattern in ("config/*.yaml", "config/*.yml", "*.txt", "*.sh"):
+            for f in code_dir.glob(pattern):
+                try:
+                    rel = str(f.relative_to(code_dir)).replace("\\", "/")
+                    file_contents[rel] = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
 
         files_summary = "\n".join(
-            f"--- {path} ---\n{content[:1500]}\n"
+            f"--- {path} ---\n{content[:2000]}\n"
             for path, content in file_contents.items()
         )
 
-        prompt = f"""Apply the following changes to the experiment code project.
+        prompt = f"""Apply the following changes to the experiment code project using SEARCH-REPLACE edits.
 
 == Hypothesis ==
 {hypothesis.hypothesis}
@@ -655,18 +676,33 @@ Output a JSON object with:
 {hypothesis.rationale}
 
 == Current Files ==
-{files_summary[:12000]}
+{files_summary[:15000]}
 
-For each file you want to modify, output a JSON array of objects:
-[
-  {{
-    "path": "relative/path.py",
-    "content": "FULL file content (not a diff)"
-  }},
-  ...
-]
+Output a JSON array of edit operations. Two types are supported:
 
-Only include files that need changes. Output the COMPLETE file content for each.
+1. **Search-replace edit** (preferred for modifying existing files):
+{{
+  "path": "relative/path.py",
+  "action": "edit",
+  "edits": [
+    {{"old": "exact text to find", "new": "replacement text"}}
+  ]
+}}
+
+2. **Full file write** (only for NEW files that don't exist yet):
+{{
+  "path": "relative/new_file.py",
+  "action": "write",
+  "content": "full file content"
+}}
+
+IMPORTANT RULES:
+- "old" must be an EXACT substring of the current file content (including whitespace/indentation)
+- Each "old" string must be unique within its file
+- Use search-replace for ALL modifications to existing files
+- Only use "write" action for creating brand new files
+- Multiple edits per file are fine — they are applied sequentially
+
 Output ONLY valid JSON array."""
 
         modified_files: list[str] = []
@@ -674,7 +710,7 @@ Output ONLY valid JSON array."""
             code_gen_config = self.config.for_stage("code_gen")
             raw = await self._dispatcher.generate(
                 code_gen_config,
-                "You are an ML code editor. Modify the specified files to implement the hypothesis. Output ONLY a JSON array of {path, content} objects.",
+                "You are an ML code editor. Apply precise search-replace edits to implement the hypothesis. Output ONLY a JSON array.",
                 prompt,
             )
             text = raw.strip()
@@ -689,7 +725,7 @@ Output ONLY valid JSON array."""
                 changes = [changes]
 
             for change in changes:
-                if not isinstance(change, dict) or "path" not in change or "content" not in change:
+                if not isinstance(change, dict) or "path" not in change:
                     continue
                 file_path = change["path"]
                 # Security: prevent directory traversal
@@ -699,10 +735,67 @@ Output ONLY valid JSON array."""
                     logger.warning("Skipping unsafe iteration path: %s", file_path)
                     continue
 
-                content = change["content"]
-                self.workspace.write_text(f"code/{file_path}", content)
-                modified_files.append(file_path)
-                self.log(f"  Modified: {file_path}")
+                action = change.get("action", "write")  # backwards compat
+
+                if action == "edit":
+                    # Search-replace mode
+                    edits = change.get("edits", [])
+                    if not edits:
+                        continue
+                    # Read current content
+                    target = code_dir / file_path
+                    if not target.exists():
+                        logger.warning("Edit target does not exist: %s", file_path)
+                        continue
+                    try:
+                        current = target.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+
+                    applied = 0
+                    for edit in edits:
+                        if not isinstance(edit, dict):
+                            continue
+                        old = edit.get("old", "")
+                        new = edit.get("new", "")
+                        if not old:
+                            continue
+                        if old in current:
+                            current = current.replace(old, new, 1)
+                            applied += 1
+                        else:
+                            # Try whitespace-normalized match
+                            old_normalized = " ".join(old.split())
+                            for line_start in range(len(current)):
+                                chunk = current[line_start:line_start + len(old) + 200]
+                                if " ".join(chunk[:len(old) + 100].split()).startswith(old_normalized[:60]):
+                                    # Find the actual extent
+                                    end = current.find("\n", line_start + len(old) - 10)
+                                    if end == -1:
+                                        end = len(current)
+                                    candidate = current[line_start:end]
+                                    if " ".join(candidate.split()) == old_normalized:
+                                        current = current[:line_start] + new + current[end:]
+                                        applied += 1
+                                        break
+                            else:
+                                logger.warning(
+                                    "Edit old text not found in %s: %s",
+                                    file_path, old[:80],
+                                )
+
+                    if applied > 0:
+                        self.workspace.write_text(f"code/{file_path}", current)
+                        modified_files.append(file_path)
+                        self.log(f"  Edited: {file_path} ({applied}/{len(edits)} edits applied)")
+                else:
+                    # Full write mode (new files or backwards compat)
+                    content = change.get("content", "")
+                    if not content:
+                        continue
+                    self.workspace.write_text(f"code/{file_path}", content)
+                    modified_files.append(file_path)
+                    self.log(f"  Wrote: {file_path}")
 
         except Exception as exc:
             logger.warning("Failed to apply iteration changes: %s", exc)

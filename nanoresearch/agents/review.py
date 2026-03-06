@@ -77,6 +77,12 @@ class ReviewAgent(BaseResearchAgent):
         if figure_issues:
             self.log(f"Found {len(figure_issues)} figure alignment issues")
 
+        # Step 2d: Citation coverage check
+        citation_issues = self._check_citation_coverage(paper_tex, ideation_output)
+        review.consistency_issues.extend(citation_issues)
+        if citation_issues:
+            self.log(f"Found {len(citation_issues)} citation coverage issues")
+
         # Step 2b: Fix incoherent reviews (low score but no issues)
         for sr in review.section_reviews:
             if sr.score < MIN_SECTION_SCORE and not sr.issues:
@@ -307,6 +313,30 @@ class ReviewAgent(BaseResearchAgent):
 
             # Sanitize the revised LaTeX (fix Unicode, LLM artifacts, etc.)
             revised_tex = self._sanitize_revised_tex(revised_tex)
+
+            # Deduplicate figures: keep only the first occurrence of each figure
+            seen_fig_labels: set[str] = set()
+            seen_fig_files: set[str] = set()
+            def _dedup_fig(m: re.Match) -> str:
+                block = m.group(0)
+                label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+                if label_m:
+                    lbl = label_m.group(1)
+                    if lbl in seen_fig_labels:
+                        return ""
+                    seen_fig_labels.add(lbl)
+                file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+                if file_m:
+                    fname = file_m.group(1)
+                    if fname in seen_fig_files:
+                        return ""
+                    seen_fig_files.add(fname)
+                return block
+            revised_tex = re.sub(
+                r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+                _dedup_fig, revised_tex, flags=re.DOTALL,
+            )
+            revised_tex = re.sub(r'\n{3,}', '\n\n', revised_tex)
 
             # Resolve any new citations introduced during revision
             bib_path = self.workspace.path / "drafts" / "references.bib"
@@ -1039,6 +1069,70 @@ Return JSON:
 
         return issues
 
+    def _check_citation_coverage(self, tex: str, ideation_output: dict) -> list[ConsistencyIssue]:
+        """Check citation coverage: total count and must-cite enforcement."""
+        import re
+        issues: list[ConsistencyIssue] = []
+
+        # Count total unique citations
+        cite_pattern = re.compile(r"\\cite[tp]?\{([^}]+)\}")
+        cited: set[str] = set()
+        for m in cite_pattern.finditer(tex):
+            for k in m.group(1).split(","):
+                k = k.strip()
+                if k:
+                    cited.add(k)
+
+        total = len(cited)
+        if total < 10:
+            issues.append(ConsistencyIssue(
+                issue_type="low_citation_count",
+                description=(
+                    f"Paper has only {total} unique citations. "
+                    "A top-venue paper typically needs 25+ citations. "
+                    "Add more references, especially in Related Work and Introduction."
+                ),
+                severity="high",
+                locations=["Related Work", "Introduction"],
+            ))
+        elif total < 20:
+            issues.append(ConsistencyIssue(
+                issue_type="moderate_citation_count",
+                description=(
+                    f"Paper has {total} unique citations. "
+                    "Consider adding more to strengthen Related Work (target: 25+)."
+                ),
+                severity="medium",
+                locations=["Related Work"],
+            ))
+
+        # Check Related Work section specifically
+        rw_pattern = re.compile(
+            r'\\section\{Related Work\}(.*?)(?=\\section\{|\\end\{document\})',
+            re.DOTALL
+        )
+        rw_match = rw_pattern.search(tex)
+        if rw_match:
+            rw_content = rw_match.group(1)
+            rw_cited: set[str] = set()
+            for m in cite_pattern.finditer(rw_content):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        rw_cited.add(k)
+            if len(rw_cited) < 10:
+                issues.append(ConsistencyIssue(
+                    issue_type="sparse_related_work_citations",
+                    description=(
+                        f"Related Work has only {len(rw_cited)} unique citations. "
+                        "A thorough survey needs 15+ citations minimum."
+                    ),
+                    severity="medium",
+                    locations=["Related Work"],
+                ))
+
+        return issues
+
     def _check_figure_text_alignment(self, tex: str) -> list[ConsistencyIssue]:
         """Check that figure references match figure definitions."""
         import re
@@ -1075,6 +1169,7 @@ Return JSON:
 
         try:
             from nanoresearch.agents.checkers import (
+                check_ai_writing_patterns,
                 check_bare_special_chars,
                 check_latex_consistency,
                 check_math_formulas,
@@ -1089,6 +1184,7 @@ Return JSON:
                 check_bare_special_chars,
                 check_unicode_issues,
                 validate_equations_sympy,
+                check_ai_writing_patterns,
             ):
                 try:
                     for issue in checker(tex):
@@ -1209,12 +1305,25 @@ Return JSON:
 
     @staticmethod
     def _sanitize_revised_tex(tex: str) -> str:
-        """Sanitize revised LaTeX using WritingAgent's sanitizer."""
+        """Sanitize revised LaTeX using WritingAgent's sanitizer.
+
+        Falls back to inline critical fixes if WritingAgent import fails.
+        """
         try:
             from nanoresearch.agents.writing import WritingAgent
             tex = WritingAgent._sanitize_latex(tex)
-        except ImportError:
-            logger.debug("WritingAgent not available for sanitization, skipping")
+        except Exception as exc:
+            logger.warning("WritingAgent._sanitize_latex failed (%s), applying inline fixes", exc)
+            # Inline fallback: at minimum fix the most critical issues
+            import re as _re
+            # [H]/[h]/[h!] → [t!] (preserve * for column-spanning variants)
+            tex = _re.sub(r'\\begin\{figure\}\s*\[[Hh]!?\]', r'\\begin{figure}[t!]', tex)
+            tex = _re.sub(r'\\begin\{figure\*\}\s*\[[Hh]!?\]', r'\\begin{figure*}[t!]', tex)
+            tex = _re.sub(r'\\begin\{table\}\s*\[[Hh]!?\]', r'\\begin{table}[t!]', tex)
+            tex = _re.sub(r'\\begin\{table\*\}\s*\[[Hh]!?\]', r'\\begin{table*}[t!]', tex)
+            # Unicode dashes
+            tex = tex.replace("\u2014", "---").replace("\u2013", "--")
+            tex = tex.replace("\u201c", "``").replace("\u201d", "''")
         return tex
 
     async def _compile_pdf_with_fix_loop(self, tex_path: Path) -> dict:
@@ -1436,7 +1545,7 @@ Return JSON:
             preamble = modified[:preamble_end]
             package_fixes = {
                 "\\multirow": ("multirow", "\\usepackage{multirow}"),
-                "\\multicolumn": ("multirow", "\\usepackage{multirow}"),
+                # \multicolumn is a core LaTeX command — no package needed; omitted
                 "\\toprule": ("booktabs", "\\usepackage{booktabs}"),
                 "\\midrule": ("booktabs", "\\usepackage{booktabs}"),
                 "\\bottomrule": ("booktabs", "\\usepackage{booktabs}"),
@@ -1455,8 +1564,10 @@ Return JSON:
                         self.log(f"  Deterministic: added {use_line}")
 
         # 5. Mismatched environments at the error line
-        if error_line and error_line <= len(tex_lines):
-            err_line_text = tex_lines[error_line - 1]
+        # Use modified (not original tex_lines) since prior steps may have changed line counts
+        modified_lines = modified.split('\n')
+        if error_line and error_line <= len(modified_lines):
+            err_line_text = modified_lines[error_line - 1]
             # Common: \begin{figure} without matching \end{figure}
             for env in ("figure", "figure*", "table", "table*", "align", "equation"):
                 begin_tag = f"\\begin{{{env}}}"
@@ -1472,10 +1583,9 @@ Return JSON:
                             self.log(f"  Deterministic: added missing {end_tag}")
                     elif end_count > begin_count:
                         # Extra \end — remove the one at error line
-                        lines = modified.split('\n')
-                        if error_line - 1 < len(lines) and end_tag in lines[error_line - 1]:
-                            lines[error_line - 1] = lines[error_line - 1].replace(end_tag, '', 1)
-                            modified = '\n'.join(lines)
+                        if error_line - 1 < len(modified_lines) and end_tag in modified_lines[error_line - 1]:
+                            modified_lines[error_line - 1] = modified_lines[error_line - 1].replace(end_tag, '', 1)
+                            modified = '\n'.join(modified_lines)
                             self.log(f"  Deterministic: removed extra {end_tag} at line {error_line}")
 
         return modified if modified != tex_source else None
@@ -1612,15 +1722,21 @@ Return JSON:
                 else:
                     # Try with normalized whitespace as fallback
                     old_norm = ' '.join(old.split())
-                    for line_idx, line in enumerate(result.split('\n')):
-                        if old_norm in ' '.join(line.split()):
-                            lines = result.split('\n')
-                            lines[line_idx] = line.replace(line.strip(), new.strip())
-                            result = '\n'.join(lines)
+                    result_lines = result.split('\n')
+                    matched = False
+                    for line_idx, line in enumerate(result_lines):
+                        line_norm = ' '.join(line.split())
+                        if old_norm in line_norm:
+                            # Replace only the matched fragment, not the entire line
+                            indent = line[:len(line) - len(line.lstrip())]
+                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
+                            result_lines[line_idx] = indent + new_line_norm
+                            result = '\n'.join(result_lines)
                             applied += 1
                             self.log(f"  Level 2: applied edit with whitespace normalization")
+                            matched = True
                             break
-                    else:
+                    if not matched:
                         self.log(f"  Level 2: old text not found, skipping edit")
 
             if applied > 0 and result != tex_source:

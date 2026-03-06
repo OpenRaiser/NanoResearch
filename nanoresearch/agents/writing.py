@@ -72,6 +72,9 @@ PAPER_SECTIONS = [
      "Cite quantitative results from prior work where available from the evidence data.\n"
      "IMPORTANT: Every \\cite{} or \\citet{} key MUST be from the provided CITATION KEYS list. "
      "Do NOT invent citation keys. If uncertain about a key, omit the citation.\n"
+     "MUST-CITE ENFORCEMENT: If the context includes a 'MUST-CITE PAPERS' section, "
+     "you MUST cite ALL of those papers in this section. Organize them into your thematic "
+     "clusters naturally. Do not skip any must-cite paper.\n"
      "FAIRNESS: discuss the STRONGEST baselines, not just weak ones. "
      "Acknowledge prior contributions before noting limitations.\n"
      "Use \\citet{key} when author is subject, \\citep{key} for parenthetical.",
@@ -188,24 +191,61 @@ class WritingAgent(BaseResearchAgent):
         # Track which figure blocks have been placed
         placed_figures: set[str] = set()
 
-        # Add list of available figures to context for the LLM
-        fig_list_text = "\n".join(
-            f"  - \\ref{{fig:{k}}}: {k}" for k in figure_blocks
-        )
-        context_with_figs = (
-            f"{context}\n\n"
-            f"=== AVAILABLE FIGURES (use \\ref{{fig:NAME}} to reference) ===\n"
-            f"{fig_list_text}\n"
-            f"=== END FIGURES ==="
-        )
-
         sections = []
         prior_sections_summary: list[str] = []
         for heading, label, instructions, fig_keys in PAPER_SECTIONS:
             self.log(f"Writing section: {heading}")
+
+            # Build per-section figure context: only show UN-placed figures
+            remaining_figs = [k for k in figure_blocks if k not in placed_figures]
+            fig_list_text = "\n".join(
+                f"  - \\ref{{fig:{k}}}: {k}" for k in remaining_figs
+            )
+            placed_note = ""
+            if placed_figures:
+                placed_list = ", ".join(sorted(placed_figures))
+                placed_note = (
+                    f"\nFigures ALREADY placed in previous sections (do NOT include again): "
+                    f"{placed_list}\n"
+                )
+            context_with_figs = (
+                f"{context}\n\n"
+                f"=== AVAILABLE FIGURES (use \\ref{{fig:NAME}} to reference) ===\n"
+                f"{fig_list_text}\n"
+                f"{placed_note}"
+                f"=== END FIGURES ==="
+            )
+
             content = await self._generate_section(
                 context_with_figs, heading, instructions, prior_sections_summary
             )
+
+            # ── Detect figures the LLM already embedded in section content ──
+            # This prevents the code from placing the same figures again.
+            # Match by \label{fig:XXX}
+            llm_placed_labels = re.findall(
+                r'\\begin\{figure\*?\}.*?\\label\{fig:([^}]+)\}.*?\\end\{figure\*?\}',
+                content, re.DOTALL,
+            )
+            for fig_label in llm_placed_labels:
+                if fig_label in figure_blocks and fig_label not in placed_figures:
+                    placed_figures.add(fig_label)
+                    self.log(f"  LLM already placed fig:{fig_label} in {heading}")
+            # Also match by \includegraphics filename (e.g., fig3_main_results.pdf)
+            llm_placed_files = re.findall(
+                r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}',
+                content,
+            )
+            for fname in llm_placed_files:
+                # Map filename back to figure key: "fig3_main_results.pdf" → "main_results"
+                stem = fname.rsplit(".", 1)[0]  # remove extension
+                for fk in figure_blocks:
+                    if fk in placed_figures:
+                        continue
+                    # Check if the filename contains the figure key
+                    if fk in stem or stem.endswith(fk):
+                        placed_figures.add(fk)
+                        self.log(f"  LLM already included {fname} → marking fig:{fk} as placed in {heading}")
 
             # ── Smart figure placement ──
             if label == "sec:intro":
@@ -305,6 +345,37 @@ class WritingAgent(BaseResearchAgent):
         self.log(f"Figure placement complete: {len(figure_blocks)} blocks, "
                  f"{len(placed_figures)} placed")
 
+        # ── Post-assembly deduplication: remove duplicate figure blocks ──
+        # If the same figure appears in multiple sections, keep only the first occurrence.
+        seen_fig_labels: set[str] = set()
+        seen_fig_files: set[str] = set()
+        for sec in sections:
+            def _dedup_figure(m: re.Match) -> str:
+                block = m.group(0)
+                # Check by label
+                label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+                if label_m:
+                    lbl = label_m.group(1)
+                    if lbl in seen_fig_labels:
+                        self.log(f"  Removed duplicate figure {lbl} from {sec.heading}")
+                        return ""
+                    seen_fig_labels.add(lbl)
+                # Check by includegraphics filename
+                file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+                if file_m:
+                    fname = file_m.group(1)
+                    if fname in seen_fig_files:
+                        self.log(f"  Removed duplicate figure file {fname} from {sec.heading}")
+                        return ""
+                    seen_fig_files.add(fname)
+                return block
+            sec.content = re.sub(
+                r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+                _dedup_figure, sec.content, flags=re.DOTALL,
+            )
+            # Clean up leftover blank lines from removed figures
+            sec.content = re.sub(r'\n{3,}', '\n\n', sec.content)
+
         # Step 5: Build skeleton
         skeleton = PaperSkeleton(
             title=title,
@@ -320,12 +391,55 @@ class WritingAgent(BaseResearchAgent):
         latex_content = self._render_latex(skeleton)
         latex_content = self._sanitize_latex(latex_content)
 
+        # Step 6b-pre: Full-document figure dedup (safety net after assembly)
+        # Per-section dedup ran earlier, but assembly/render might re-introduce duplicates
+        seen_labels: set[str] = set()
+        seen_files: set[str] = set()
+        def _dedup_assembled(m: re.Match) -> str:
+            block = m.group(0)
+            lbl_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+            if lbl_m:
+                lbl = lbl_m.group(1)
+                if lbl in seen_labels:
+                    self.log(f"  Full-doc dedup: removed duplicate figure {lbl}")
+                    return ""
+                seen_labels.add(lbl)
+            file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+            if file_m:
+                fname = file_m.group(1)
+                if fname in seen_files:
+                    self.log(f"  Full-doc dedup: removed duplicate figure file {fname}")
+                    return ""
+                seen_files.add(fname)
+            return block
+        latex_content = re.sub(
+            r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+            _dedup_assembled, latex_content, flags=re.DOTALL,
+        )
+        latex_content = re.sub(r'\n{3,}', '\n\n', latex_content)
+
         # Step 6b: Final LaTeX-level figure validation
         # Check that every figure file from figure_output has an \includegraphics in the tex
         latex_content = self._validate_figures_in_latex(latex_content, figure_output)
 
         # Step 6c: Resolve missing citations — find \cite keys not in bib, auto-fill
         bibtex = await self._resolve_missing_citations(latex_content, bibtex)
+
+        # Step 6d: Citation coverage validation + must-cite enforcement
+        citation_report = self._validate_citation_coverage(
+            latex_content, ideation, cite_keys
+        )
+        if citation_report.get("missing_must_cites"):
+            self.log(f"Must-cite enforcement: {len(citation_report['missing_must_cites'])} "
+                     f"must-cite papers not referenced, injecting into Related Work")
+            latex_content = self._inject_must_cites(
+                latex_content, citation_report["missing_must_cites"], cite_keys, ideation
+            )
+            # Re-resolve in case new cite keys were introduced
+            bibtex = await self._resolve_missing_citations(latex_content, bibtex)
+
+        # Log citation quality report
+        self._log_citation_report(citation_report)
 
         # Save outputs
         tex_path = self.workspace.write_text("drafts/paper.tex", latex_content)
@@ -521,7 +635,60 @@ Each contribution in Introduction MUST map to experimental evidence:
 - Method components: {json.dumps([c for c in method.get('key_components', [])], ensure_ascii=False)}
 - Ablation groups: {json.dumps([a.get('group_name', '') for a in ablations], ensure_ascii=False)}
 Every component listed above should appear in the ablation table.
-=== END ALIGNMENT ==={full_text_block}"""
+=== END ALIGNMENT ===
+
+{self._build_must_cite_context(ideation, cite_keys)}{full_text_block}"""
+
+    def _build_must_cite_context(self, ideation: dict, cite_keys: dict[int, str]) -> str:
+        """Build a must-cite instruction block for writing prompts.
+
+        Maps must-cite titles to their actual cite_keys so the LLM
+        knows exactly which keys to use.
+        """
+        must_cites = ideation.get("must_cites", [])
+        must_cite_matches = ideation.get("must_cite_matches", [])
+        if not must_cites:
+            return ""
+
+        lines = ["=== MUST-CITE PAPERS (these MUST appear in the paper, especially Related Work) ==="]
+        lines.append("The following papers are essential references identified from survey analysis.")
+        lines.append("You MUST cite each of these at least once in the paper.\n")
+
+        papers = ideation.get("papers", [])
+        cited_keys = []
+        for mc in must_cite_matches:
+            title = mc.get("title", "")
+            idx = mc.get("paper_index")
+            matched = mc.get("matched", False)
+            if matched and idx is not None and idx in cite_keys:
+                key = cite_keys[idx]
+                lines.append(f"  - \\cite{{{key}}}: {title}")
+                cited_keys.append(key)
+            else:
+                lines.append(f"  - [no key available]: {title} (cite by searching if possible)")
+
+        # If no matches but we have titles, still list them
+        if not must_cite_matches:
+            for title in must_cites[:15]:
+                # Try to find by title in papers
+                for i, p in enumerate(papers):
+                    if not isinstance(p, dict):
+                        continue
+                    p_title = (p.get("title") or "").lower().strip()
+                    mc_lower = title.lower().strip()
+                    mc_words = set(mc_lower.split())
+                    p_words = set(p_title.split())
+                    if mc_words and p_words:
+                        overlap = len(mc_words & p_words) / max(len(mc_words), len(p_words))
+                        if overlap > 0.5 and i in cite_keys:
+                            lines.append(f"  - \\cite{{{cite_keys[i]}}}: {title}")
+                            cited_keys.append(cite_keys[i])
+                            break
+                else:
+                    lines.append(f"  - [unmatched]: {title}")
+
+        lines.append("\n=== END MUST-CITE ===")
+        return "\n".join(lines)
 
     @staticmethod
     def _build_evidence_context(ideation: dict, blueprint: dict) -> str:
@@ -801,6 +968,64 @@ Every component listed above should appear in the ablation table.
         except ImportError:
             pass
 
+        # RAG tool: read full-text from a paper's PDF
+        try:
+            from mcp_server.tools.pdf_reader import download_and_extract
+
+            async def _read_paper_pdf(pdf_url: str, section: str = "") -> dict:
+                """Download a paper PDF and extract its full text or a specific section."""
+                result = await download_and_extract(pdf_url, max_pages=20)
+                if section:
+                    # Return specific section if requested
+                    sections = result.get("sections", {})
+                    for name, content in sections.items():
+                        if section.lower() in name.lower():
+                            return {"section": name, "content": content[:5000]}
+                    return {"error": f"Section '{section}' not found. Available: {list(sections.keys())}"}
+                # Return method + experiment + abstract (most useful for writing)
+                out: dict = {}
+                if result.get("method_text"):
+                    out["method"] = result["method_text"][:4000]
+                if result.get("experiment_text"):
+                    out["experiments"] = result["experiment_text"][:4000]
+                sections = result.get("sections", {})
+                if "Abstract" in sections:
+                    out["abstract"] = sections["Abstract"][:1000]
+                if not out:
+                    out["full_text"] = result.get("full_text", "")[:6000]
+                out["page_count"] = result.get("page_count", 0)
+                out["sections_available"] = list(sections.keys())
+                return out
+
+            registry.register(ToolDefinition(
+                name="read_paper_pdf",
+                description=(
+                    "Download and read a paper's PDF to get its full text. "
+                    "Use this to get detailed method descriptions, experiment setups, "
+                    "or specific results from a paper. Provide the PDF URL "
+                    "(e.g., https://arxiv.org/pdf/2301.12345). "
+                    "Optionally specify a section name to read only that section."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pdf_url": {
+                            "type": "string",
+                            "description": "URL to the PDF file (e.g., https://arxiv.org/pdf/XXXX.XXXXX)",
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": "Optional section name to extract (e.g., 'Method', 'Experiments')",
+                            "default": "",
+                        },
+                    },
+                    "required": ["pdf_url"],
+                },
+                handler=_read_paper_pdf,
+            ))
+        except ImportError:
+            pass
+
         return registry if len(registry) > 0 else None
 
     # ---- section generation -------------------------------------------------
@@ -808,7 +1033,7 @@ Every component listed above should appear in the ablation table.
     async def _generate_title(self, context: str) -> str:
         prompt = f"Based on the following research context, generate a paper title:\n\n{context}"
         try:
-            return (await self.generate(TITLE_SYSTEM_PROMPT, prompt)).strip().strip('"')
+            return ((await self.generate(TITLE_SYSTEM_PROMPT, prompt)) or "").strip().strip('"')
         except Exception as e:
             logger.warning("Title generation failed, using fallback: %s", e)
             return "Untitled Research Paper"
@@ -816,7 +1041,7 @@ Every component listed above should appear in the ablation table.
     async def _generate_abstract(self, context: str) -> str:
         prompt = f"Based on the following research context, write the abstract:\n\n{context}"
         try:
-            return (await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)).strip()
+            return ((await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)) or "").strip()
         except Exception as e:
             logger.warning("Abstract generation failed, using fallback: %s", e)
             return "Abstract not available."
@@ -859,15 +1084,19 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                         "If you need to verify citations, find additional references, "
                         "or look up recent results, use the tools before writing."
                     )
-                    return (await self.generate_with_tools(
+                    content = (await self.generate_with_tools(
                         section_system, tool_prompt, tools,
                         max_tool_rounds=10,
-                    )).strip()
+                    ) or "").strip()
+                    if not content:
+                        self.log(f"  ReAct loop returned empty content for {heading}, retrying without tools")
+                        content = ((await self.generate(section_system, prompt)) or "").strip()
+                    return content
             except Exception as e:
                 logger.warning("Tool-augmented writing failed for %s, falling back: %s", heading, e)
 
         try:
-            return (await self.generate(section_system, prompt)).strip()
+            return ((await self.generate(section_system, prompt)) or "").strip()
         except Exception as e:
             logger.warning("Section generation failed for %s: %s", heading, e)
             return f"% Section generation failed: {heading}"
@@ -938,7 +1167,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
     # ---- missing citation resolver -------------------------------------------
 
-    _CITE_KEY_RE = re.compile(r"\\cite[tp]?\{([^}]+)\}")
+    _CITE_KEY_RE = re.compile(r"\\cite[tp]?(?:\[[^\]]*\])*\{([^}]+)\}")
     _BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)")
 
     async def _resolve_missing_citations(
@@ -1060,6 +1289,182 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             f"}}\n"
         )
 
+    # ---- citation coverage validation ----------------------------------------
+
+    def _validate_citation_coverage(
+        self, latex: str, ideation: dict, cite_keys: dict[int, str]
+    ) -> dict:
+        """Validate citation quality of the written paper.
+
+        Checks:
+        1. Total citation count
+        2. Must-cite papers referenced
+        3. Citation distribution across sections
+        4. High-cited papers coverage
+        """
+        # 1. Extract all cited keys
+        cited: set[str] = set()
+        for m in self._CITE_KEY_RE.finditer(latex):
+            for k in m.group(1).split(","):
+                k = k.strip()
+                if k:
+                    cited.add(k)
+
+        total_citations = len(cited)
+
+        # 2. Check must-cite coverage
+        must_cites = ideation.get("must_cites", [])
+        must_cite_matches = ideation.get("must_cite_matches", [])
+        papers = ideation.get("papers", [])
+
+        missing_must_cites: list[dict] = []
+        cited_must_cites: list[str] = []
+        for mc in must_cite_matches:
+            idx = mc.get("paper_index")
+            matched = mc.get("matched", False)
+            title = mc.get("title", "")
+            if matched and idx is not None and idx in cite_keys:
+                key = cite_keys[idx]
+                if key in cited:
+                    cited_must_cites.append(title)
+                else:
+                    missing_must_cites.append({"title": title, "cite_key": key, "paper_index": idx})
+            else:
+                # Unmatched must-cite — can't check, but flag it
+                missing_must_cites.append({"title": title, "cite_key": None, "paper_index": None})
+
+        # 3. Citation distribution by section
+        section_cites: dict[str, int] = {}
+        # Split by \section
+        section_pattern = re.compile(r'\\section\{([^}]+)\}')
+        parts = section_pattern.split(latex)
+        for i in range(1, len(parts), 2):
+            sec_name = parts[i] if i < len(parts) else "Unknown"
+            sec_content = parts[i + 1] if i + 1 < len(parts) else ""
+            sec_cited = set()
+            for m in self._CITE_KEY_RE.finditer(sec_content):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        sec_cited.add(k)
+            section_cites[sec_name] = len(sec_cited)
+
+        # 4. High-cited papers coverage
+        high_cited_keys = set()
+        for i, p in enumerate(papers):
+            if not isinstance(p, dict):
+                continue
+            if (p.get("citation_count", 0) or 0) >= 100 and i in cite_keys:
+                high_cited_keys.add(cite_keys[i])
+
+        cited_high = high_cited_keys & cited
+        uncited_high = high_cited_keys - cited
+
+        return {
+            "total_citations": total_citations,
+            "must_cite_total": len(must_cites),
+            "must_cite_found": len(cited_must_cites),
+            "missing_must_cites": missing_must_cites,
+            "cited_must_cites": cited_must_cites,
+            "section_cites": section_cites,
+            "high_cited_total": len(high_cited_keys),
+            "high_cited_referenced": len(cited_high),
+            "uncited_high_keys": sorted(uncited_high),
+        }
+
+    def _inject_must_cites(
+        self, latex: str, missing: list[dict],
+        cite_keys: dict[int, str], ideation: dict,
+    ) -> str:
+        """Inject missing must-cite papers into the Related Work section.
+
+        Adds a brief sentence for each must-cite paper that was identified
+        but not referenced in the paper.
+        """
+        papers = ideation.get("papers", [])
+
+        # Build injection lines
+        inject_lines = []
+        for mc in missing:
+            key = mc.get("cite_key")
+            idx = mc.get("paper_index")
+            if not key:
+                continue  # Can't inject without a cite key
+
+            # Get paper title for context
+            title = mc.get("title", "")
+            if idx is not None and idx < len(papers):
+                p = papers[idx]
+                if isinstance(p, dict):
+                    title = p.get("title", title)
+
+            inject_lines.append(f"\\citet{{{key}}} is also relevant to this line of research.")
+
+        if not inject_lines:
+            return latex
+
+        injection = "\n".join(inject_lines)
+
+        # Find the Related Work section and inject before its end
+        rw_pattern = re.compile(
+            r'(\\section\{Related Work\}.*?)'
+            r'(\\section\{)',
+            re.DOTALL
+        )
+        m = rw_pattern.search(latex)
+        if m:
+            # Insert before next \section
+            insert_pos = m.start(2)
+            latex = (
+                latex[:insert_pos]
+                + "\n\n" + injection + "\n\n"
+                + latex[insert_pos:]
+            )
+            self.log(f"Injected {len(inject_lines)} must-cite references into Related Work")
+        else:
+            # Fallback: try inserting after Introduction
+            intro_pattern = re.compile(
+                r'(\\section\{Introduction\}.*?)(\\section\{)',
+                re.DOTALL
+            )
+            m = intro_pattern.search(latex)
+            if m:
+                insert_pos = m.start(2)
+                latex = (
+                    latex[:insert_pos]
+                    + "\n\n" + injection + "\n\n"
+                    + latex[insert_pos:]
+                )
+                self.log(f"Injected {len(inject_lines)} must-cite references after Introduction")
+
+        return latex
+
+    def _log_citation_report(self, report: dict) -> None:
+        """Log a citation quality report."""
+        self.log("=== Citation Quality Report ===")
+        self.log(f"  Total unique citations: {report.get('total_citations', 0)}")
+        self.log(f"  Must-cite coverage: {report.get('must_cite_found', 0)}/{report.get('must_cite_total', 0)}")
+        self.log(f"  High-cited papers referenced: {report.get('high_cited_referenced', 0)}/{report.get('high_cited_total', 0)}")
+
+        section_cites = report.get("section_cites", {})
+        if section_cites:
+            self.log("  Per-section citations:")
+            for sec, count in section_cites.items():
+                self.log(f"    {sec}: {count}")
+
+        uncited_high = report.get("uncited_high_keys", [])
+        if uncited_high:
+            self.log(f"  Uncited high-cited papers: {', '.join(uncited_high[:10])}")
+
+        missing = report.get("missing_must_cites", [])
+        if missing:
+            self.log(f"  Missing must-cites: {[m['title'][:50] for m in missing[:5]]}")
+
+        # Save report to workspace
+        self.save_log("citation_quality_report.json",
+                      json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        self.log("=== End Citation Report ===")
+
     def _render_latex(self, skeleton: PaperSkeleton) -> str:
         """Render the paper skeleton to LaTeX string."""
         try:
@@ -1090,7 +1495,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             r"\usepackage{multirow}",  # for multi-row table cells
             "",
             f"\\title{{{skeleton.title}}}",
-            f"\\author{{{' \\\\and '.join(skeleton.authors)}}}",
+            f"\\author{{{' \\and '.join(skeleton.authors)}}}",
             r"\date{}",
             "",
             r"\begin{document}",
@@ -1349,7 +1754,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         )
 
         try:
-            raw = await self.generate(system, prompt)
+            raw = (await self.generate(system, prompt)) or ""
             edits = ReviewAgent._parse_edit_json(raw)
 
             if not edits:
@@ -1369,14 +1774,22 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                     self.log(f"  Level 2: applied edit ({len(old)}→{len(new)} chars)")
                 else:
                     old_norm = ' '.join(old.split())
-                    for line_idx, line in enumerate(result.split('\n')):
-                        if old_norm in ' '.join(line.split()):
-                            lines = result.split('\n')
-                            lines[line_idx] = line.replace(line.strip(), new.strip())
-                            result = '\n'.join(lines)
+                    result_lines = result.split('\n')
+                    matched = False
+                    for line_idx, line in enumerate(result_lines):
+                        line_norm = ' '.join(line.split())
+                        if old_norm in line_norm:
+                            # Replace only the matched fragment, not the entire line
+                            indent = line[:len(line) - len(line.lstrip())]
+                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
+                            result_lines[line_idx] = indent + new_line_norm
+                            result = '\n'.join(result_lines)
                             applied += 1
                             self.log(f"  Level 2: applied edit with whitespace normalization")
+                            matched = True
                             break
+                    if not matched:
+                        self.log(f"  Level 2: old text not found, skipping edit")
 
             if applied > 0 and result != tex_source:
                 self.log(f"  Level 2: {applied} edit(s) applied successfully")
@@ -1458,8 +1871,9 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         # ── 3. Normalize figure placement ──
         # Use [t!] instead of [H] to let LaTeX optimize float placement.
         # placeins package with [section] option prevents cross-section drift.
+        # Normalize [H], [h], [h!] → [t!] for figure and figure*
         text = re.sub(
-            r'\\begin\{figure\}\s*\[H\]',
+            r'\\begin\{figure\}\s*\[[Hh]!?\]',
             r'\\begin{figure}[t!]',
             text,
         )
@@ -1469,20 +1883,19 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             r'\\begin{figure}[t!]',
             text,
         )
-        # Same for figure*
         text = re.sub(
-            r'\\begin\{figure\*\}\s*\[H\]',
+            r'\\begin\{figure\*\}\s*\[[Hh]!?\]',
             r'\\begin{figure*}[t!]',
             text,
         )
         # Normalize table placement too
         text = re.sub(
-            r'\\begin\{table\}\s*\[H\]',
+            r'\\begin\{table\}\s*\[[Hh]!?\]',
             r'\\begin{table}[t!]',
             text,
         )
         text = re.sub(
-            r'\\begin\{table\*\}\s*\[H\]',
+            r'\\begin\{table\*\}\s*\[[Hh]!?\]',
             r'\\begin{table*}[t!]',
             text,
         )
@@ -1492,6 +1905,24 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         # ── 5. Enforce contribution limit ──
         text = WritingAgent._enforce_contribution_limit(text)
+
+        # ── 6. Collapse blank lines before/after math environments ──
+        # A blank line before \begin{equation} creates a paragraph break → extra vertical space
+        _math_envs = r'(?:equation|align|gather|multline|eqnarray)\*?'
+        text = re.sub(
+            rf'\n[ \t]*\n([ \t]*\\begin\{{{_math_envs}\}})',
+            r'\n\1',
+            text,
+        )
+        # Also collapse blank lines after \end{math_env}
+        text = re.sub(
+            rf'(\\end\{{{_math_envs}\}})[ \t]*\n[ \t]*\n',
+            r'\1\n',
+            text,
+        )
+
+        # ── 7. Extract figure blocks from inside list environments ──
+        text = WritingAgent._extract_figures_from_lists(text)
 
         return text
 
@@ -1503,10 +1934,10 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         def _patch_table(match: re.Match) -> str:
             block = match.group(0)
-            # Inject \small after \begin{table}[...] if missing
+            # Inject \small after \begin{table}[...] or \begin{table*}[...] if missing
             if "\\small" not in block:
                 block = re.sub(
-                    r'(\\begin\{table\}\[[^\]]*\])',
+                    r'(\\begin\{table\*?\}\[[^\]]*\])',
                     r'\1\n\\small',
                     block,
                 )
@@ -1517,41 +1948,52 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                     "\\setlength{\\tabcolsep}{4pt}\n\\begin{tabular}",
                 )
             # Add @{} to tabular column spec if missing (opening and closing)
-            # Use balanced-brace matching since specs can contain @{}
-            def _add_at_braces(m):
-                full = m.group(0)  # e.g. \begin{tabular}{@{}lccr@{}}
-                # Extract column spec by finding the balanced { } after \begin{tabular}
-                idx = full.index("{", len("\\begin{tabular}"))
-                depth = 0
-                start = idx
-                end = idx
-                for i in range(idx, len(full)):
-                    if full[i] == '{':
-                        depth += 1
-                    elif full[i] == '}':
-                        depth -= 1
-                        if depth == 0:
-                            end = i
-                            break
-                spec = full[start + 1:end]  # inside the braces
-                # Clean up any previously garbled @{@{}} patterns
-                while "@{@{}}" in spec:
-                    spec = spec.replace("@{@{}}", "@{}")
-                if not spec.startswith("@{}"):
-                    spec = "@{}" + spec
-                if not spec.endswith("@{}"):
-                    spec = spec + "@{}"
-                return f"\\begin{{tabular}}{{{spec}}}"
-            block = re.sub(
-                r'\\begin\{tabular\}\{[^}]*(?:\{[^}]*\}[^}]*)*\}',
-                _add_at_braces,
-                block,
-            )
+            # Uses balanced-brace search to correctly handle @{} in column specs
+            def _fix_tabular_at_braces(text):
+                result = []
+                i = 0
+                tag = "\\begin{tabular}{"
+                while i < len(text):
+                    pos = text.find(tag, i)
+                    if pos == -1:
+                        result.append(text[i:])
+                        break
+                    result.append(text[i:pos])
+                    # Find matching closing brace using balanced counting
+                    brace_start = pos + len(tag) - 1  # index of opening {
+                    depth = 0
+                    brace_end = brace_start
+                    for j in range(brace_start, len(text)):
+                        if text[j] == '{':
+                            depth += 1
+                        elif text[j] == '}':
+                            depth -= 1
+                            if depth == 0:
+                                brace_end = j
+                                break
+                    if brace_end <= brace_start:
+                        # Can't parse, leave unchanged
+                        result.append(tag)
+                        i = pos + len(tag)
+                        continue
+                    spec = text[brace_start + 1:brace_end]
+                    # Clean up garbled patterns from prior runs
+                    while "@{@{}}" in spec:
+                        spec = spec.replace("@{@{}}", "@{}")
+                    if not spec.startswith("@{}"):
+                        spec = "@{}" + spec
+                    if not spec.endswith("@{}"):
+                        spec = spec + "@{}"
+                    result.append(f"\\begin{{tabular}}{{{spec}}}")
+                    i = brace_end + 1
+                return "".join(result)
+
+            block = _fix_tabular_at_braces(block)
             return block
 
-        # Match entire table environments (non-greedy)
+        # Match entire table environments (non-greedy), including table*
         text = re.sub(
-            r'\\begin\{table\}.*?\\end\{table\}',
+            r'\\begin\{table\*?\}.*?\\end\{table\*?\}',
             _patch_table,
             text,
             flags=re.DOTALL,
@@ -1595,8 +2037,67 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         return text
 
     @staticmethod
+    def _extract_figures_from_lists(text: str) -> str:
+        """Move figure/figure* blocks out of itemize/enumerate environments.
+
+        Figures inside list environments cause severe formatting issues,
+        especially with [H] placement. This extracts them and places
+        them immediately after the closing \\end{itemize/enumerate}.
+        """
+        fig_pattern = re.compile(
+            r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}', re.DOTALL
+        )
+        for env in ('itemize', 'enumerate'):
+            # Use re.sub with callback to handle ALL list instances in one pass
+            # Match innermost (non-nested) list environments
+            pat = re.compile(
+                rf'(\\begin\{{{env}\}})'
+                rf'((?:(?!\\begin\{{{env}\}})(?!\\end\{{{env}\}}).)*?)'
+                rf'(\\end\{{{env}\}})',
+                re.DOTALL,
+            )
+
+            def _move_figs(m: re.Match) -> str:
+                body = m.group(2)
+                figs = list(fig_pattern.finditer(body))
+                if not figs:
+                    return m.group(0)  # no figures, leave unchanged
+                # Extract figures from list body
+                extracted: list[str] = []
+                new_body = body
+                for fm in reversed(figs):
+                    extracted.insert(0, fm.group(0))
+                    new_body = new_body[:fm.start()] + new_body[fm.end():]
+                new_body = re.sub(r'\n{3,}', '\n\n', new_body)
+                return (
+                    m.group(1) + new_body + m.group(3)
+                    + '\n\n' + '\n\n'.join(extracted)
+                )
+
+            text = pat.sub(_move_figs, text)
+        return text
+
+    @staticmethod
     def _sanitize_bibtex(bib: str) -> str:
-        """Fix common Unicode issues in BibTeX entries."""
+        """Fix common Unicode issues in BibTeX entries and deduplicate."""
+        # ── 0. Deduplicate BibTeX entries by key ──
+        # Split into individual entries and keep only the first occurrence of each key.
+        entry_pattern = re.compile(r'(@\w+\s*\{[^,\s]+\s*,.*?\n\}\s*\n?)', re.DOTALL)
+        key_pattern = re.compile(r'@\w+\s*\{\s*([^,\s]+)\s*,')
+        entries = entry_pattern.findall(bib)
+        if entries:
+            seen_bib_keys: set[str] = set()
+            deduped_entries: list[str] = []
+            for entry in entries:
+                key_match = key_pattern.match(entry.strip())
+                if key_match:
+                    bib_key = key_match.group(1).strip()
+                    if bib_key in seen_bib_keys:
+                        continue
+                    seen_bib_keys.add(bib_key)
+                deduped_entries.append(entry.strip())
+            bib = "\n\n".join(deduped_entries) + "\n"
+
         replacements = {
             "\u00e9": r"{\'e}",
             "\u00e8": r"{\`e}",

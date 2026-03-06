@@ -13,12 +13,19 @@ from mcp_server.utils import get_http_client
 logger = logging.getLogger(__name__)
 
 # Common section heading patterns in academic papers
+# Broad enough to catch variants like "Model Architecture", "Proposed Framework", etc.
 _SECTION_PATTERNS = [
     re.compile(
-        r"^\s*(?:\d+\.?\s+)?(Introduction|Related\s+Work|Background|"
-        r"Method(?:s|ology)?|Approach|Experiment(?:s|al\s+(?:Setup|Results))?|"
-        r"Results?(?:\s+and\s+Discussion)?|Discussion|Conclusion(?:s)?|"
-        r"Abstract|Acknowledgment(?:s)?|References|Appendix)",
+        r"^\s*(?:\d+\.?\s+)?(Introduction|Related\s+Work|Background|Preliminaries|"
+        r"Problem\s+(?:Definition|Formulation|Statement|Setup)|"
+        r"Method(?:s|ology)?|Approach|(?:Proposed\s+)?(?:Model|Framework|System|Architecture)|"
+        r"(?:Our\s+)?(?:Method|Approach|Framework|Model)|Technical\s+Approach|"
+        r"Experiment(?:s|al)?(?:\s+(?:Setup|Results|Settings|Details))?|"
+        r"(?:Main\s+)?Results?(?:\s+and\s+(?:Discussion|Analysis))?|"
+        r"Evaluation|Analysis|Ablation(?:\s+Study)?|"
+        r"Discussion|Conclusion(?:s)?|Limitations?|Broader\s+Impact|"
+        r"Abstract|Acknowledgment(?:s)?|References|Appendix|"
+        r"Implementation\s+Details|Training\s+Details|Datasets?)",
         re.IGNORECASE | re.MULTILINE,
     ),
 ]
@@ -95,7 +102,11 @@ def extract_text_from_bytes(
         pages_text: list[str] = []
         for page_num in range(page_count):
             page = doc[page_num]
-            pages_text.append(page.get_text())
+            try:
+                pages_text.append(page.get_text())
+            except Exception as e:
+                logger.warning("Failed to extract text from page %d: %s", page_num + 1, e)
+                pages_text.append("")
     finally:
         doc.close()
 
@@ -106,10 +117,16 @@ def extract_text_from_bytes(
     experiment_text = ""
     for name, content in sections.items():
         name_lower = name.lower()
-        if "method" in name_lower or "approach" in name_lower:
-            method_text = content
-        elif "experiment" in name_lower or "result" in name_lower:
-            experiment_text = content
+        if any(kw in name_lower for kw in (
+            "method", "approach", "framework", "architecture", "model",
+            "technical", "proposed", "our method",
+        )):
+            method_text += ("\n\n" + content if method_text else content)
+        elif any(kw in name_lower for kw in (
+            "experiment", "result", "evaluation", "ablation",
+            "implementation", "training detail",
+        )):
+            experiment_text += ("\n\n" + content if experiment_text else content)
 
     return {
         "full_text": full_text,

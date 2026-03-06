@@ -33,6 +33,14 @@ class ConsistencyIssue(BaseModel):
     locations: list[str] = Field(default_factory=list, description="Where in the paper this occurs")
     severity: Literal["low", "medium", "high"] = Field(default="medium")
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, v):
+        """Normalize severity to lowercase to prevent Literal validation failures."""
+        if isinstance(v, str):
+            return v.lower()
+        return v
+
     @field_validator("issue_type", "description", mode="before")
     @classmethod
     def _coerce_to_str(cls, v):

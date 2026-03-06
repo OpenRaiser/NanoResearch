@@ -89,10 +89,17 @@ def _fix_json_escapes(text: str) -> str:
         if text[i] == '\\' and i + 1 < len(text):
             next_char = text[i + 1]
             if next_char in _VALID_JSON_ESCAPES:
-                # Valid JSON escape — keep as-is
-                result.append(text[i])
-                result.append(next_char)
-                i += 2
+                # Check if this is actually a LaTeX command (e.g. \textbf, \boldsymbol)
+                # rather than a JSON escape (\t, \n, \b, \f, \r, \u)
+                if next_char.isalpha() and i + 2 < len(text) and text[i + 2].isalpha():
+                    # Looks like LaTeX command — double-escape
+                    result.append('\\\\')
+                    i += 1  # re-process next_char as normal
+                else:
+                    # Valid JSON escape — keep as-is
+                    result.append(text[i])
+                    result.append(next_char)
+                    i += 2
             elif next_char == '\\':
                 # Already escaped backslash
                 result.append('\\\\')
@@ -152,9 +159,6 @@ def _repair_truncated_json(text: str) -> str | None:
 
     if not stack:
         return stripped  # Already balanced
-
-    # Remove trailing comma before closing
-    stripped = re.sub(r',\s*$', '', stripped)
 
     # Close in reverse order
     closers = {'[': ']', '{': '}'}
@@ -407,7 +411,10 @@ class BaseResearchAgent(ABC):
                     # Classify error: rate limits and server errors are retryable,
                     # but repeated identical failures get tagged [NON-RETRYABLE]
                     error_sig = type(e).__name__
-                    args_hash = hash(frozenset(args.items())) if isinstance(args, dict) else hash(str(args))
+                    try:
+                        args_hash = hash(frozenset(args.items())) if isinstance(args, dict) else hash(str(args))
+                    except TypeError:
+                        args_hash = hash(str(args))
                     fail_key = f"{name}|{args_hash}|{error_sig}"
                     _failure_counts[fail_key] = _failure_counts.get(fail_key, 0) + 1
                     if _failure_counts[fail_key] >= _MAX_IDENTICAL_FAILURES:

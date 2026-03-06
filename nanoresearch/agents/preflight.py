@@ -14,8 +14,12 @@ from nanoresearch.schemas.iteration import PreflightReport, PreflightResult
 
 logger = logging.getLogger(__name__)
 
-# Keys that config/default.yaml must contain
+# Keys that config/default.yaml must contain.
+# Each required key maps to a set of accepted aliases (LLMs use varied names).
 _REQUIRED_CONFIG_KEYS = {"random_seed"}
+_CONFIG_KEY_ALIASES: dict[str, set[str]] = {
+    "random_seed": {"random_seed", "seed", "rand_seed", "manual_seed"},
+}
 
 # Known framework conflicts (having both simultaneously is suspicious)
 _FRAMEWORK_CONFLICTS = [
@@ -95,18 +99,24 @@ class PreflightChecker:
                 if isinstance(v, dict):
                     all_keys.update(v.keys())
 
-            missing = _REQUIRED_CONFIG_KEYS - all_keys
+            # Check required keys, accepting aliases
+            missing = []
+            for req_key in _REQUIRED_CONFIG_KEYS:
+                aliases = _CONFIG_KEY_ALIASES.get(req_key, {req_key})
+                if not (all_keys & aliases):
+                    missing.append(req_key)
             if missing:
                 return PreflightResult(
                     check_name="config_yaml",
                     status="failed",
-                    message=f"config/default.yaml missing required keys: {missing}",
+                    message=f"config/default.yaml missing required keys: {set(missing)}",
                     details={"missing_keys": sorted(missing)},
                 )
         except ImportError:
             # PyYAML not available — do a simple text-based check
             for key in _REQUIRED_CONFIG_KEYS:
-                if key not in text:
+                aliases = _CONFIG_KEY_ALIASES.get(key, {key})
+                if not any(alias in text for alias in aliases):
                     return PreflightResult(
                         check_name="config_yaml",
                         status="failed",

@@ -1673,6 +1673,7 @@ class FigureAgent(BaseResearchAgent):
         png_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(str(png_path), dpi=300, bbox_inches="tight")
         plt.close(fig)
+        plt.close("all")  # ensure no leaked figures from prior in-process rendering
 
         self.log(f"  {fig_key} fallback placeholder saved")
         return self._save_figure_files(fig_key, filename_stem, caption,

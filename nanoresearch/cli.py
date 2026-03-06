@@ -78,10 +78,34 @@ def _setup_logging(verbose: bool = False) -> None:
 def _load_config_safe(config_path: Path | None) -> ResearchConfig:
     """Load config with user-friendly error messages."""
     try:
-        return ResearchConfig.load(config_path)
+        cfg = ResearchConfig.load(config_path)
     except (RuntimeError, ValueError) as exc:
         console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(1)
+
+    # Propagate optional third-party API keys from config.json → env vars
+    _propagate_api_keys(config_path)
+    return cfg
+
+
+def _propagate_api_keys(config_path: Path | None) -> None:
+    """Read optional API keys from config.json and set as env vars."""
+    path = config_path or Path.home() / ".nanobot" / "config.json"
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    research = data.get("research", {})
+    key_map = {
+        "openalex_api_key": "OPENALEX_API_KEY",
+        "s2_api_key": "S2_API_KEY",
+    }
+    for json_key, env_key in key_map.items():
+        val = research.get(json_key, "")
+        if val and not os.environ.get(env_key):
+            os.environ[env_key] = str(val)
 
 
 def _load_workspace_safe(path: Path) -> Workspace:
