@@ -2,6 +2,30 @@
 
 AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
 
+## Recent Changes (v0.2 — 2026-03-06)
+
+### New Features
+- **Deep Pipeline** — 9-stage pipeline with fine-grained experiment control: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
+- **REVIEW stage** — Automated paper review with per-section scoring, LaTeX consistency checks, claim-result alignment, and up to 5 revision rounds with convergence detection
+- **FIGURE_GEN stage in deep pipeline** — Dedicated figure generation between ANALYSIS and WRITING, producing architecture diagrams (AI) + results/ablation charts (code)
+- **Thinking model support** — `max_completion_tokens` for o1/o3/thinking models, with automatic fallback if proxy doesn't support it
+- **Auto-export** — Pipeline automatically exports workspace to a clean folder on completion
+
+### Bug Fixes
+- **Cross-file interface mismatch detection** — Coding agent now catches `import X; X.func()` patterns where `func` doesn't exist in `X`, not just `from X import Y`
+- **Figure/caption mismatch** — Semantic keyword-based classification maps descriptive figure keys (`fig_training_curve`) to canonical aliases (`architecture`, `results`, `ablation`)
+- **Empty tables / no SOTA comparison** — Analysis agent returns structured `comparison_with_baselines` dict and `ablation_results` array; writing agent injects baseline performance from blueprint
+- **LaTeX compilation failures** — Deterministic pre-fixes (Unicode, `@{}` doubling, missing figures, unmatched environments) applied before LLM; surgical line-level replacement instead of full-document rewrite
+- **Planning JSON truncation** — `max_tokens` increased to 16384; truncated JSON auto-repaired by closing unmatched brackets
+- **Subprocess GBK decode crash** — Safe byte decoding with UTF-8 → Latin-1 fallback for Windows compatibility
+- **Result fabrication prevention** — Writing agent accepts both `main_results` and `final_metrics` formats from analysis; never fabricates numbers when experiments fail
+
+### Improvements
+- **Image generation retry loop** — Up to 3 retries + LLM prompt diagnosis + optimized prompt retry before falling back to code chart
+- **Review scoring rubric** — Expanded with consistency rules, severity-based scoring, mandatory strengths listing
+- **Revision principles** — Preserve strengths, fix issues, do no harm, minimal changes
+- **Common ML pitfalls** — Coding and debug agents know about `ignore_mismatched_sizes`, archive decompression, `sys.exit(1)` patterns
+
 ## What It Does
 
 Give NanoResearch a research topic, and it will:
@@ -13,7 +37,8 @@ Give NanoResearch a research topic, and it will:
 5. **Writing** — Write a full LaTeX paper section-by-section, compile to PDF
 
 ```
-Topic → IDEATION → PLANNING → EXPERIMENT → FIGURE_GEN → WRITING → paper.pdf
+Standard: Topic → IDEATION → PLANNING → EXPERIMENT → FIGURE_GEN → WRITING → REVIEW → paper.pdf
+Deep:     Topic → IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW → paper.pdf
 ```
 
 ## Quick Start
@@ -136,15 +161,23 @@ nanoresearch/
 ├── nanoresearch/              # Main package
 │   ├── cli.py                # CLI commands (run, resume, status, list, export)
 │   ├── config.py             # Per-stage model routing + global config
-│   ├── agents/               # 5 pipeline agents
-│   │   ├── base.py          # BaseResearchAgent (shared LLM call logic)
+│   ├── agents/               # 9 pipeline agents + helpers
+│   │   ├── base.py          # BaseResearchAgent (shared LLM call logic + JSON repair)
 │   │   ├── ideation.py      # Literature search + hypothesis generation
 │   │   ├── planning.py      # Experiment blueprint design
-│   │   ├── experiment.py    # Code project generation (two-phase)
-│   │   ├── figure_gen.py    # Hybrid figure generation (AI + code)
-│   │   └── writing.py       # Section-by-section paper writing + PDF compilation
+│   │   ├── setup.py         # GitHub code search + repo cloning + model download
+│   │   ├── coding.py        # Code project generation + cross-file mismatch detection
+│   │   ├── execution.py     # SLURM job submission + monitoring + debug loop
+│   │   ├── analysis.py      # Result parsing + structured comparison/ablation output
+│   │   ├── figure_gen.py    # Hybrid figure generation (AI + code) with retry + diagnosis
+│   │   ├── writing.py       # Section-by-section paper writing + PDF compilation
+│   │   ├── review.py        # Automated review + revision + consistency checks
+│   │   ├── debug.py         # Debug agent (used by execution for failed jobs)
+│   │   ├── preflight.py     # Static preflight checks on experiment code
+│   │   └── checkers.py      # LaTeX consistency + math formula validators
 │   ├── pipeline/             # Infrastructure
-│   │   ├── orchestrator.py  # Stage scheduling + retry + checkpoint
+│   │   ├── orchestrator.py  # Standard 6-stage pipeline (retry + checkpoint)
+│   │   ├── deep_orchestrator.py  # Deep 9-stage pipeline (SLURM execution)
 │   │   ├── state.py         # Pipeline state machine
 │   │   ├── workspace.py     # Workspace directory + manifest management
 │   │   └── multi_model.py   # OpenAI + Gemini API dispatcher
@@ -156,7 +189,7 @@ nanoresearch/
 ├── mcp_server/               # MCP tool server
 │   ├── server.py            # JSON-RPC 2.0 stdio server
 │   └── tools/               # arXiv search, Semantic Scholar, LaTeX, PDF compile
-├── tests/                    # 60 tests
+├── tests/                    # 185 tests
 ├── outputs/                  # Example pipeline outputs
 └── pyproject.toml
 ```
@@ -177,7 +210,7 @@ conda install -c conda-forge tectonic
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v  # 60 tests
+pytest tests/ -v  # 185 tests
 ```
 
 ## License
