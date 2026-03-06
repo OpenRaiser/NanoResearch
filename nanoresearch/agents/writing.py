@@ -186,11 +186,17 @@ class WritingAgent(BaseResearchAgent):
         self.log("Abstract generated")
 
         # Step 3: Build figures & table data from blueprint
-        figure_blocks = self._build_figure_blocks(blueprint, figure_output)
+        figure_blocks, figure_equiv = self._build_figure_blocks(blueprint, figure_output)
 
         # Step 4: Generate each section independently, embed figures inline
         # Track which figure blocks have been placed
         placed_figures: set[str] = set()
+
+        def _mark_placed(key: str) -> None:
+            """Mark a figure key and all its equivalents as placed."""
+            placed_figures.add(key)
+            for eq_key in figure_equiv.get(key, ()):
+                placed_figures.add(eq_key)
 
         # Add list of available figures to context for the LLM
         fig_list_text = "\n".join(
@@ -219,12 +225,12 @@ class WritingAgent(BaseResearchAgent):
                         for kw in ("overview", "framework", "pipeline", "architecture"):
                             if kw in fk:
                                 content = figure_blocks[fk] + "\n\n" + content
-                                placed_figures.add(fk)
+                                _mark_placed(fk)
                                 break
                         else:
                             # fig_key in fig_keys but no keyword match — append at end
                             content += "\n\n" + figure_blocks[fk]
-                            placed_figures.add(fk)
+                            _mark_placed(fk)
 
             # 2) For ALL sections: insert remaining figures near their \ref
             for fk, blk in figure_blocks.items():
@@ -232,7 +238,7 @@ class WritingAgent(BaseResearchAgent):
                     continue
                 content, inserted = self._insert_figure_near_ref(content, fk, blk)
                 if inserted:
-                    placed_figures.add(fk)
+                    _mark_placed(fk)
 
             sections.append(Section(heading=heading, label=label, content=content))
             snippet = content[:200].replace("\n", " ").strip()
@@ -245,7 +251,7 @@ class WritingAgent(BaseResearchAgent):
                 if sec.label == "sec:experiments":
                     for fk in remaining:
                         sec.content += "\n\n" + figure_blocks[fk]
-                        placed_figures.add(fk)
+                        _mark_placed(fk)
                     break
 
         # Log final figure placement order for debugging
@@ -753,7 +759,7 @@ Every component listed above should appear in the ablation table.
                     return alias
         return None
 
-    def _build_figure_blocks(self, blueprint: dict, figure_output: dict | None = None) -> dict[str, str]:
+    def _build_figure_blocks(self, blueprint: dict, figure_output: dict | None = None) -> tuple[dict[str, str], dict[str, set[str]]]:
         """Pre-build LaTeX figure/table blocks to embed inline.
 
         Dynamically builds blocks from whatever figures the FigureAgent produced.
@@ -823,7 +829,7 @@ Every component listed above should appear in the ablation table.
             self.log("WARNING: No figures available for paper")
             for alias in ("architecture", "results", "ablation"):
                 blocks[alias] = f"% Figure '{alias}' not available\n"
-            return blocks
+            return blocks, {}
 
         # Step 1: Store each figure under its label_suffix
         for fig_key, caption, block, label_suffix in entries:
@@ -831,6 +837,8 @@ Every component listed above should appear in the ablation table.
 
         # Step 2: Semantic classification — map each figure to a canonical alias
         # Avoid assigning the same alias to multiple figures
+        # Track equivalences: alias <-> label_suffix point to the same figure
+        equiv: dict[str, set[str]] = {}  # key -> set of equivalent keys
         alias_assigned: dict[str, str] = {}  # alias -> fig_key
         for fig_key, caption, block, label_suffix in entries:
             alias = self._classify_figure(label_suffix, caption)
@@ -838,8 +846,12 @@ Every component listed above should appear in the ablation table.
                 alias_assigned[alias] = fig_key
                 if alias not in blocks:
                     blocks[alias] = block
+                # Record equivalence between alias and label_suffix
+                if alias != label_suffix:
+                    equiv.setdefault(alias, set()).add(label_suffix)
+                    equiv.setdefault(label_suffix, set()).add(alias)
 
-        return blocks
+        return blocks, equiv
 
     # ---- tool-augmented search for writing -----------------------------------
 
