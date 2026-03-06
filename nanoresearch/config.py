@@ -41,12 +41,14 @@ class ResearchConfig(BaseModel):
 
     ideation: StageModelConfig = Field(
         default_factory=lambda: StageModelConfig(
-            model="deepseek-ai/DeepSeek-V3.2", temperature=0.5
+            model="deepseek-ai/DeepSeek-V3.2", temperature=0.5,
+            max_tokens=16384, timeout=600.0,
         )
     )
     planning: StageModelConfig = Field(
         default_factory=lambda: StageModelConfig(
-            model="deepseek-ai/DeepSeek-V3.2", temperature=0.2
+            model="deepseek-ai/DeepSeek-V3.2", temperature=0.2,
+            max_tokens=16384, timeout=600.0,
         )
     )
     experiment: StageModelConfig = Field(

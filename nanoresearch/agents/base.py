@@ -52,6 +52,72 @@ def _fix_json_escapes(text: str) -> str:
     return ''.join(result)
 
 
+def _repair_truncated_json(text: str) -> str | None:
+    """Attempt to repair JSON that was truncated by output token limit.
+
+    Strategy: close any open strings, arrays, and objects from the end.
+    """
+    # Only try if it looks like it starts as valid JSON
+    stripped = text.strip()
+    if not stripped or stripped[0] not in ('{', '['):
+        return None
+
+    # Remove trailing incomplete key-value or comma
+    import re
+    stripped = re.sub(r',\s*$', '', stripped)
+    # Remove trailing incomplete string (unmatched quote)
+    if stripped.count('"') % 2 != 0:
+        # Find last quote and truncate everything after it
+        last_quote = stripped.rfind('"')
+        if last_quote > 0:
+            stripped = stripped[:last_quote + 1]
+
+    # Count unmatched brackets/braces
+    stack = []
+    in_string = False
+    escape = False
+    for ch in stripped:
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in ('{', '['):
+            stack.append(ch)
+        elif ch == '}' and stack and stack[-1] == '{':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1] == '[':
+            stack.pop()
+
+    if not stack:
+        return stripped  # Already balanced
+
+    # Remove trailing comma before closing
+    stripped = re.sub(r',\s*$', '', stripped)
+
+    # Close in reverse order
+    closers = {'[': ']', '{': '}'}
+    for bracket in reversed(stack):
+        stripped += closers.get(bracket, '')
+
+    return stripped
+
+
+def _json_error_msg(text: str) -> str:
+    """Get JSON parse error message for diagnostics."""
+    try:
+        json.loads(text)
+        return "no error"
+    except json.JSONDecodeError as exc:
+        return str(exc)
+
+
 class BaseResearchAgent(ABC):
     """Abstract base class for all NanoResearch agents."""
 
@@ -118,15 +184,27 @@ class BaseResearchAgent(ABC):
         fixed = _fix_json_escapes(text)
         try:
             return json.loads(fixed, strict=False)
-        except json.JSONDecodeError as exc:
-            logger.error(
-                "JSON parse failed even after escape fixing. First 500 chars: %s",
-                fixed[:500],
-            )
-            raise LLMError(
-                f"LLM output is not valid JSON: {exc}. "
-                f"Raw output starts with: {raw[:200]!r}"
-            ) from exc
+        except json.JSONDecodeError:
+            pass
+
+        # Attempt to repair truncated JSON (output cut off by token limit)
+        repaired = _repair_truncated_json(fixed)
+        if repaired is not None:
+            try:
+                return json.loads(repaired, strict=False)
+            except json.JSONDecodeError:
+                pass
+
+        # All attempts failed
+        logger.error(
+            "JSON parse failed even after escape fixing. First 500 chars: %s",
+            fixed[:500],
+        )
+        raise LLMError(
+            f"LLM output is not valid JSON: "
+            f"{_json_error_msg(fixed)}. "
+            f"Raw output starts with: {raw[:200]!r}"
+        ) from None
 
     async def generate_with_tools(
         self,
