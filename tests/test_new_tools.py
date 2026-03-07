@@ -11,63 +11,51 @@ import pytest
 # Web Search Tests
 # ============================================================
 
-MOCK_DDG_HTML = """
-<html>
-<body>
-<div class="result results_links results_links_deep web-result">
-  <a class="result__a" href="https://example.com/page1">First Result Title</a>
-  <a class="result__snippet">This is the first snippet.</a>
-</div>
-<div class="result results_links results_links_deep web-result">
-  <a class="result__a" href="https://example.com/page2">Second Result Title</a>
-  <a class="result__snippet">This is the second snippet.</a>
-</div>
-</body>
-</html>
-"""
+MOCK_DDGS_RESULTS = [
+    {"title": "First Result Title", "href": "https://example.com/page1", "body": "This is the first snippet."},
+    {"title": "Second Result Title", "href": "https://example.com/page2", "body": "This is the second snippet."},
+]
 
 
 class TestWebSearch:
     @pytest.mark.asyncio
     async def test_search_web_parses_results(self):
-        from mcp_server.tools.web_search import search_web, _parse_ddg_html
+        from mcp_server.tools.web_search import search_web
 
-        results = _parse_ddg_html(MOCK_DDG_HTML, max_results=10)
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_inst = MagicMock()
+        mock_ddgs_inst.text = MagicMock(return_value=MOCK_DDGS_RESULTS)
+        mock_ddgs_cls.return_value = mock_ddgs_inst
+
+        mock_module = MagicMock()
+        mock_module.DDGS = mock_ddgs_cls
+
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_module}):
+            with patch("mcp_server.tools.web_search._limiter") as mock_limiter:
+                mock_limiter.acquire = AsyncMock()
+                results = await search_web("test query")
         assert len(results) == 2
         assert results[0]["title"] == "First Result Title"
         assert results[0]["url"] == "https://example.com/page1"
         assert results[0]["snippet"] == "This is the first snippet."
 
     @pytest.mark.asyncio
-    async def test_search_web_max_results(self):
-        from mcp_server.tools.web_search import _parse_ddg_html
-
-        results = _parse_ddg_html(MOCK_DDG_HTML, max_results=1)
-        assert len(results) == 1
-
-    @pytest.mark.asyncio
-    async def test_search_web_empty_html(self):
-        from mcp_server.tools.web_search import _parse_ddg_html
-
-        results = _parse_ddg_html("<html><body></body></html>", max_results=10)
-        assert results == []
-
-    @pytest.mark.asyncio
-    async def test_search_web_with_mock_http(self):
+    async def test_search_web_empty_results(self):
         from mcp_server.tools.web_search import search_web
 
-        mock_resp = MagicMock()
-        mock_resp.text = MOCK_DDG_HTML
-        mock_resp.raise_for_status = MagicMock()
+        mock_ddgs_cls = MagicMock()
+        mock_ddgs_inst = MagicMock()
+        mock_ddgs_inst.text = MagicMock(return_value=[])
+        mock_ddgs_cls.return_value = mock_ddgs_inst
 
-        mock_client = AsyncMock()
-        mock_client.post = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
+        mock_module = MagicMock()
+        mock_module.DDGS = mock_ddgs_cls
 
-        with patch("mcp_server.tools.web_search.get_http_client", return_value=mock_client):
-            results = await search_web("test query")
-        assert len(results) == 2
+        with patch.dict("sys.modules", {"duckduckgo_search": mock_module}):
+            with patch("mcp_server.tools.web_search._limiter") as mock_limiter:
+                mock_limiter.acquire = AsyncMock()
+                results = await search_web("test query")
+        assert results == []
 
 
 # ============================================================
@@ -118,48 +106,27 @@ class TestPapersWithCode:
     async def test_search_tasks(self):
         from mcp_server.tools.paperswithcode import search_tasks
 
-        mock_resp = MagicMock()
-        mock_resp.json.return_value = MOCK_PWC_TASKS_RESPONSE
-        mock_resp.raise_for_status = MagicMock()
+        mock_web_results = [
+            {"title": "Image Classification", "url": "https://paperswithcode.com/task/image-classification", "snippet": "Classify images."},
+            {"title": "Object Detection", "url": "https://paperswithcode.com/task/object-detection", "snippet": "Detect objects."},
+            {"title": "Unrelated", "url": "https://example.com/other", "snippet": "Not PwC."},
+        ]
 
-        mock_client = AsyncMock()
-        mock_client.get = AsyncMock(return_value=mock_resp)
-        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-        mock_client.__aexit__ = AsyncMock(return_value=False)
-
-        with patch("mcp_server.tools.paperswithcode.get_http_client", return_value=mock_client):
+        with patch("mcp_server.tools.web_search.search_web", new_callable=AsyncMock) as mock_sw:
+            mock_sw.return_value = mock_web_results
             results = await search_tasks("image classification")
 
-        assert len(results) == 2
-        assert results[0]["id"] == "image-classification"
+        assert len(results) == 2  # only paperswithcode.com URLs
         assert results[0]["name"] == "Image Classification"
+        assert "paperswithcode.com" in results[0]["url"]
 
     @pytest.mark.asyncio
     async def test_get_sota(self):
         from mcp_server.tools.paperswithcode import get_sota
 
-        async def mock_get(url, **kwargs):
-            mock_resp = MagicMock()
-            mock_resp.raise_for_status = MagicMock()
-            if "/datasets/" in url and "/sota/" not in url:
-                mock_resp.json.return_value = MOCK_PWC_DATASETS_RESPONSE
-            else:
-                mock_resp.json.return_value = MOCK_PWC_SOTA_RESPONSE
-            return mock_resp
-
-        # Create a mock client that supports both async context manager usages
-        def make_mock_client():
-            mock_client = AsyncMock()
-            mock_client.get = mock_get
-            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
-            mock_client.__aexit__ = AsyncMock(return_value=False)
-            return mock_client
-
-        with patch("mcp_server.tools.paperswithcode.get_http_client", side_effect=lambda **kw: make_mock_client()):
-            results = await get_sota("image-classification")
-
-        assert len(results) >= 1
-        assert results[0]["method"] == "ViT-G/14"
+        # PwC API is defunct, should return empty list
+        results = await get_sota("image-classification")
+        assert results == []
 
 
 # ============================================================
