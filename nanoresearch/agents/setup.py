@@ -11,6 +11,7 @@ import gzip
 import json
 import logging
 import re
+import shlex
 import shutil
 import urllib.request
 from pathlib import Path
@@ -199,6 +200,10 @@ Return a JSON object with:
             repo = repo_info.get("repo", "")
             if not owner or not repo:
                 continue
+            # Sanitize owner/repo to prevent command injection
+            if not re.match(r'^[a-zA-Z0-9._-]+$', owner) or not re.match(r'^[a-zA-Z0-9._-]+$', repo):
+                self.log(f"Skipping unsafe repo name: {owner}/{repo}")
+                continue
             clone_url = f"https://github.com/{owner}/{repo}.git"
             dest = repos_dir / repo
             if dest.exists():
@@ -206,7 +211,7 @@ Return a JSON object with:
                 continue
             try:
                 result = await self._run_shell(
-                    f"git clone --depth 1 {clone_url} {dest}", timeout=120
+                    f"git clone --depth 1 {shlex.quote(clone_url)} {shlex.quote(str(dest))}", timeout=120
                 )
                 if dest.exists():
                     cloned.append({"name": repo, "path": str(dest), "source": clone_url})
@@ -229,7 +234,7 @@ Return a JSON object with:
                         continue
                     dest = repos_dir / name
                     await self._run_shell(
-                        f"git clone --depth 1 {clone_url} {dest}", timeout=120
+                        f"git clone --depth 1 {shlex.quote(clone_url)} {shlex.quote(str(dest))}", timeout=120
                     )
                     if dest.exists():
                         cloned.append({
@@ -376,7 +381,7 @@ Return JSON:
             self.log(f"Downloading model: {model_id}")
 
             # Try ModelScope first (convert HuggingFace ID to ModelScope format)
-            modelscope_id = self._hf_to_modelscope_id(model_id)
+            modelscope_id = await self._hf_to_modelscope_id(model_id)
             success = False
 
             if modelscope_id:
@@ -472,8 +477,9 @@ Return JSON:
 
             if url.startswith(("wget ", "curl ")):
                 try:
+                    # Only allow wget/curl commands, sanitize the data_dir path
                     result = await self._run_shell(
-                        f"cd {data_dir} && {url}", timeout=600
+                        f"cd {shlex.quote(str(data_dir))} && {url}", timeout=600
                     )
                     dl_files = list(data_dir.glob("*"))
                     downloaded.append({
@@ -494,7 +500,7 @@ Return JSON:
                 dest_file = data_dir / filename
                 try:
                     result = await self._run_shell(
-                        f"wget -q -O '{dest_file}' '{url}'", timeout=600
+                        f"wget -q -O {shlex.quote(str(dest_file))} {shlex.quote(url)}", timeout=600
                     )
                     if dest_file.exists() and dest_file.stat().st_size > 0:
                         if filename.endswith(".gz") and not filename.endswith(".tar.gz"):
@@ -537,17 +543,14 @@ Return JSON:
 
         return downloaded
 
-    def _hf_to_modelscope_id(self, hf_id: str) -> str:
-        """Search ModelScope for a matching model.
+    async def _hf_to_modelscope_id(self, hf_id: str) -> str:
+        """Search ModelScope for a matching model (async, non-blocking).
 
         Uses ModelScope API to find if the model exists, rather than
         relying on a hardcoded mapping table.
         """
-        import urllib.parse
-
         # Try common org mappings first as search hints
         search_terms = []
-        # e.g. "facebook/esm2_t33_650M_UR50D" -> search for "esm2_t33_650M_UR50D"
         if "/" in hf_id:
             model_name = hf_id.split("/")[-1]
             search_terms.append(model_name)
@@ -555,22 +558,21 @@ Return JSON:
 
         for term in search_terms:
             try:
-                encoded = urllib.parse.quote(term)
-                # Use ModelScope API to search
-                import subprocess
-                result = subprocess.run(
-                    ["python3", "-c",
-                     f"from modelscope.hub.api import HubApi; "
-                     f"api = HubApi(); "
-                     f"models = api.list_models('{term}', limit=3); "
-                     f"print([m.model_id for m in models] if models else [])"],
-                    capture_output=True, text=True, timeout=15,
-                    env={k: v for k, v in __import__('os').environ.items()
-                         if 'proxy' not in k.lower()},  # no proxy for ModelScope
+                # Sanitize term to prevent code injection
+                safe_term = re.sub(r"[^a-zA-Z0-9_\-./]", "", term)
+                if not safe_term:
+                    continue
+                result = await self._run_shell_no_proxy(
+                    f"python3 -c \""
+                    f"from modelscope.hub.api import HubApi; "
+                    f"api = HubApi(); "
+                    f"models = api.list_models('{safe_term}', limit=3); "
+                    f"print([m.model_id for m in models] if models else [])\"",
+                    timeout=15,
                 )
-                if result.returncode == 0 and result.stdout.strip():
+                if result.get("returncode") == 0 and result.get("stdout", "").strip():
                     import ast
-                    ids = ast.literal_eval(result.stdout.strip())
+                    ids = ast.literal_eval(result["stdout"].strip())
                     if ids:
                         self.log(f"Found ModelScope match: {ids[0]} for {hf_id}")
                         return ids[0]
@@ -600,8 +602,6 @@ Return JSON:
             "stdout": stdout.decode(errors="replace"),
             "stderr": stderr.decode(errors="replace"),
         }
-
-        return downloaded
 
     async def _run_shell(self, cmd: str, timeout: int = 60) -> dict:
         """Run a shell command asynchronously with proxy environment."""

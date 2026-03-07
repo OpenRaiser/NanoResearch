@@ -337,6 +337,8 @@ class BaseResearchAgent(ABC):
         tools: Any,  # ToolRegistry
         max_tool_rounds: int = 10,
         stage_override: StageModelConfig | None = None,
+        reminder_text: str | None = None,
+        reminder_interval: int = 3,
     ) -> str:
         """Run a ReAct loop: let the LLM call tools until it produces text.
 
@@ -346,6 +348,8 @@ class BaseResearchAgent(ABC):
             tools: A ``ToolRegistry`` instance.
             max_tool_rounds: Max tool-call round-trips before forcing a final answer.
             stage_override: Optional stage config override.
+            reminder_text: Custom periodic reminder (default: academic writing focus).
+            reminder_interval: Inject reminder every N rounds (default: 3).
 
         Returns:
             Final assistant text content.
@@ -456,17 +460,15 @@ class BaseResearchAgent(ABC):
             # trim older tool results to keep context manageable
             _compact_messages_if_needed(messages)
 
-            # Inject system reminder every 3 rounds to prevent instruction drift
-            if (round_idx + 1) % 3 == 0 and round_idx + 1 <= max_tool_rounds:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "[REMINDER] You are writing academic content for a top-tier venue. "
-                        "Focus on producing the final output now. Use the information "
-                        "gathered from tools to write high-quality content. "
-                        "Do NOT continue searching indefinitely."
-                    ),
-                })
+            # Inject system reminder periodically to prevent instruction drift
+            if (round_idx + 1) % reminder_interval == 0 and round_idx + 1 <= max_tool_rounds:
+                _reminder = reminder_text or (
+                    "[REMINDER] You are writing academic content for a top-tier venue. "
+                    "Focus on producing the final output now. Use the information "
+                    "gathered from tools to write high-quality content. "
+                    "Do NOT continue searching indefinitely."
+                )
+                messages.append({"role": "user", "content": _reminder})
 
         # Exceeded max rounds — do a final summary call without tools
         self.log(f"Exceeded {max_tool_rounds} tool rounds, forcing final answer")

@@ -41,16 +41,17 @@ class CodingAgent(BaseResearchAgent):
         )
         self.log(f"Code plan: {len(code_plan.get('files', []))} files")
 
-        # Step 2: Generate each file
+        # Step 2: Generate each file (parallel for speed)
+        valid_specs = [s for s in code_plan.get("files", []) if isinstance(s, dict) and s.get("path")]
+        self.log(f"  Generating {len(valid_specs)} files in parallel")
+        contents = await asyncio.gather(*(
+            self._generate_file(spec, code_plan, experiment_blueprint, setup_output)
+            for spec in valid_specs
+        ))
+
         generated_files = []
-        for file_spec in code_plan.get("files", []):
-            filepath = file_spec.get("path", "")
-            if not filepath:
-                continue
-            content = await self._generate_file(
-                file_spec, code_plan, experiment_blueprint, setup_output
-            )
-            # Write file
+        for spec, content in zip(valid_specs, contents):
+            filepath = spec["path"]
             full_path = code_dir / filepath
             full_path.parent.mkdir(parents=True, exist_ok=True)
             full_path.write_text(content)
@@ -346,9 +347,9 @@ echo "========================================"
 source ~/anaconda3/etc/profile.d/conda.sh
 conda activate torch
 
-# Enable proxy for downloading models/data
-export https_proxy=http://xujinhang:RgvPm7Q6OM12cWZA6hzuVxIlVR7v6GoJLmcTOQcpq76H9Np2ZSTQDyBN74Jx@10.1.20.51:23128/
-export http_proxy=$https_proxy
+# Enable proxy for downloading models/data (read from environment)
+export https_proxy="${{HTTPS_PROXY:-}}"
+export http_proxy="${{HTTP_PROXY:-}}"
 
 # Create output directories
 mkdir -p {code_dir}/results

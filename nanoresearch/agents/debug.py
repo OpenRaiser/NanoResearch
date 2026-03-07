@@ -24,7 +24,7 @@ from nanoresearch.schemas.manifest import PipelineStage
 
 logger = logging.getLogger(__name__)
 
-MAX_DEBUG_ROUNDS = 30
+MAX_DEBUG_ROUNDS = 20
 
 
 class DebugAgent(BaseResearchAgent):
@@ -264,18 +264,22 @@ Diagnose the root cause and generate patches to fix it. Return JSON only."""
         new_text = patch["new"]
 
         filepath = code_dir / filename
+        # Security: ensure filepath is within code_dir
+        try:
+            filepath.resolve().relative_to(code_dir.resolve())
+        except ValueError:
+            logger.warning(f"Patch target outside code_dir: {filepath}, skipping")
+            return False
         if not filepath.exists():
-            # File doesn't exist — create it if old is empty (new file creation)
+            # File doesn't exist — create it only if old is empty (new file creation)
             if not old_text or old_text.strip() == "":
                 filepath.parent.mkdir(parents=True, exist_ok=True)
                 filepath.write_text(new_text)
                 logger.info(f"Created new file: {filepath}")
                 return True
-            # LLM wants to patch a non-existent file — try creating with new_text
-            logger.warning(f"Patch target not found: {filepath}, creating with new content")
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-            filepath.write_text(new_text)
-            return True
+            # LLM wants to patch a non-existent file with specific old_text — skip
+            logger.warning(f"Patch target not found: {filepath}, cannot match old_text, skipping")
+            return False
 
         content = filepath.read_text(errors="replace")
 
@@ -436,13 +440,13 @@ Other files import from this file:
                         1,
                     )
 
-            # Fix 2: Ensure proxy is present for pip install
+            # Fix 2: Ensure proxy is present for pip install (read from env, no hardcoded creds)
             if "pip install" in content and "proxy" not in content.lower():
                 content = content.replace(
                     "pip install",
-                    "# Enable proxy for pip\n"
-                    "export https_proxy=http://xujinhang:RgvPm7Q6OM12cWZA6hzuVxIlVR7v6GoJLmcTOQcpq76H9Np2ZSTQDyBN74Jx@10.1.20.51:23128/\n"
-                    "export http_proxy=$https_proxy\n"
+                    "# Enable proxy for pip (from environment)\n"
+                    'export https_proxy="${HTTPS_PROXY:-}"\n'
+                    'export http_proxy="${HTTP_PROXY:-}"\n'
                     "pip install",
                     1,
                 )
@@ -484,7 +488,11 @@ Other files import from this file:
         return "code_bug", ""
 
     async def _download_missing_resource(self, missing_path: str) -> bool:
-        """Try to download a missing data file."""
+        """Try to download a missing data file.
+
+        Security: validates URL scheme (http/https only) and uses shlex.quote.
+        """
+        import shlex as _shlex
         system_prompt = (
             "Given a missing file path from an ML experiment, determine its download URL. "
             "Return JSON: {\"url\": \"...\", \"filename\": \"...\"} or {\"cannot_download\": true}."
@@ -498,11 +506,15 @@ Other files import from this file:
             filename = result.get("filename", "") or Path(missing_path).name
             if not url:
                 return False
+            # Validate URL: only allow http/https
+            if not url.startswith(("http://", "https://")):
+                self.log(f"Rejecting non-HTTP URL: {url}")
+                return False
 
             dest = Path(missing_path)
             dest.parent.mkdir(parents=True, exist_ok=True)
             proc = await asyncio.create_subprocess_shell(
-                f"wget -q -O '{dest}' '{url}'",
+                f"wget -q -O {_shlex.quote(str(dest))} {_shlex.quote(url)}",
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

@@ -814,8 +814,8 @@ Every component listed above should appear in the ablation table.
                 "- Write: 'Due to technical issues during execution, we were unable to\n"
                 "  obtain experimental results in this draft. We present our methodology\n"
                 "  and experimental design; empirical validation is left for the final version.'\n"
-                "- Omit results tables entirely, or include them with placeholder '--' values\n"
-                "  and a note explaining that results are pending.\n"
+                "- Omit results tables entirely. Do NOT include tables with '--' placeholders.\n"
+                "- Focus on describing the experimental setup, methodology, and expected behavior.\n"
                 "=== END EXPERIMENT RESULTS ==="
             )
 

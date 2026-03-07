@@ -35,7 +35,7 @@ MATH (ISO 80000-2):
 - Operators: \operatorname{softmax}. Subscript labels: roman L_{\mathrm{total}}.
 
 TABLES:
-- \begin{table}[H] \small ... \end{table}. Use \setlength{\tabcolsep}{4pt}.
+- \begin{table}[t!] \small ... \end{table}. Use \setlength{\tabcolsep}{4pt}.
 - @{} at both ends. Short headers. \resizebox{\textwidth}{!}{...} if >5 columns.
 - NEVER exceed \textwidth. Bold best results with \textbf{}.
 
