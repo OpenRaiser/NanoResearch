@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 
 # Configurable limits
 MAX_PAPERS_FOR_CITATIONS = 50
-MAX_LATEX_FIX_ATTEMPTS = 5
+MAX_LATEX_FIX_ATTEMPTS = 3
 
 # Legacy aliases — now each section gets its own system prompt via
 # get_writing_system_prompt(heading), but some internal methods still
@@ -72,6 +72,9 @@ PAPER_SECTIONS = [
      "Cite quantitative results from prior work where available from the evidence data.\n"
      "IMPORTANT: Every \\cite{} or \\citet{} key MUST be from the provided CITATION KEYS list. "
      "Do NOT invent citation keys. If uncertain about a key, omit the citation.\n"
+     "MUST-CITE ENFORCEMENT: If the context includes a 'MUST-CITE PAPERS' section, "
+     "you MUST cite ALL of those papers in this section. Organize them into your thematic "
+     "clusters naturally. Do not skip any must-cite paper.\n"
      "FAIRNESS: discuss the STRONGEST baselines, not just weak ones. "
      "Acknowledge prior contributions before noting limitations.\n"
      "Use \\citet{key} when author is subject, \\citep{key} for parenthetical.",
@@ -105,7 +108,7 @@ PAPER_SECTIONS = [
      "(2) Implementation Details: hyperparameters (final values AND search ranges), "
      "hardware (GPU type, count), training time, random seeds, software versions.\n"
      "(3) Main Results: you MUST include a LaTeX table (Table~\\ref{tab:main_results}) using "
-     "\\begin{table}[H] with booktabs comparing all methods across all metrics.\n"
+     "\\begin{table}[t!] with booktabs comparing all methods across all metrics.\n"
      "  - Bold the best result in each column using \\textbf{}\n"
      "  - Include standard deviations or confidence intervals (e.g., $\\pm$ 0.3)\n"
      "  - Use \\citet{key} to reference baseline sources\n"
@@ -113,7 +116,7 @@ PAPER_SECTIONS = [
      "(4) Analysis: explain WHY the method works --- what specific component leads to gains. "
      "Support with evidence, not speculation.\n"
      "(5) Ablation Study: you MUST include a LaTeX ablation table (Table~\\ref{tab:ablation}) "
-     "using \\begin{table}[H] with booktabs. Each row removes or replaces one component "
+     "using \\begin{table}[t!] with booktabs. Each row removes or replaces one component "
      "(e.g., 'w/o module A', 'replace B with C'). Columns are evaluation metrics. "
      "The full model should be the last row with best results in \\textbf{}. "
      "Discuss what each ablation reveals about the component's contribution.\n"
@@ -126,10 +129,6 @@ PAPER_SECTIONS = [
      "Do NOT round, adjust, or modify them.\n"
      "If results are marked SYNTHETIC or come from figure data, use those numbers in the tables.\n"
      "NEVER leave the proposed method rows as '--'. Always fill tables with concrete numbers.\n"
-     "For baseline rows: use the numbers from BASELINE EXPECTED PERFORMANCE section above.\n"
-     "For ablation rows: use the numbers from Ablation Results section above.\n"
-     "If a specific baseline number is genuinely unavailable, use '-' (single dash) ONLY for\n"
-     "that cell, but ALWAYS fill the proposed method row completely.\n"
      "If no results are available because the experiment FAILED or did not run,\n"
      "you MUST clearly state this in the text. Write: 'Due to [reason], we were unable to\n"
      "obtain experimental results. We present our methodology and leave empirical validation\n"
@@ -186,83 +185,196 @@ class WritingAgent(BaseResearchAgent):
         self.log("Abstract generated")
 
         # Step 3: Build figures & table data from blueprint
-        figure_blocks, figure_equiv = self._build_figure_blocks(blueprint, figure_output)
+        figure_blocks = self._build_figure_blocks(blueprint, figure_output)
 
         # Step 4: Generate each section independently, embed figures inline
         # Track which figure blocks have been placed
         placed_figures: set[str] = set()
 
-        def _mark_placed(key: str) -> None:
-            """Mark a figure key and all its equivalents as placed."""
-            placed_figures.add(key)
-            for eq_key in figure_equiv.get(key, ()):
-                placed_figures.add(eq_key)
-
-        # Add list of available figures to context for the LLM
-        fig_list_text = "\n".join(
-            f"  - \\ref{{fig:{k}}}: {k}" for k in figure_blocks
-        )
-        context_with_figs = (
-            f"{context}\n\n"
-            f"=== AVAILABLE FIGURES (use \\ref{{fig:NAME}} to reference) ===\n"
-            f"{fig_list_text}\n"
-            f"=== END FIGURES ==="
-        )
-
         sections = []
         prior_sections_summary: list[str] = []
         for heading, label, instructions, fig_keys in PAPER_SECTIONS:
             self.log(f"Writing section: {heading}")
+
+            # Build per-section figure context: only show UN-placed figures
+            remaining_figs = [k for k in figure_blocks if k not in placed_figures]
+            fig_list_text = "\n".join(
+                f"  - \\ref{{fig:{k}}}: {k}" for k in remaining_figs
+            )
+            placed_note = ""
+            if placed_figures:
+                placed_list = ", ".join(sorted(placed_figures))
+                placed_note = (
+                    f"\nFigures ALREADY placed in previous sections (do NOT include again): "
+                    f"{placed_list}\n"
+                )
+            context_with_figs = (
+                f"{context}\n\n"
+                f"=== AVAILABLE FIGURES (use \\ref{{fig:NAME}} to reference) ===\n"
+                f"{fig_list_text}\n"
+                f"{placed_note}"
+                f"=== END FIGURES ==="
+            )
+
             content = await self._generate_section(
                 context_with_figs, heading, instructions, prior_sections_summary
             )
 
+            # ── Detect figures the LLM already embedded in section content ──
+            # This prevents the code from placing the same figures again.
+            # Match by \label{fig:XXX}
+            llm_placed_labels = re.findall(
+                r'\\begin\{figure\*?\}.*?\\label\{fig:([^}]+)\}.*?\\end\{figure\*?\}',
+                content, re.DOTALL,
+            )
+            for fig_label in llm_placed_labels:
+                if fig_label in figure_blocks and fig_label not in placed_figures:
+                    placed_figures.add(fig_label)
+                    self.log(f"  LLM already placed fig:{fig_label} in {heading}")
+            # Also match by \includegraphics filename (e.g., fig3_main_results.pdf)
+            llm_placed_files = re.findall(
+                r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}',
+                content,
+            )
+            for fname in llm_placed_files:
+                # Map filename back to figure key: "fig3_main_results.pdf" → "main_results"
+                stem = fname.rsplit(".", 1)[0]  # remove extension
+                for fk in figure_blocks:
+                    if fk in placed_figures:
+                        continue
+                    # Check if the filename contains the figure key
+                    if fk in stem or stem.endswith(fk):
+                        placed_figures.add(fk)
+                        self.log(f"  LLM already included {fname} → marking fig:{fk} as placed in {heading}")
+
             # ── Smart figure placement ──
+            if label == "sec:intro":
+                # Task illustration / qualitative / motivation figures → Intro
+                intro_keywords = ("qualitative", "example", "motivation", "task",
+                                  "illustration", "counterfactual", "demo", "sample",
+                                  "teaser", "intuition")
+                for fk in list(figure_blocks.keys()):
+                    if fk in placed_figures:
+                        continue
+                    if any(kw in fk for kw in intro_keywords):
+                        content += "\n\n" + figure_blocks[fk]
+                        placed_figures.add(fk)
+                        break  # only one intro figure
+
             if label == "sec:method":
-                # 1) Pipeline / architecture figure → top of Method section
-                for fk in list(fig_keys):
-                    if fk in figure_blocks and fk not in placed_figures:
-                        for kw in ("overview", "framework", "pipeline", "architecture"):
-                            if kw in fk:
-                                content = figure_blocks[fk] + "\n\n" + content
-                                _mark_placed(fk)
-                                break
-                        else:
-                            # fig_key in fig_keys but no keyword match — append at end
-                            content += "\n\n" + figure_blocks[fk]
-                            _mark_placed(fk)
+                # Architecture / framework / pipeline figure → top of Method section
+                arch_keywords = ("overview", "framework", "pipeline", "architecture", "model")
+                for fk in list(figure_blocks.keys()):
+                    if fk in placed_figures:
+                        continue
+                    if any(kw in fk for kw in arch_keywords):
+                        content = figure_blocks[fk] + "\n\n" + content
+                        placed_figures.add(fk)
+                        break  # only one architecture figure at top
 
             # 2) For ALL sections: insert remaining figures near their \ref
+            # But respect reserved placement: arch figures belong in Method, not Intro
+            _arch_kws = ("overview", "framework", "pipeline", "architecture", "model")
+            _intro_kws = ("qualitative", "example", "motivation", "task",
+                          "illustration", "counterfactual", "demo", "teaser")
             for fk, blk in figure_blocks.items():
                 if fk in placed_figures:
                     continue
+                # Skip architecture figures outside Method
+                if label != "sec:method" and any(kw in fk for kw in _arch_kws):
+                    continue
+                # Skip intro/qualitative figures outside Intro
+                if label != "sec:intro" and any(kw in fk for kw in _intro_kws):
+                    continue
                 content, inserted = self._insert_figure_near_ref(content, fk, blk)
                 if inserted:
-                    _mark_placed(fk)
+                    placed_figures.add(fk)
 
             sections.append(Section(heading=heading, label=label, content=content))
             snippet = content[:200].replace("\n", " ").strip()
             prior_sections_summary.append(f"[{heading}]: {snippet}...")
 
-        # Fallback: inject any remaining figures into Experiments section end
+        # Fallback: distribute remaining figures to appropriate sections
         remaining = [k for k in figure_blocks if k not in placed_figures]
         if remaining:
+            self.log(f"Fallback placement for {len(remaining)} unplaced figures: {remaining}")
+            # Map figure keywords to preferred sections
+            section_hints = {
+                "sec:intro": ("qualitative", "example", "motivation", "task",
+                              "illustration", "counterfactual", "demo", "teaser",
+                              "intuition", "sample"),
+                "sec:experiments": ("result", "comparison", "performance", "main", "latency",
+                                    "tradeoff", "trade_off", "efficiency", "scalab"),
+                "sec:method": ("architecture", "framework", "pipeline", "overview", "model",
+                               "diagram", "workflow"),
+                "sec:conclusion": ("ablation", "analysis", "error", "contradiction"),
+            }
+            for fk in remaining:
+                target_label = "sec:experiments"  # default
+                for sec_label, keywords in section_hints.items():
+                    if any(kw in fk for kw in keywords):
+                        target_label = sec_label
+                        break
+                for sec in sections:
+                    if sec.label == target_label:
+                        sec.content += "\n\n" + figure_blocks[fk]
+                        placed_figures.add(fk)
+                        self.log(f"  Placed '{fk}' → {target_label}")
+                        break
+                else:
+                    # target section not found, append to Experiments
+                    for sec in sections:
+                        if sec.label == "sec:experiments":
+                            sec.content += "\n\n" + figure_blocks[fk]
+                            placed_figures.add(fk)
+                            self.log(f"  Placed '{fk}' → sec:experiments (fallback)")
+                            break
+
+        # Post-assembly validation: ensure ALL figure blocks are in the sections
+        final_missing = [k for k in figure_blocks if k not in placed_figures]
+        if final_missing:
+            self.log(f"CRITICAL: {len(final_missing)} figures still unplaced after all passes: {final_missing}")
+            # Force-inject into Experiments as last resort
             for sec in sections:
                 if sec.label == "sec:experiments":
-                    for fk in remaining:
+                    for fk in final_missing:
                         sec.content += "\n\n" + figure_blocks[fk]
-                        _mark_placed(fk)
+                        self.log(f"  Force-injected '{fk}' → sec:experiments")
                     break
 
-        # Log final figure placement order for debugging
-        fig_order = []
-        label_pattern = re.compile(r'\\label\{fig:(\w+)\}')
+        self.log(f"Figure placement complete: {len(figure_blocks)} blocks, "
+                 f"{len(placed_figures)} placed")
+
+        # ── Post-assembly deduplication: remove duplicate figure blocks ──
+        # If the same figure appears in multiple sections, keep only the first occurrence.
+        seen_fig_labels: set[str] = set()
+        seen_fig_files: set[str] = set()
         for sec in sections:
-            for m in label_pattern.finditer(sec.content):
-                fig_order.append(m.group(1))
-        self.log(f"Figure placement order: {fig_order}")
-        if remaining:
-            self.log(f"  (fallback-injected into Experiments: {remaining})")
+            def _dedup_figure(m: re.Match) -> str:
+                block = m.group(0)
+                # Check by label
+                label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+                if label_m:
+                    lbl = label_m.group(1)
+                    if lbl in seen_fig_labels:
+                        self.log(f"  Removed duplicate figure {lbl} from {sec.heading}")
+                        return ""
+                    seen_fig_labels.add(lbl)
+                # Check by includegraphics filename
+                file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+                if file_m:
+                    fname = file_m.group(1)
+                    if fname in seen_fig_files:
+                        self.log(f"  Removed duplicate figure file {fname} from {sec.heading}")
+                        return ""
+                    seen_fig_files.add(fname)
+                return block
+            sec.content = re.sub(
+                r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+                _dedup_figure, sec.content, flags=re.DOTALL,
+            )
+            # Clean up leftover blank lines from removed figures
+            sec.content = re.sub(r'\n{3,}', '\n\n', sec.content)
 
         # Step 5: Build skeleton
         skeleton = PaperSkeleton(
@@ -279,8 +391,55 @@ class WritingAgent(BaseResearchAgent):
         latex_content = self._render_latex(skeleton)
         latex_content = self._sanitize_latex(latex_content)
 
-        # Step 6b: Resolve missing citations — find \cite keys not in bib, auto-fill
+        # Step 6b-pre: Full-document figure dedup (safety net after assembly)
+        # Per-section dedup ran earlier, but assembly/render might re-introduce duplicates
+        seen_labels: set[str] = set()
+        seen_files: set[str] = set()
+        def _dedup_assembled(m: re.Match) -> str:
+            block = m.group(0)
+            lbl_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+            if lbl_m:
+                lbl = lbl_m.group(1)
+                if lbl in seen_labels:
+                    self.log(f"  Full-doc dedup: removed duplicate figure {lbl}")
+                    return ""
+                seen_labels.add(lbl)
+            file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+            if file_m:
+                fname = file_m.group(1)
+                if fname in seen_files:
+                    self.log(f"  Full-doc dedup: removed duplicate figure file {fname}")
+                    return ""
+                seen_files.add(fname)
+            return block
+        latex_content = re.sub(
+            r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+            _dedup_assembled, latex_content, flags=re.DOTALL,
+        )
+        latex_content = re.sub(r'\n{3,}', '\n\n', latex_content)
+
+        # Step 6b: Final LaTeX-level figure validation
+        # Check that every figure file from figure_output has an \includegraphics in the tex
+        latex_content = self._validate_figures_in_latex(latex_content, figure_output)
+
+        # Step 6c: Resolve missing citations — find \cite keys not in bib, auto-fill
         bibtex = await self._resolve_missing_citations(latex_content, bibtex)
+
+        # Step 6d: Citation coverage validation + must-cite enforcement
+        citation_report = self._validate_citation_coverage(
+            latex_content, ideation, cite_keys
+        )
+        if citation_report.get("missing_must_cites"):
+            self.log(f"Must-cite enforcement: {len(citation_report['missing_must_cites'])} "
+                     f"must-cite papers not referenced, injecting into Related Work")
+            latex_content = self._inject_must_cites(
+                latex_content, citation_report["missing_must_cites"], cite_keys, ideation
+            )
+            # Re-resolve in case new cite keys were introduced
+            bibtex = await self._resolve_missing_citations(latex_content, bibtex)
+
+        # Log citation quality report
+        self._log_citation_report(citation_report)
 
         # Save outputs
         tex_path = self.workspace.write_text("drafts/paper.tex", latex_content)
@@ -463,10 +622,6 @@ Metrics: {json.dumps([m.get('name', '') for m in metrics], ensure_ascii=False)}
 Baselines: {json.dumps([b.get('name', '') for b in baselines], ensure_ascii=False)}
 Ablation Groups: {json.dumps([a.get('group_name', '') for a in ablations], ensure_ascii=False)}
 
-=== BASELINE EXPECTED PERFORMANCE (from literature) ===
-{self._format_baseline_performance(baselines, metrics)}
-=== END BASELINE PERFORMANCE ===
-
 {evidence_lines}
 
 {real_results_lines}
@@ -480,34 +635,59 @@ Each contribution in Introduction MUST map to experimental evidence:
 - Method components: {json.dumps([c for c in method.get('key_components', [])], ensure_ascii=False)}
 - Ablation groups: {json.dumps([a.get('group_name', '') for a in ablations], ensure_ascii=False)}
 Every component listed above should appear in the ablation table.
-=== END ALIGNMENT ==={full_text_block}"""
+=== END ALIGNMENT ===
 
-    @staticmethod
-    def _format_baseline_performance(baselines: list, metrics: list) -> str:
-        """Format baseline expected performance from blueprint for context."""
-        if not baselines:
-            return "No baselines defined."
-        metric_names = [m.get("name", "?") for m in metrics] if metrics else []
-        lines = []
-        has_any_value = False
-        for b in baselines:
-            name = b.get("name", "Unknown")
-            perf = b.get("expected_performance", {})
-            if not isinstance(perf, dict):
-                perf = {}
-            # Filter out N/A and null values
-            valid_perf = {k: v for k, v in perf.items()
-                         if v is not None and str(v).strip().upper() != "N/A"}
-            if valid_perf:
-                has_any_value = True
-                perf_str = ", ".join(f"{k}={v}" for k, v in valid_perf.items())
-                lines.append(f"  {name}: {perf_str}")
+{self._build_must_cite_context(ideation, cite_keys)}{full_text_block}"""
+
+    def _build_must_cite_context(self, ideation: dict, cite_keys: dict[int, str]) -> str:
+        """Build a must-cite instruction block for writing prompts.
+
+        Maps must-cite titles to their actual cite_keys so the LLM
+        knows exactly which keys to use.
+        """
+        must_cites = ideation.get("must_cites", [])
+        must_cite_matches = ideation.get("must_cite_matches", [])
+        if not must_cites:
+            return ""
+
+        lines = ["=== MUST-CITE PAPERS (these MUST appear in the paper, especially Related Work) ==="]
+        lines.append("The following papers are essential references identified from survey analysis.")
+        lines.append("You MUST cite each of these at least once in the paper.\n")
+
+        papers = ideation.get("papers", [])
+        cited_keys = []
+        for mc in must_cite_matches:
+            title = mc.get("title", "")
+            idx = mc.get("paper_index")
+            matched = mc.get("matched", False)
+            if matched and idx is not None and idx in cite_keys:
+                key = cite_keys[idx]
+                lines.append(f"  - \\cite{{{key}}}: {title}")
+                cited_keys.append(key)
             else:
-                lines.append(f"  {name}: (no published numbers available)")
-        if not has_any_value:
-            lines.append("NOTE: No published baseline numbers were found in the literature review.")
-            lines.append("Use well-known results from original papers if you know them.")
-            lines.append("Otherwise, state that baseline comparison requires further investigation.")
+                lines.append(f"  - [no key available]: {title} (cite by searching if possible)")
+
+        # If no matches but we have titles, still list them
+        if not must_cite_matches:
+            for title in must_cites[:15]:
+                # Try to find by title in papers
+                for i, p in enumerate(papers):
+                    if not isinstance(p, dict):
+                        continue
+                    p_title = (p.get("title") or "").lower().strip()
+                    mc_lower = title.lower().strip()
+                    mc_words = set(mc_lower.split())
+                    p_words = set(p_title.split())
+                    if mc_words and p_words:
+                        overlap = len(mc_words & p_words) / max(len(mc_words), len(p_words))
+                        if overlap > 0.5 and i in cite_keys:
+                            lines.append(f"  - \\cite{{{cite_keys[i]}}}: {title}")
+                            cited_keys.append(cite_keys[i])
+                            break
+                else:
+                    lines.append(f"  - [unmatched]: {title}")
+
+        lines.append("\n=== END MUST-CITE ===")
         return "\n".join(lines)
 
     @staticmethod
@@ -568,16 +748,10 @@ Every component listed above should appear in the ablation table.
         main_results = experiment_results.get("main_results", [])
         if not isinstance(main_results, list):
             main_results = []
-
-        # Also accept analysis-format results (from AnalysisAgent)
-        final_metrics = experiment_results.get("final_metrics", {})
-        comparison = experiment_results.get("comparison_with_baselines", {})
-        key_findings = experiment_results.get("key_findings", [])
-
         has_real = bool(
             experiment_results
             and experiment_status.lower() in ("success", "completed")
-            and (main_results or final_metrics)
+            and main_results
         )
 
         if has_real:
@@ -587,7 +761,6 @@ Every component listed above should appear in the ablation table.
                 "in tables, text, and analysis. Do NOT round, adjust, or fabricate.",
                 "",
             ]
-            # Format 1: structured main_results
             for entry in main_results:
                 if not isinstance(entry, dict):
                     continue
@@ -606,85 +779,12 @@ Every component listed above should appear in the ablation table.
                         f"{metric.get('metric_name', '?')} = {val}{std_str}{tag}"
                     )
 
-            # Format 2: analysis-format results (final_metrics dict)
-            if final_metrics and not main_results:
-                lines.append("--- Final Metrics ---")
-                for k, v in final_metrics.items():
-                    if isinstance(v, float):
-                        lines.append(f"  {k}: {v:.4f}")
-                    else:
-                        lines.append(f"  {k}: {v}")
-
-            if comparison:
-                lines.append("")
-                lines.append("--- Comparison with Baselines ---")
-                if isinstance(comparison, dict):
-                    # Collect metric names for table header
-                    all_metric_names: list[str] = []
-                    for method_name, method_metrics in comparison.items():
-                        if isinstance(method_metrics, dict):
-                            metrics_str = ", ".join(
-                                f"{k}={v}" for k, v in method_metrics.items()
-                                if v is not None
-                            )
-                            lines.append(f"  {method_name}: {metrics_str}")
-                            for k in method_metrics:
-                                if k not in all_metric_names:
-                                    all_metric_names.append(k)
-                        else:
-                            lines.append(f"  {method_name}: {method_metrics}")
-
-                    # Pre-formatted table data to make it impossible to miss
-                    if all_metric_names:
-                        lines.append("")
-                        lines.append("=== MAIN RESULTS TABLE DATA (use in Table~\\ref{tab:main_results}) ===")
-                        header = "Method & " + " & ".join(all_metric_names) + " \\\\"
-                        lines.append(header)
-                        lines.append("\\midrule")
-                        for method_name, method_metrics in comparison.items():
-                            if isinstance(method_metrics, dict):
-                                vals = []
-                                for mn in all_metric_names:
-                                    v = method_metrics.get(mn)
-                                    vals.append(str(v) if v is not None else "-")
-                                lines.append(f"{method_name} & " + " & ".join(vals) + " \\\\")
-                        lines.append("=== END TABLE DATA ===")
-                elif isinstance(comparison, str):
-                    lines.append(f"  {comparison}")
-                elif isinstance(comparison, list):
-                    for entry in comparison:
-                        lines.append(f"  {entry}")
-
-            if key_findings:
-                lines.append("")
-                lines.append("--- Key Findings ---")
-                for f in key_findings:
-                    lines.append(f"  - {f}")
-
-            # Include training dynamics summary if available
-            training_dynamics = experiment_results.get("training_dynamics", {})
-            if training_dynamics:
-                lines.append("")
-                lines.append("--- Training Dynamics ---")
-                if isinstance(training_dynamics, dict):
-                    for k, v in training_dynamics.items():
-                        lines.append(f"  {k}: {v}")
-
-            # Include raw summary from analysis
-            summary = experiment_results.get("summary", "")
-            if summary:
-                lines.append("")
-                lines.append(f"--- Summary ---")
-                lines.append(f"  {summary}")
-
             ablation = experiment_results.get("ablation_results", [])
             if not isinstance(ablation, list):
                 ablation = []
             if ablation:
                 lines.append("")
                 lines.append("--- Ablation Results (real) ---")
-                # Collect all metric names from ablation entries
-                abl_metric_names: list[str] = []
                 for entry in ablation:
                     if not isinstance(entry, dict):
                         continue
@@ -692,31 +792,10 @@ Every component listed above should appear in the ablation table.
                     for metric in entry.get("metrics", []):
                         if not isinstance(metric, dict):
                             continue
-                        mn = metric.get("metric_name", "?")
                         val = metric.get("value", "?")
-                        lines.append(f"  {variant}: {mn} = {val}")
-                        if mn not in abl_metric_names:
-                            abl_metric_names.append(mn)
-
-                # Pre-formatted ablation table data
-                if abl_metric_names:
-                    lines.append("")
-                    lines.append("=== ABLATION TABLE DATA (use in Table~\\ref{tab:ablation}) ===")
-                    header = "Variant & " + " & ".join(abl_metric_names) + " \\\\"
-                    lines.append(header)
-                    lines.append("\\midrule")
-                    for entry in ablation:
-                        if not isinstance(entry, dict):
-                            continue
-                        variant = entry.get("variant_name", "?")
-                        metric_map = {
-                            m.get("metric_name", ""): m.get("value", "-")
-                            for m in entry.get("metrics", [])
-                            if isinstance(m, dict)
-                        }
-                        vals = [str(metric_map.get(mn, "-")) for mn in abl_metric_names]
-                        lines.append(f"{variant} & " + " & ".join(vals) + " \\\\")
-                    lines.append("=== END ABLATION TABLE DATA ===")
+                        lines.append(
+                            f"  {variant}: {metric.get('metric_name', '?')} = {val}"
+                        )
 
             lines.append("=== END REAL EXPERIMENT RESULTS ===")
             return "\n".join(lines)
@@ -735,123 +814,81 @@ Every component listed above should appear in the ablation table.
                 "- Write: 'Due to technical issues during execution, we were unable to\n"
                 "  obtain experimental results in this draft. We present our methodology\n"
                 "  and experimental design; empirical validation is left for the final version.'\n"
-                "- Omit results tables entirely, or include them with placeholder '--' values\n"
-                "  and a note explaining that results are pending.\n"
+                "- Omit results tables entirely. Do NOT include tables with '--' placeholders.\n"
+                "- Focus on describing the experimental setup, methodology, and expected behavior.\n"
                 "=== END EXPERIMENT RESULTS ==="
             )
 
     # ---- figure/table blocks ------------------------------------------------
 
-    # Semantic keyword → canonical figure alias mapping
-    _FIGURE_ALIAS_KEYWORDS: dict[str, list[str]] = {
-        "architecture": ["architecture", "model", "framework", "pipeline", "overview", "diagram"],
-        "results": ["results", "comparison", "performance", "accuracy", "main"],
-        "ablation": ["ablation"],
-        "training": ["training", "loss", "convergence", "curve"],
-    }
-
-    def _classify_figure(self, fig_key: str, caption: str) -> str | None:
-        """Classify a figure into a canonical alias based on key and caption."""
-        text = f"{fig_key} {caption}".lower()
-        for alias, keywords in self._FIGURE_ALIAS_KEYWORDS.items():
-            for kw in keywords:
-                if kw in text:
-                    return alias
-        return None
-
-    def _build_figure_blocks(self, blueprint: dict, figure_output: dict | None = None) -> tuple[dict[str, str], dict[str, set[str]]]:
+    def _build_figure_blocks(self, blueprint: dict, figure_output: dict | None = None) -> dict[str, str]:
         """Pre-build LaTeX figure/table blocks to embed inline.
 
         Dynamically builds blocks from whatever figures the FigureAgent produced.
-        Uses semantic classification to map descriptive figure keys to canonical
-        aliases (architecture, results, ablation, training).
-        Falls back to scanning drafts directory when figure_output is not available.
+        Falls back to hardcoded names when figure_output is not available.
         """
         blocks: dict[str, str] = {}
         figures = (figure_output or {}).get("figures", {})
 
-        def _make_block(fig_key: str, caption: str, fig_data: dict | None = None,
-                        include_name: str = "") -> str:
-            """Build a LaTeX figure block."""
-            if not include_name:
-                if fig_data and fig_data.get("pdf_path"):
-                    include_name = f"{fig_key}.pdf"
-                else:
-                    include_name = f"{fig_key}.png"
-            # Derive label from fig_key
-            parts = fig_key.split("_", 1)
-            label_suffix = parts[1] if len(parts) > 1 else fig_key
-            return (
-                "\\begin{figure}[H]\n"
-                "\\centering\n"
-                f"\\includegraphics[width=0.9\\textwidth]{{{include_name}}}\n"
-                f"\\caption{{{caption}}}\n"
-                f"\\label{{fig:{label_suffix}}}\n"
-                "\\end{figure}"
-            ), label_suffix
-
-        # Collect all figure entries: (fig_key, caption, block, label_suffix)
-        entries: list[tuple[str, str, str, str]] = []
-
         if figures:
+            # Dynamic: iterate over all figures produced by the FigureAgent.
+            # Each figure gets exactly ONE key (label_suffix) — no aliases,
+            # to prevent the same block being placed twice.
             for fig_key, fig_data in figures.items():
                 if "error" in fig_data and "png_path" not in fig_data:
-                    continue
-                caption = fig_data.get("caption", f"Figure: {fig_key}")
-                block, label_suffix = _make_block(fig_key, caption, fig_data)
-                entries.append((fig_key, caption, block, label_suffix))
-        else:
-            # Scan drafts directory for generated figure files
-            drafts_dir = self.workspace.path / "drafts" if hasattr(self, "workspace") else None
-            fig_files = []
-            if drafts_dir and drafts_dir.exists():
-                fig_files = sorted(drafts_dir.glob("fig_*.pdf")) + sorted(drafts_dir.glob("fig_*.png"))
+                    continue  # skip failed figures with no output
 
-            seen_stems = set()
-            for fig_path in fig_files:
-                stem = fig_path.stem
-                if stem in seen_stems:
-                    continue
-                seen_stems.add(stem)
-                label_suffix = stem.replace("fig_", "", 1) if stem.startswith("fig_") else stem
-                caption = label_suffix.replace("_", " ").title()
+                caption = fig_data.get("caption", f"Figure: {fig_key}")
+                # Derive a LaTeX-friendly label from fig_key
+                # e.g., "fig1_architecture" -> "fig:architecture"
+                #        "fig2_results"     -> "fig:results"
+                parts = fig_key.split("_", 1)
+                label_suffix = parts[1] if len(parts) > 1 else fig_key
+                label = f"fig:{label_suffix}"
+
+                # Check for PDF first, then PNG
+                pdf_name = f"{fig_key}.pdf"
+                png_name = f"{fig_key}.png"
+                include_name = pdf_name if fig_data.get("pdf_path") else png_name
+
                 block = (
-                    "\\begin{figure}[H]\n"
+                    "\\begin{figure}[t!]\n"
                     "\\centering\n"
-                    f"\\includegraphics[width=0.9\\textwidth]{{{fig_path.name}}}\n"
-                    f"\\caption{{{caption}.}}\n"
-                    f"\\label{{fig:{label_suffix}}}\n"
+                    f"\\includegraphics[width=\\textwidth]{{{include_name}}}\n"
+                    f"\\caption{{{caption}}}\n"
+                    f"\\label{{{label}}}\n"
                     "\\end{figure}"
                 )
-                entries.append((stem, caption, block, label_suffix))
 
-        if not entries:
-            self.log("WARNING: No figures available for paper")
-            for alias in ("architecture", "results", "ablation"):
-                blocks[alias] = f"% Figure '{alias}' not available\n"
-            return blocks, {}
+                blocks[label_suffix] = block
+        else:
+            # Fallback: assume standard 3-figure layout
+            blocks["architecture"] = (
+                "\\begin{figure}[t!]\n"
+                "\\centering\n"
+                "\\includegraphics[width=\\textwidth]{fig1_architecture.pdf}\n"
+                "\\caption{Overview of the proposed model architecture.}\n"
+                "\\label{fig:architecture}\n"
+                "\\end{figure}"
+            )
+            blocks["results"] = (
+                "\\begin{figure}[t!]\n"
+                "\\centering\n"
+                "\\includegraphics[width=\\textwidth]{fig2_results.pdf}\n"
+                "\\caption{Performance comparison.}\n"
+                "\\label{fig:results}\n"
+                "\\end{figure}"
+            )
+            blocks["ablation"] = (
+                "\\begin{figure}[t!]\n"
+                "\\centering\n"
+                "\\includegraphics[width=\\textwidth]{fig3_ablation.pdf}\n"
+                "\\caption{Ablation study.}\n"
+                "\\label{fig:ablation}\n"
+                "\\end{figure}"
+            )
 
-        # Step 1: Store each figure under its label_suffix
-        for fig_key, caption, block, label_suffix in entries:
-            blocks[label_suffix] = block
-
-        # Step 2: Semantic classification — map each figure to a canonical alias
-        # Avoid assigning the same alias to multiple figures
-        # Track equivalences: alias <-> label_suffix point to the same figure
-        equiv: dict[str, set[str]] = {}  # key -> set of equivalent keys
-        alias_assigned: dict[str, str] = {}  # alias -> fig_key
-        for fig_key, caption, block, label_suffix in entries:
-            alias = self._classify_figure(label_suffix, caption)
-            if alias and alias not in alias_assigned:
-                alias_assigned[alias] = fig_key
-                if alias not in blocks:
-                    blocks[alias] = block
-                # Record equivalence between alias and label_suffix
-                if alias != label_suffix:
-                    equiv.setdefault(alias, set()).add(label_suffix)
-                    equiv.setdefault(label_suffix, set()).add(alias)
-
-        return blocks, equiv
+        return blocks
 
     # ---- tool-augmented search for writing -----------------------------------
 
@@ -931,6 +968,64 @@ Every component listed above should appear in the ablation table.
         except ImportError:
             pass
 
+        # RAG tool: read full-text from a paper's PDF
+        try:
+            from mcp_server.tools.pdf_reader import download_and_extract
+
+            async def _read_paper_pdf(pdf_url: str, section: str = "") -> dict:
+                """Download a paper PDF and extract its full text or a specific section."""
+                result = await download_and_extract(pdf_url, max_pages=20)
+                if section:
+                    # Return specific section if requested
+                    sections = result.get("sections", {})
+                    for name, content in sections.items():
+                        if section.lower() in name.lower():
+                            return {"section": name, "content": content[:5000]}
+                    return {"error": f"Section '{section}' not found. Available: {list(sections.keys())}"}
+                # Return method + experiment + abstract (most useful for writing)
+                out: dict = {}
+                if result.get("method_text"):
+                    out["method"] = result["method_text"][:4000]
+                if result.get("experiment_text"):
+                    out["experiments"] = result["experiment_text"][:4000]
+                sections = result.get("sections", {})
+                if "Abstract" in sections:
+                    out["abstract"] = sections["Abstract"][:1000]
+                if not out:
+                    out["full_text"] = result.get("full_text", "")[:6000]
+                out["page_count"] = result.get("page_count", 0)
+                out["sections_available"] = list(sections.keys())
+                return out
+
+            registry.register(ToolDefinition(
+                name="read_paper_pdf",
+                description=(
+                    "Download and read a paper's PDF to get its full text. "
+                    "Use this to get detailed method descriptions, experiment setups, "
+                    "or specific results from a paper. Provide the PDF URL "
+                    "(e.g., https://arxiv.org/pdf/2301.12345). "
+                    "Optionally specify a section name to read only that section."
+                ),
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "pdf_url": {
+                            "type": "string",
+                            "description": "URL to the PDF file (e.g., https://arxiv.org/pdf/XXXX.XXXXX)",
+                        },
+                        "section": {
+                            "type": "string",
+                            "description": "Optional section name to extract (e.g., 'Method', 'Experiments')",
+                            "default": "",
+                        },
+                    },
+                    "required": ["pdf_url"],
+                },
+                handler=_read_paper_pdf,
+            ))
+        except ImportError:
+            pass
+
         return registry if len(registry) > 0 else None
 
     # ---- section generation -------------------------------------------------
@@ -938,7 +1033,7 @@ Every component listed above should appear in the ablation table.
     async def _generate_title(self, context: str) -> str:
         prompt = f"Based on the following research context, generate a paper title:\n\n{context}"
         try:
-            return (await self.generate(TITLE_SYSTEM_PROMPT, prompt)).strip().strip('"')
+            return ((await self.generate(TITLE_SYSTEM_PROMPT, prompt)) or "").strip().strip('"')
         except Exception as e:
             logger.warning("Title generation failed, using fallback: %s", e)
             return "Untitled Research Paper"
@@ -946,7 +1041,7 @@ Every component listed above should appear in the ablation table.
     async def _generate_abstract(self, context: str) -> str:
         prompt = f"Based on the following research context, write the abstract:\n\n{context}"
         try:
-            return (await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)).strip()
+            return ((await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)) or "").strip()
         except Exception as e:
             logger.warning("Abstract generation failed, using fallback: %s", e)
             return "Abstract not available."
@@ -989,15 +1084,19 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                         "If you need to verify citations, find additional references, "
                         "or look up recent results, use the tools before writing."
                     )
-                    return (await self.generate_with_tools(
+                    content = (await self.generate_with_tools(
                         section_system, tool_prompt, tools,
                         max_tool_rounds=10,
-                    )).strip()
+                    ) or "").strip()
+                    if not content:
+                        self.log(f"  ReAct loop returned empty content for {heading}, retrying without tools")
+                        content = ((await self.generate(section_system, prompt)) or "").strip()
+                    return content
             except Exception as e:
                 logger.warning("Tool-augmented writing failed for %s, falling back: %s", heading, e)
 
         try:
-            return (await self.generate(section_system, prompt)).strip()
+            return ((await self.generate(section_system, prompt)) or "").strip()
         except Exception as e:
             logger.warning("Section generation failed for %s: %s", heading, e)
             return f"% Section generation failed: {heading}"
@@ -1068,7 +1167,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
     # ---- missing citation resolver -------------------------------------------
 
-    _CITE_KEY_RE = re.compile(r"\\cite[tp]?\{([^}]+)\}")
+    _CITE_KEY_RE = re.compile(r"\\cite[tp]?(?:\[[^\]]*\])*\{([^}]+)\}")
     _BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)")
 
     async def _resolve_missing_citations(
@@ -1190,6 +1289,182 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             f"}}\n"
         )
 
+    # ---- citation coverage validation ----------------------------------------
+
+    def _validate_citation_coverage(
+        self, latex: str, ideation: dict, cite_keys: dict[int, str]
+    ) -> dict:
+        """Validate citation quality of the written paper.
+
+        Checks:
+        1. Total citation count
+        2. Must-cite papers referenced
+        3. Citation distribution across sections
+        4. High-cited papers coverage
+        """
+        # 1. Extract all cited keys
+        cited: set[str] = set()
+        for m in self._CITE_KEY_RE.finditer(latex):
+            for k in m.group(1).split(","):
+                k = k.strip()
+                if k:
+                    cited.add(k)
+
+        total_citations = len(cited)
+
+        # 2. Check must-cite coverage
+        must_cites = ideation.get("must_cites", [])
+        must_cite_matches = ideation.get("must_cite_matches", [])
+        papers = ideation.get("papers", [])
+
+        missing_must_cites: list[dict] = []
+        cited_must_cites: list[str] = []
+        for mc in must_cite_matches:
+            idx = mc.get("paper_index")
+            matched = mc.get("matched", False)
+            title = mc.get("title", "")
+            if matched and idx is not None and idx in cite_keys:
+                key = cite_keys[idx]
+                if key in cited:
+                    cited_must_cites.append(title)
+                else:
+                    missing_must_cites.append({"title": title, "cite_key": key, "paper_index": idx})
+            else:
+                # Unmatched must-cite — can't check, but flag it
+                missing_must_cites.append({"title": title, "cite_key": None, "paper_index": None})
+
+        # 3. Citation distribution by section
+        section_cites: dict[str, int] = {}
+        # Split by \section
+        section_pattern = re.compile(r'\\section\{([^}]+)\}')
+        parts = section_pattern.split(latex)
+        for i in range(1, len(parts), 2):
+            sec_name = parts[i] if i < len(parts) else "Unknown"
+            sec_content = parts[i + 1] if i + 1 < len(parts) else ""
+            sec_cited = set()
+            for m in self._CITE_KEY_RE.finditer(sec_content):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        sec_cited.add(k)
+            section_cites[sec_name] = len(sec_cited)
+
+        # 4. High-cited papers coverage
+        high_cited_keys = set()
+        for i, p in enumerate(papers):
+            if not isinstance(p, dict):
+                continue
+            if (p.get("citation_count", 0) or 0) >= 100 and i in cite_keys:
+                high_cited_keys.add(cite_keys[i])
+
+        cited_high = high_cited_keys & cited
+        uncited_high = high_cited_keys - cited
+
+        return {
+            "total_citations": total_citations,
+            "must_cite_total": len(must_cites),
+            "must_cite_found": len(cited_must_cites),
+            "missing_must_cites": missing_must_cites,
+            "cited_must_cites": cited_must_cites,
+            "section_cites": section_cites,
+            "high_cited_total": len(high_cited_keys),
+            "high_cited_referenced": len(cited_high),
+            "uncited_high_keys": sorted(uncited_high),
+        }
+
+    def _inject_must_cites(
+        self, latex: str, missing: list[dict],
+        cite_keys: dict[int, str], ideation: dict,
+    ) -> str:
+        """Inject missing must-cite papers into the Related Work section.
+
+        Adds a brief sentence for each must-cite paper that was identified
+        but not referenced in the paper.
+        """
+        papers = ideation.get("papers", [])
+
+        # Build injection lines
+        inject_lines = []
+        for mc in missing:
+            key = mc.get("cite_key")
+            idx = mc.get("paper_index")
+            if not key:
+                continue  # Can't inject without a cite key
+
+            # Get paper title for context
+            title = mc.get("title", "")
+            if idx is not None and idx < len(papers):
+                p = papers[idx]
+                if isinstance(p, dict):
+                    title = p.get("title", title)
+
+            inject_lines.append(f"\\citet{{{key}}} is also relevant to this line of research.")
+
+        if not inject_lines:
+            return latex
+
+        injection = "\n".join(inject_lines)
+
+        # Find the Related Work section and inject before its end
+        rw_pattern = re.compile(
+            r'(\\section\{Related Work\}.*?)'
+            r'(\\section\{)',
+            re.DOTALL
+        )
+        m = rw_pattern.search(latex)
+        if m:
+            # Insert before next \section
+            insert_pos = m.start(2)
+            latex = (
+                latex[:insert_pos]
+                + "\n\n" + injection + "\n\n"
+                + latex[insert_pos:]
+            )
+            self.log(f"Injected {len(inject_lines)} must-cite references into Related Work")
+        else:
+            # Fallback: try inserting after Introduction
+            intro_pattern = re.compile(
+                r'(\\section\{Introduction\}.*?)(\\section\{)',
+                re.DOTALL
+            )
+            m = intro_pattern.search(latex)
+            if m:
+                insert_pos = m.start(2)
+                latex = (
+                    latex[:insert_pos]
+                    + "\n\n" + injection + "\n\n"
+                    + latex[insert_pos:]
+                )
+                self.log(f"Injected {len(inject_lines)} must-cite references after Introduction")
+
+        return latex
+
+    def _log_citation_report(self, report: dict) -> None:
+        """Log a citation quality report."""
+        self.log("=== Citation Quality Report ===")
+        self.log(f"  Total unique citations: {report.get('total_citations', 0)}")
+        self.log(f"  Must-cite coverage: {report.get('must_cite_found', 0)}/{report.get('must_cite_total', 0)}")
+        self.log(f"  High-cited papers referenced: {report.get('high_cited_referenced', 0)}/{report.get('high_cited_total', 0)}")
+
+        section_cites = report.get("section_cites", {})
+        if section_cites:
+            self.log("  Per-section citations:")
+            for sec, count in section_cites.items():
+                self.log(f"    {sec}: {count}")
+
+        uncited_high = report.get("uncited_high_keys", [])
+        if uncited_high:
+            self.log(f"  Uncited high-cited papers: {', '.join(uncited_high[:10])}")
+
+        missing = report.get("missing_must_cites", [])
+        if missing:
+            self.log(f"  Missing must-cites: {[m['title'][:50] for m in missing[:5]]}")
+
+        # Save report to workspace
+        self.save_log("citation_quality_report.json",
+                      json.dumps(report, indent=2, ensure_ascii=False, default=str))
+        self.log("=== End Citation Report ===")
+
     def _render_latex(self, skeleton: PaperSkeleton) -> str:
         """Render the paper skeleton to LaTeX string."""
         try:
@@ -1215,11 +1490,12 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             r"\usepackage{hyperref}",
             r"\usepackage{natbib}",
             r"\usepackage{booktabs}",
-            r"\usepackage{float}",  # for [H] placement
+            r"\usepackage{float}",
+            r"\usepackage[section]{placeins}",  # prevent floats drifting across sections
             r"\usepackage{multirow}",  # for multi-row table cells
             "",
             f"\\title{{{skeleton.title}}}",
-            f"\\author{{{' \\\\and '.join(skeleton.authors)}}}",
+            f"\\author{{{' \\and '.join(skeleton.authors)}}}",
             r"\date{}",
             "",
             r"\begin{document}",
@@ -1252,122 +1528,23 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         ])
         return "\n".join(lines)
 
-    def _deterministic_latex_fixes(self, tex_source: str, tex_dir: Path) -> tuple[str, list[str]]:
-        """Apply rule-based fixes to common LaTeX errors BEFORE calling the LLM.
-
-        Returns (fixed_tex, list_of_fixes_applied).
-        """
-        fixes: list[str] = []
-        text = tex_source
-
-        # 1. Fix missing figure files: comment out \includegraphics for non-existent files
-        def _fix_missing_figure(m):
-            filename = m.group(1)
-            fig_path = tex_dir / filename
-            if not fig_path.exists():
-                # Try to find a similar file
-                stem = Path(filename).stem
-                candidates = list(tex_dir.glob("fig_*.pdf")) + list(tex_dir.glob("fig_*.png"))
-                if candidates:
-                    replacement = candidates[0].name
-                    fixes.append(f"Replaced missing '{filename}' with '{replacement}'")
-                    return m.group(0).replace(filename, replacement)
-                else:
-                    fixes.append(f"Commented out missing figure '{filename}'")
-                    return f"% MISSING: {m.group(0)}"
-            return m.group(0)
-
-        text = re.sub(
-            r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}',
-            _fix_missing_figure,
-            text,
-        )
-
-        # 2. Fix doubled @{} in tabular column specs (e.g., @{@{}} or @{}@{})
-        def _fix_doubled_at_braces(m):
-            spec = m.group(1)
-            original = spec
-            # Remove any @{@{}} patterns (nested/doubled)
-            while "@{@{}}" in spec or "@{}@{}" in spec:
-                spec = spec.replace("@{@{}}", "@{}")
-                spec = spec.replace("@{}@{}", "@{}")
-            if spec != original:
-                fixes.append(f"Fixed doubled @{{}} in tabular: '{original}' -> '{spec}'")
-            return f"\\begin{{tabular}}{{{spec}}}"
-
-        text = re.sub(
-            r'\\begin\{tabular\}\{(.+)\}',
-            _fix_doubled_at_braces,
-            text,
-        )
-
-        # 3. Unicode character replacements
-        unicode_map = {
-            '\u2014': '---',   # em-dash
-            '\u2013': '--',    # en-dash
-            '\u2018': '`',     # left single quote
-            '\u2019': "'",     # right single quote
-            '\u201c': '``',    # left double quote
-            '\u201d': "''",    # right double quote
-            '\u2026': '\\ldots{}',  # ellipsis
-            '\u00d7': '$\\times$',  # multiplication sign
-            '\u2264': '$\\leq$',    # less than or equal
-            '\u2265': '$\\geq$',    # greater than or equal
-            '\u00b1': '$\\pm$',     # plus-minus
-        }
-        for uchar, replacement in unicode_map.items():
-            if uchar in text:
-                count = text.count(uchar)
-                text = text.replace(uchar, replacement)
-                fixes.append(f"Replaced {count} Unicode '{uchar}' with '{replacement}'")
-
-        # 4. Fix unmatched \begin/\end environments
-        env_stack: list[str] = []
-        for m in re.finditer(r'\\(begin|end)\{(\w+)\}', text):
-            cmd, env = m.group(1), m.group(2)
-            if cmd == "begin":
-                env_stack.append(env)
-            elif cmd == "end" and env_stack and env_stack[-1] == env:
-                env_stack.pop()
-        # If there are unclosed environments, append \end{X} before \end{document}
-        if env_stack:
-            closing = "\n".join(f"\\end{{{e}}}" for e in reversed(env_stack))
-            fixes.append(f"Added missing \\end for: {env_stack}")
-            text = text.replace("\\end{document}", f"{closing}\n\\end{{document}}")
-
-        # 5. Remove commented-out figure environments that still have \includegraphics
-        # (from fix #1, clean up orphaned \caption, \label within the commented block)
-        def _clean_commented_figure(m):
-            block = m.group(0)
-            if "% MISSING:" in block:
-                # Comment out the entire figure environment
-                commented = "\n".join(f"% {line}" for line in block.split("\n"))
-                fixes.append("Commented out entire figure environment with missing file")
-                return commented
-            return block
-
-        text = re.sub(
-            r'\\begin\{figure\}.*?\\end\{figure\}',
-            _clean_commented_figure,
-            text,
-            flags=re.DOTALL,
-        )
-
-        return text, fixes
-
     async def _compile_pdf(
         self,
         tex_path,
         max_fix_attempts: int = MAX_LATEX_FIX_ATTEMPTS,
         template_format: str = "arxiv",
     ) -> dict:
-        """Compile LaTeX to PDF with deterministic pre-fixes + LLM patch loop.
+        """Compile LaTeX to PDF with automatic error-fix loop.
 
-        Flow:
-        1. Apply deterministic regex fixes (zero LLM cost)
-        2. Compile
-        3. If fails → LLM patch-mode fix → retry
+        If compilation fails, feed the error back to the LLM, apply the fix,
+        and retry up to *max_fix_attempts* times.
+
+        Safety features (OpenClaw-inspired):
+        - Backs up original tex before fix loop; restores on total failure
+        - Post-write verification: re-reads file to confirm write succeeded
         """
+        import shutil
+
         self._copy_figures_to_drafts()
         self._copy_style_files(template_format)
 
@@ -1378,30 +1555,21 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             return {"error": f"PDF compiler module not available: {exc}"}
 
         tex_path = Path(tex_path)
-        tex_dir = tex_path.parent
 
-        # Step 1: Apply deterministic fixes before first compilation
+        # Backup original tex before any fix attempts
+        backup_path = tex_path.with_suffix('.tex.bak')
         try:
-            current_tex = tex_path.read_text(encoding="utf-8")
-            fixed_tex, det_fixes = self._deterministic_latex_fixes(current_tex, tex_dir)
-            if det_fixes:
-                self.log(f"Applied {len(det_fixes)} deterministic LaTeX fix(es):")
-                for f in det_fixes:
-                    self.log(f"  - {f}")
-                fixed_tex = self._sanitize_latex(fixed_tex)
-                tex_path.write_text(fixed_tex, encoding="utf-8")
-        except OSError as exc:
-            logger.error("Cannot read/write tex file for pre-fixing: %s", exc)
+            shutil.copy2(tex_path, backup_path)
+        except OSError:
+            pass  # non-fatal
 
-        # Step 2: Compile + LLM fix loop
         result: dict = {}
-        llm_attempts = 0
         for attempt in range(max_fix_attempts + 1):
             result = await compile_pdf(str(tex_path))
 
             if "pdf_path" in result:
                 if attempt > 0:
-                    self.log(f"PDF compiled successfully after {attempt} fix(es) ({llm_attempts} LLM)")
+                    self.log(f"PDF compiled successfully after {attempt} fix(es)")
                 return result
 
             error_msg = result.get("error", "Unknown compilation error")
@@ -1413,37 +1581,46 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
             if attempt >= max_fix_attempts:
                 self.log(f"PDF compilation failed after {max_fix_attempts} fix attempts")
+                # Restore backup on total failure
+                if backup_path.exists():
+                    try:
+                        shutil.copy2(backup_path, tex_path)
+                        self.log("  Restored original tex from backup")
+                    except OSError:
+                        pass
                 return result
 
-            self.log(f"PDF compilation failed (attempt {attempt + 1}), diagnosing...")
-            self.save_log(f"latex_compile_error_{attempt}.log", error_msg)
+            # Ask LLM to fix the LaTeX
+            self.log(f"PDF compilation failed (attempt {attempt + 1}), asking LLM to fix...")
+            self.save_log(
+                f"latex_compile_error_{attempt}.log", error_msg
+            )
 
-            # Try deterministic fixes again based on the error message
             try:
                 current_tex = tex_path.read_text(encoding="utf-8")
             except OSError as exc:
                 logger.error("Cannot read tex file for fixing: %s", exc)
                 return result
 
-            fixed_tex, det_fixes = self._deterministic_latex_fixes(current_tex, tex_dir)
-            if det_fixes:
-                self.log(f"  Applied {len(det_fixes)} deterministic fix(es), retrying...")
-                fixed_tex = self._sanitize_latex(fixed_tex)
-                tex_path.write_text(fixed_tex, encoding="utf-8")
-                continue  # retry without counting as LLM attempt
-
-            # Ask LLM to fix via patch mode
-            llm_attempts += 1
-            self.log(f"  Asking LLM for patch fix (LLM attempt {llm_attempts})...")
             fixed_tex = await self._fix_latex_errors(current_tex, error_msg)
 
             if fixed_tex and fixed_tex != current_tex:
+                # Sanitize again after the LLM fix
                 fixed_tex = self._sanitize_latex(fixed_tex)
                 try:
                     tex_path.write_text(fixed_tex, encoding="utf-8")
                 except OSError as exc:
                     logger.error("Cannot write fixed tex file: %s", exc)
                     return result
+                # Post-write verification
+                try:
+                    verify = tex_path.read_text(encoding="utf-8")
+                    if verify != fixed_tex:
+                        self.log("  WARNING: post-write verification failed, reverting")
+                        tex_path.write_text(current_tex, encoding="utf-8")
+                        return result
+                except OSError:
+                    pass
                 self.log(f"  Applied LLM fix (attempt {attempt + 1})")
             else:
                 self.log("  LLM returned no changes, aborting fix loop")
@@ -1452,157 +1629,175 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         return result  # pragma: no cover
 
     async def _fix_latex_errors(self, tex_source: str, error_log: str) -> str | None:
-        """Fix LaTeX compilation errors using surgical line-level replacement.
+        """Fix LaTeX compilation errors using a 2-level strategy.
 
-        Instead of asking the LLM to return the entire document, we:
-        1. Extract the error line number from the error log
-        2. Send only ±10 lines around the error to the LLM
-        3. LLM returns ONLY the fixed lines
-        4. We splice them back into the original document
+        Level 1: Deterministic fixes (no LLM) — Unicode, missing packages, preamble junk
+        Level 2: Search-replace LLM fix — LLM outputs {"old":"...","new":"..."} pairs,
+                 applied via str.replace(). Safe: no match = no change.
 
-        Falls back to full-document mode only when no line number is found.
+        Inspired by OpenClaw's edit tool. NEVER sends full document for rewriting.
         """
+        from nanoresearch.agents.review import ReviewAgent
+
         if len(error_log) > 3000:
             error_log = error_log[:1500] + "\n...[truncated]...\n" + error_log[-1500:]
 
-        # Extract error line number
-        error_line = None
-        line_match = re.search(r'(?:line\s+|l\.)(\d+)', error_log)
-        if line_match:
-            error_line = int(line_match.group(1))
+        # Prioritize actual error lines over warnings
+        error_lines: list[int] = []
+        for log_line in error_log.split('\n'):
+            if 'error:' in log_line.lower():
+                for m in re.finditer(r'\.tex:(\d+):', log_line):
+                    ln = int(m.group(1))
+                    if ln not in error_lines:
+                        error_lines.append(ln)
+                for m in re.finditer(r'(?:input line\s+|line\s+|l\.)(\d+)', log_line):
+                    ln = int(m.group(1))
+                    if ln not in error_lines:
+                        error_lines.append(ln)
+        if not error_lines:
+            for m in re.finditer(r'(?:\.tex:(\d+):)', error_log):
+                ln = int(m.group(1))
+                if ln not in error_lines:
+                    error_lines.append(ln)
+            for m in re.finditer(r'(?:line\s+|l\.)(\d+)', error_log):
+                ln = int(m.group(1))
+                if ln not in error_lines:
+                    error_lines.append(ln)
+        error_line = error_lines[0] if error_lines else None
 
         tex_lines = tex_source.split('\n')
-
-        # Classify error for targeted guidance
         error_lower = error_log.lower()
-        targeted_hint = ""
-        if "invalid character" in error_lower or "unicode" in error_lower or "character" in error_lower:
-            targeted_hint = (
-                "Likely cause: Unicode characters (em-dash, en-dash, smart quotes, "
-                "non-ASCII). Replace with LaTeX equivalents: --- for em-dash, -- for "
-                "en-dash, standard quotes, \\alpha etc."
-            )
-        elif "undefined control sequence" in error_lower:
-            targeted_hint = "Likely cause: Typo in command name or missing \\usepackage."
-        elif "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
-            targeted_hint = "Likely cause: Mismatched \\begin/\\end environments."
-        elif "missing \\begin{document}" in error_lower:
-            targeted_hint = "Likely cause: Non-LaTeX content before \\begin{document}."
 
-        # ---- Surgical mode: line number known ----
+        # Level 1: Deterministic
+        fixed = ReviewAgent._try_deterministic_fix(
+            self, tex_source, tex_lines, error_log, error_lower, error_line
+        )
+        if fixed and fixed != tex_source:
+            self.log("  Level 1: deterministic fix applied")
+            return fixed
+
+        targeted_hint = ReviewAgent._classify_error(error_lower)
+
+        # Level 2: Search-replace LLM fix (reuse ReviewAgent's implementation)
+        result = await self._search_replace_llm_fix_writing(
+            tex_source, tex_lines, error_line, error_log, targeted_hint
+        )
+        if result:
+            return result
+
+        self.log("  All fix levels exhausted, no fix found")
+        return None
+
+    async def _search_replace_llm_fix_writing(
+        self, tex_source: str, tex_lines: list[str],
+        error_line: int | None, error_log: str, targeted_hint: str,
+    ) -> str | None:
+        """Level 2 search-replace fix for WritingAgent."""
+        from nanoresearch.agents.review import ReviewAgent
+
+        # Build context snippet (same window logic as ReviewAgent)
         if error_line and error_line <= len(tex_lines):
-            err_idx = error_line - 1  # 0-indexed
-            window_radius = 10
-            win_start = max(0, err_idx - window_radius)
-            win_end = min(len(tex_lines), err_idx + window_radius + 1)
-            snippet_lines = tex_lines[win_start:win_end]
+            err_idx = error_line - 1
+            win_start = max(0, err_idx - 20)
+            win_end = min(len(tex_lines), err_idx + 20 + 1)
 
-            # Number lines for clarity
-            numbered = "\n".join(
-                f"{win_start + i + 1:>5}: {line}"
-                for i, line in enumerate(snippet_lines)
-            )
-
-            system = (
-                "You are a LaTeX error fixer. You will receive a small snippet of "
-                "LaTeX lines around an error. Fix ONLY the broken lines.\n\n"
-                "Rules:\n"
-                "- Return ONLY the fixed lines (same count as input, no line numbers)\n"
-                "- Do NOT add or remove lines — keep exactly the same number of lines\n"
-                "- Do NOT wrap in markdown fences\n"
-                "- Change as little as possible — only fix the error"
-            )
-
-            prompt = (
-                f"LaTeX compilation error at line {error_line}:\n"
-                f"{error_log}\n\n"
-                f"{targeted_hint}\n\n"
-                f"Lines {win_start + 1}-{win_end} of the document:\n"
-                f"{numbered}\n\n"
-                f"Return the fixed version of these {len(snippet_lines)} lines. "
-                f"Output EXACTLY {len(snippet_lines)} lines, no more, no less."
-            )
-
-            try:
-                fixed_text = await self.generate(system, prompt)
-                fixed_text = fixed_text.strip()
-                # Strip markdown fences
-                if fixed_text.startswith("```"):
-                    flines = fixed_text.split("\n")
-                    flines = flines[1:]
-                    if flines and flines[-1].strip().startswith("```"):
-                        flines = flines[:-1]
-                    fixed_text = "\n".join(flines)
-                # Strip any line number prefixes the LLM might add
-                fixed_lines = fixed_text.split('\n')
-                cleaned = []
-                for fl in fixed_lines:
-                    stripped = re.sub(r'^\s*\d+\s*:\s?', '', fl)
-                    cleaned.append(stripped)
-                fixed_lines = cleaned
-
-                # Validate: should be roughly same line count
-                if abs(len(fixed_lines) - len(snippet_lines)) <= 2:
-                    # Splice back
-                    new_lines = tex_lines[:win_start] + fixed_lines + tex_lines[win_end:]
-                    result = '\n'.join(new_lines)
-                    self.log(
-                        f"  Surgical fix: replaced lines {win_start+1}-{win_end} "
-                        f"({len(snippet_lines)}→{len(fixed_lines)} lines)"
-                    )
-                    return result
-                else:
-                    self.log(
-                        f"  Surgical fix line count mismatch: "
-                        f"expected ~{len(snippet_lines)}, got {len(fixed_lines)}, "
-                        f"falling back to full-document mode"
-                    )
-            except Exception as exc:
-                self.log(f"  Surgical fix failed: {exc}, falling back")
-
-        # ---- Fallback: no line number or surgical fix failed ----
-        if len(tex_source) > 40000:
-            tex_for_prompt = (
-                '\n'.join(tex_lines[:80])
-                + "\n% ... [middle omitted] ...\n"
-                + '\n'.join(tex_lines[-50:])
-            )
+            env_stack: list[int] = []
+            for i in range(win_start, win_end):
+                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    env_stack.append(i)
+                if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    if env_stack:
+                        env_stack.pop()
+            if env_stack:
+                for i in range(win_end, min(len(tex_lines), win_end + 30)):
+                    if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                        win_end = i + 1
+                        env_stack.pop()
+                        if not env_stack:
+                            break
+            for i in range(win_start - 1, max(-1, win_start - 30), -1):
+                if i < 0:
+                    break
+                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    win_start = i
+                    break
         else:
-            tex_for_prompt = tex_source
+            win_start = 0
+            win_end = min(len(tex_lines), 40)
+
+        snippet_lines = tex_lines[win_start:win_end]
+        numbered = "\n".join(
+            f"{win_start + i + 1:>5}: {line}"
+            for i, line in enumerate(snippet_lines)
+        )
 
         system = (
-            "You are a LaTeX expert. Fix the compilation errors.\n"
-            "Return the COMPLETE fixed LaTeX document.\n"
-            "Do NOT wrap in markdown fences. Output ONLY LaTeX source.\n"
-            "Must start with \\documentclass and end with \\end{document}."
+            "You are a LaTeX error fixer. You will see a code snippet with an error.\n\n"
+            "Your job: identify the EXACT broken text and provide a replacement.\n\n"
+            "Reply with ONLY a JSON array of edit operations:\n"
+            '[\n'
+            '  {"old": "exact broken text from the snippet", "new": "fixed replacement text"}\n'
+            ']\n\n'
+            "Rules:\n"
+            "- old MUST be an EXACT substring copied from the snippet (including whitespace)\n"
+            "- old should be as SHORT as possible — just the broken part + enough context to be unique\n"
+            "- new is the corrected version of old\n"
+            "- Output ONLY the JSON array, nothing else"
         )
+
+        line_ref = f" at line {error_line}" if error_line else ""
         prompt = (
-            f"=== ERROR ===\n{error_log}\n=== END ERROR ===\n"
-            f"{targeted_hint}\n\n"
-            f"=== LATEX SOURCE ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
-            f"Fix the error and return the complete document."
+            f"LaTeX compilation error{line_ref}:\n"
+            f"{error_log}\n\n{targeted_hint}\n\n"
+            f"Code snippet (lines {win_start + 1}-{win_end}):\n"
+            f"{numbered}\n\nProvide the search-replace edits as a JSON array."
         )
 
         try:
-            fixed = await self.generate(system, prompt)
-            fixed = fixed.strip()
-            if fixed.startswith("```"):
-                lines = fixed.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                fixed = "\n".join(lines)
-            if "\\documentclass" in fixed:
-                idx = fixed.index("\\documentclass")
-                if idx > 0:
-                    fixed = fixed[idx:]
-            if "\\documentclass" not in fixed:
-                self.log("  LLM fix missing \\documentclass, discarding")
-                return None
-            return fixed
+            raw = (await self.generate(system, prompt)) or ""
+            edits = ReviewAgent._parse_edit_json(raw)
 
-        except Exception as e:
-            self.log(f"  LLM fix call failed: {e}")
-            return None
+            if not edits:
+                self.log("  Level 2: LLM returned no valid edits")
+                return None
+
+            result = tex_source
+            applied = 0
+            for edit in edits:
+                old = edit.get("old", "")
+                new = edit.get("new", "")
+                if not old or old == new:
+                    continue
+                if old in result:
+                    result = result.replace(old, new, 1)
+                    applied += 1
+                    self.log(f"  Level 2: applied edit ({len(old)}→{len(new)} chars)")
+                else:
+                    old_norm = ' '.join(old.split())
+                    result_lines = result.split('\n')
+                    matched = False
+                    for line_idx, line in enumerate(result_lines):
+                        line_norm = ' '.join(line.split())
+                        if old_norm in line_norm:
+                            # Replace only the matched fragment, not the entire line
+                            indent = line[:len(line) - len(line.lstrip())]
+                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
+                            result_lines[line_idx] = indent + new_line_norm
+                            result = '\n'.join(result_lines)
+                            applied += 1
+                            self.log(f"  Level 2: applied edit with whitespace normalization")
+                            matched = True
+                            break
+                    if not matched:
+                        self.log(f"  Level 2: old text not found, skipping edit")
+
+            if applied > 0 and result != tex_source:
+                self.log(f"  Level 2: {applied} edit(s) applied successfully")
+                return result
+
+        except Exception as exc:
+            self.log(f"  Level 2 search-replace fix failed: {exc}")
+        return None
 
     # ---- LaTeX sanitization --------------------------------------------------
 
@@ -1613,7 +1808,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         Applies, in order:
         1. Unicode replacement (dashes, quotes)
         2. Percent-sign escaping
-        3. Force all figures to [H] placement
+        3. Normalize float placement to [t!] (not [H])
         4. Auto-fix table overflow (inject \\small / \\tabcolsep / @{})
         5. Enforce max 3 contribution bullets in Introduction
         """
@@ -1673,16 +1868,35 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             fixed_lines.append(fixed_line)
         text = "\n".join(fixed_lines)
 
-        # ── 3. Force [H] on all figure environments ──
+        # ── 3. Normalize figure placement ──
+        # Use [t!] instead of [H] to let LaTeX optimize float placement.
+        # placeins package with [section] option prevents cross-section drift.
+        # Normalize [H], [h], [h!] → [t!] for figure and figure*
         text = re.sub(
-            r'\\begin\{figure\}\s*\[[^\]]*\]',
-            r'\\begin{figure}[H]',
+            r'\\begin\{figure\}\s*\[[Hh]!?\]',
+            r'\\begin{figure}[t!]',
             text,
         )
-        # Also handle bare \begin{figure} without any placement arg
+        # Handle bare \begin{figure} without any placement arg
         text = re.sub(
             r'\\begin\{figure\}(?!\[)',
-            r'\\begin{figure}[H]',
+            r'\\begin{figure}[t!]',
+            text,
+        )
+        text = re.sub(
+            r'\\begin\{figure\*\}\s*\[[Hh]!?\]',
+            r'\\begin{figure*}[t!]',
+            text,
+        )
+        # Normalize table placement too
+        text = re.sub(
+            r'\\begin\{table\}\s*\[[Hh]!?\]',
+            r'\\begin{table}[t!]',
+            text,
+        )
+        text = re.sub(
+            r'\\begin\{table\*\}\s*\[[Hh]!?\]',
+            r'\\begin{table*}[t!]',
             text,
         )
 
@@ -1691,6 +1905,24 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         # ── 5. Enforce contribution limit ──
         text = WritingAgent._enforce_contribution_limit(text)
+
+        # ── 6. Collapse blank lines before/after math environments ──
+        # A blank line before \begin{equation} creates a paragraph break → extra vertical space
+        _math_envs = r'(?:equation|align|gather|multline|eqnarray)\*?'
+        text = re.sub(
+            rf'\n[ \t]*\n([ \t]*\\begin\{{{_math_envs}\}})',
+            r'\n\1',
+            text,
+        )
+        # Also collapse blank lines after \end{math_env}
+        text = re.sub(
+            rf'(\\end\{{{_math_envs}\}})[ \t]*\n[ \t]*\n',
+            r'\1\n',
+            text,
+        )
+
+        # ── 7. Extract figure blocks from inside list environments ──
+        text = WritingAgent._extract_figures_from_lists(text)
 
         return text
 
@@ -1702,10 +1934,10 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
         def _patch_table(match: re.Match) -> str:
             block = match.group(0)
-            # Inject \small after \begin{table}[...] if missing
+            # Inject \small after \begin{table}[...] or \begin{table*}[...] if missing
             if "\\small" not in block:
                 block = re.sub(
-                    r'(\\begin\{table\}\[[^\]]*\])',
+                    r'(\\begin\{table\*?\}\[[^\]]*\])',
                     r'\1\n\\small',
                     block,
                 )
@@ -1716,27 +1948,52 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                     "\\setlength{\\tabcolsep}{4pt}\n\\begin{tabular}",
                 )
             # Add @{} to tabular column spec if missing (opening and closing)
-            def _add_at_braces(m):
-                spec = m.group(1)  # column spec e.g. "lccr" or "@{}lccr@{}"
-                # If @{} is already present anywhere, don't touch it
-                if "@{}" in spec:
-                    return f"\\begin{{tabular}}{{{spec}}}"
-                if not spec.startswith("@{}"):
-                    spec = "@{}" + spec
-                if not spec.endswith("@{}"):
-                    spec = spec + "@{}"
-                return f"\\begin{{tabular}}{{{spec}}}"
-            # Use a greedy match for the column spec to handle nested @{}
-            block = re.sub(
-                r'\\begin\{tabular\}\{(.+)\}',
-                _add_at_braces,
-                block,
-            )
+            # Uses balanced-brace search to correctly handle @{} in column specs
+            def _fix_tabular_at_braces(text):
+                result = []
+                i = 0
+                tag = "\\begin{tabular}{"
+                while i < len(text):
+                    pos = text.find(tag, i)
+                    if pos == -1:
+                        result.append(text[i:])
+                        break
+                    result.append(text[i:pos])
+                    # Find matching closing brace using balanced counting
+                    brace_start = pos + len(tag) - 1  # index of opening {
+                    depth = 0
+                    brace_end = brace_start
+                    for j in range(brace_start, len(text)):
+                        if text[j] == '{':
+                            depth += 1
+                        elif text[j] == '}':
+                            depth -= 1
+                            if depth == 0:
+                                brace_end = j
+                                break
+                    if brace_end <= brace_start:
+                        # Can't parse, leave unchanged
+                        result.append(tag)
+                        i = pos + len(tag)
+                        continue
+                    spec = text[brace_start + 1:brace_end]
+                    # Clean up garbled patterns from prior runs
+                    while "@{@{}}" in spec:
+                        spec = spec.replace("@{@{}}", "@{}")
+                    if not spec.startswith("@{}"):
+                        spec = "@{}" + spec
+                    if not spec.endswith("@{}"):
+                        spec = spec + "@{}"
+                    result.append(f"\\begin{{tabular}}{{{spec}}}")
+                    i = brace_end + 1
+                return "".join(result)
+
+            block = _fix_tabular_at_braces(block)
             return block
 
-        # Match entire table environments (non-greedy)
+        # Match entire table environments (non-greedy), including table*
         text = re.sub(
-            r'\\begin\{table\}.*?\\end\{table\}',
+            r'\\begin\{table\*?\}.*?\\end\{table\*?\}',
             _patch_table,
             text,
             flags=re.DOTALL,
@@ -1780,8 +2037,67 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         return text
 
     @staticmethod
+    def _extract_figures_from_lists(text: str) -> str:
+        """Move figure/figure* blocks out of itemize/enumerate environments.
+
+        Figures inside list environments cause severe formatting issues,
+        especially with [H] placement. This extracts them and places
+        them immediately after the closing \\end{itemize/enumerate}.
+        """
+        fig_pattern = re.compile(
+            r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}', re.DOTALL
+        )
+        for env in ('itemize', 'enumerate'):
+            # Use re.sub with callback to handle ALL list instances in one pass
+            # Match innermost (non-nested) list environments
+            pat = re.compile(
+                rf'(\\begin\{{{env}\}})'
+                rf'((?:(?!\\begin\{{{env}\}})(?!\\end\{{{env}\}}).)*?)'
+                rf'(\\end\{{{env}\}})',
+                re.DOTALL,
+            )
+
+            def _move_figs(m: re.Match) -> str:
+                body = m.group(2)
+                figs = list(fig_pattern.finditer(body))
+                if not figs:
+                    return m.group(0)  # no figures, leave unchanged
+                # Extract figures from list body
+                extracted: list[str] = []
+                new_body = body
+                for fm in reversed(figs):
+                    extracted.insert(0, fm.group(0))
+                    new_body = new_body[:fm.start()] + new_body[fm.end():]
+                new_body = re.sub(r'\n{3,}', '\n\n', new_body)
+                return (
+                    m.group(1) + new_body + m.group(3)
+                    + '\n\n' + '\n\n'.join(extracted)
+                )
+
+            text = pat.sub(_move_figs, text)
+        return text
+
+    @staticmethod
     def _sanitize_bibtex(bib: str) -> str:
-        """Fix common Unicode issues in BibTeX entries."""
+        """Fix common Unicode issues in BibTeX entries and deduplicate."""
+        # ── 0. Deduplicate BibTeX entries by key ──
+        # Split into individual entries and keep only the first occurrence of each key.
+        entry_pattern = re.compile(r'(@\w+\s*\{[^,\s]+\s*,.*?\n\}\s*\n?)', re.DOTALL)
+        key_pattern = re.compile(r'@\w+\s*\{\s*([^,\s]+)\s*,')
+        entries = entry_pattern.findall(bib)
+        if entries:
+            seen_bib_keys: set[str] = set()
+            deduped_entries: list[str] = []
+            for entry in entries:
+                key_match = key_pattern.match(entry.strip())
+                if key_match:
+                    bib_key = key_match.group(1).strip()
+                    if bib_key in seen_bib_keys:
+                        continue
+                    seen_bib_keys.add(bib_key)
+                deduped_entries.append(entry.strip())
+            bib = "\n\n".join(deduped_entries) + "\n"
+
         replacements = {
             "\u00e9": r"{\'e}",
             "\u00e8": r"{\`e}",
@@ -1864,6 +2180,66 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             + content[insert_pos:]
         )
         return new_content, True
+
+    def _validate_figures_in_latex(
+        self, latex_content: str, figure_output: dict | None
+    ) -> str:
+        """Validate that every figure file from figure_output has \\includegraphics in the LaTeX.
+
+        If a figure is missing, inject a figure block before \\end{document}.
+        Returns the (possibly modified) LaTeX content.
+        """
+        figures = (figure_output or {}).get("figures", {})
+        if not figures:
+            return latex_content
+
+        missing_blocks: list[str] = []
+        for fig_key, fig_data in figures.items():
+            if "error" in fig_data and "png_path" not in fig_data:
+                continue
+
+            pdf_name = f"{fig_key}.pdf"
+            png_name = f"{fig_key}.png"
+            # Check if either file name appears in an \includegraphics
+            if pdf_name in latex_content or png_name in latex_content:
+                continue
+
+            # This figure is missing — build an emergency block
+            self.log(f"  VALIDATION: '{fig_key}' missing from LaTeX, injecting")
+            caption = fig_data.get("caption", f"Figure: {fig_key}")
+            parts = fig_key.split("_", 1)
+            label_suffix = parts[1] if len(parts) > 1 else fig_key
+            include_name = pdf_name if fig_data.get("pdf_path") else png_name
+
+            block = (
+                "\\begin{figure}[t!]\n"
+                "\\centering\n"
+                f"\\includegraphics[width=\\textwidth]{{{include_name}}}\n"
+                f"\\caption{{{caption}}}\n"
+                f"\\label{{fig:{label_suffix}}}\n"
+                "\\end{figure}"
+            )
+            missing_blocks.append(block)
+
+        if missing_blocks:
+            self.log(f"  VALIDATION: injecting {len(missing_blocks)} missing figure(s)")
+            # Insert before \end{document}
+            inject_text = "\n\n".join(missing_blocks)
+            end_doc_pos = latex_content.rfind("\\end{document}")
+            if end_doc_pos >= 0:
+                latex_content = (
+                    latex_content[:end_doc_pos]
+                    + "\n\n% --- Auto-injected missing figures ---\n"
+                    + inject_text
+                    + "\n\n"
+                    + latex_content[end_doc_pos:]
+                )
+            else:
+                latex_content += "\n\n" + inject_text
+        else:
+            self.log("  VALIDATION: all figures present in LaTeX ✓")
+
+        return latex_content
 
     def _copy_style_files(self, template_format: str) -> None:
         """Copy .sty/.cls/.bst files bundled with *template_format* to drafts/."""

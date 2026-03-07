@@ -113,12 +113,32 @@ class ResearchConfig(BaseModel):
     skip_stages: list[str] = Field(default_factory=list)
     template_format: str = "neurips2025"
     max_retries: int = 2
-    quick_eval_timeout: int = 300  # seconds for quick-eval execution
+    quick_eval_timeout: int = 1200  # seconds for quick-eval execution (20 min)
+
+    # Use an existing conda env instead of creating a new venv.
+    # When set, experiment agent skips venv creation and uses this env's Python.
+    experiment_conda_env: str = ""  # e.g., "shixun"
+
+    # Cluster execution settings (optional — set in config.json under "research.cluster")
+    cluster: dict = Field(default_factory=dict)  # {"enabled":true, "host":..., "user":..., ...}
 
     # Iteration settings for experiment agent
     experiment_max_rounds: int = 3           # maximum iteration rounds
     experiment_plateau_patience: int = 2     # consecutive rounds with < threshold improvement
     experiment_improvement_threshold: float = 0.005  # 0.5% minimum improvement
+
+    # ReAct experiment mode: "pipeline" (default, hardcoded phases) or "react" (LLM-driven tools)
+    experiment_mode: str = "pipeline"
+    # Max tool-call rounds in react mode (each round = one LLM ↔ tool exchange)
+    react_max_rounds: int = 80
+    # SLURM settings for react mode (auto-detected if empty)
+    slurm_partition: str = ""               # e.g., "belt_road"
+    slurm_max_gpus: int = 2                 # max GPUs per job
+    slurm_default_time: str = "4:00:00"     # default wall time
+    # Container settings for react mode (for clusters with old glibc)
+    container_image: str = ""               # e.g., "docker://ubuntu:22.04" (clean base with glibc 2.35)
+    container_path: str = ""                # e.g., "/mnt/shared/ubuntu2204.sif"
+    container_bind: str = "/mnt:/mnt"       # bind mounts for apptainer
 
     @classmethod
     def load(cls, path: Path | None = None) -> "ResearchConfig":

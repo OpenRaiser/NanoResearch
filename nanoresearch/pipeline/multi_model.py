@@ -21,8 +21,8 @@ from nanoresearch.config import ResearchConfig, StageModelConfig
 logger = logging.getLogger(__name__)
 
 # Retry settings for transient API errors
-MAX_API_RETRIES = 3
-RETRY_BASE_DELAY = 2.0  # seconds
+MAX_API_RETRIES = 5
+RETRY_BASE_DELAY = 3.0  # seconds
 RETRY_BACKOFF = 2.0
 
 # Exceptions worth retrying (strings matched in error message)
@@ -129,6 +129,9 @@ class ModelDispatcher:
                     continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    # Connection errors get extra delay (proxy/network recovery)
+                    if "connection" in str(exc).lower():
+                        delay = max(delay, 10.0)
                     logger.warning(
                         "LLM call failed (model=%s, attempt %d/%d): %s. Retrying in %.1fs...",
                         config.model, attempt + 1, MAX_API_RETRIES + 1, exc, delay,
@@ -204,6 +207,8 @@ class ModelDispatcher:
                     continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    if "connection" in str(exc).lower():
+                        delay = max(delay, 10.0)
                     logger.warning(
                         "LLM tool-call failed (model=%s, attempt %d/%d): %s. Retrying in %.1fs...",
                         config.model, attempt + 1, MAX_API_RETRIES + 1, exc, delay,

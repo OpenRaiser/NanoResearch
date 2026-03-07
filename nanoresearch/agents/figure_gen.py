@@ -1044,6 +1044,9 @@ class FigureAgent(BaseResearchAgent):
             f"- [ ] Legend: no frame, not overlapping data\n"
             f"- [ ] Colors from Okabe-Ito palette (COLORS list)\n"
             f"- [ ] Hatching patterns added for grayscale accessibility\n"
+            f"- [ ] Y-axis scale: if metrics have very different value ranges (e.g. accuracy 0-1 vs loss 2-8),\n"
+            f"       split them into separate subplots with independent Y-axes. NEVER mix metrics with\n"
+            f"       different scales (e.g. 0-1 and 4-8) in the same subplot — they become unreadable.\n"
             f"- [ ] plt.close(fig) called after saving\n\n"
             f"Save to: output_path = \"{output_path}\"\n"
         )
@@ -1091,10 +1094,12 @@ class FigureAgent(BaseResearchAgent):
                     except (ValueError, TypeError):
                         val = None
                 if val is None:
+                    # Keep all synthetic values in a comparable 0-1 range
+                    # so grouped bar charts have consistent Y-axis scales.
                     if m.get("higher_is_better", True):
                         val = random.uniform(0.4, 0.7)
                     else:
-                        val = random.uniform(4.0, 8.0)
+                        val = random.uniform(0.15, 0.45)
                 std = round(abs(val) * random.uniform(0.02, 0.06), 3)
                 metrics_list.append(
                     {"metric_name": mname, "value": round(val, 3), "std": std}
@@ -1673,6 +1678,7 @@ class FigureAgent(BaseResearchAgent):
         png_path.parent.mkdir(parents=True, exist_ok=True)
         fig.savefig(str(png_path), dpi=300, bbox_inches="tight")
         plt.close(fig)
+        plt.close("all")  # ensure no leaked figures from prior in-process rendering
 
         self.log(f"  {fig_key} fallback placeholder saved")
         return self._save_figure_files(fig_key, filename_stem, caption,

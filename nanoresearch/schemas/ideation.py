@@ -58,6 +58,17 @@ class GapAnalysis(BaseModel):
         default="", description="Which paper(s) mention this as future work"
     )
 
+    @field_validator("severity", mode="before")
+    @classmethod
+    def _normalize_severity(cls, v):
+        """Normalize severity to lowercase to prevent Literal validation failures."""
+        if isinstance(v, str):
+            v = v.lower()
+            if v not in ("low", "medium", "high"):
+                return "medium"
+            return v
+        return v
+
     @field_validator("gap_id", "description", "quantitative_evidence", "future_work_mention", mode="before")
     @classmethod
     def _coerce_to_str(cls, v):
@@ -120,6 +131,10 @@ class IdeationOutput(BaseModel):
     must_cites: list[str] = Field(
         default_factory=list,
         description="Must-cite paper titles extracted from surveys",
+    )
+    must_cite_matches: list[dict] = Field(
+        default_factory=list,
+        description="Must-cite titles matched to paper indices (title, paper_index, matched)",
     )
 
     @field_validator("topic", "survey_summary", "selected_hypothesis", "rationale", mode="before")

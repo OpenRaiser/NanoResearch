@@ -66,7 +66,10 @@ async def fetch_with_retry(
             if attempt < max_retries:
                 # Respect Retry-After header if present
                 retry_after = getattr(resp, "headers", {}).get("Retry-After")
-                wait = float(retry_after) if retry_after else delay
+                try:
+                    wait = float(retry_after) if retry_after else delay
+                except (ValueError, TypeError):
+                    wait = delay  # HTTP-date format or invalid — use default backoff
                 wait = min(wait, _RETRY_MAX_DELAY)
                 logger.debug(
                     "HTTP %d, retrying in %.1fs (attempt %d/%d)",

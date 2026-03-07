@@ -1,4 +1,9 @@
-"""Papers With Code public API tool (no API key required)."""
+"""Papers With Code search tool.
+
+The original PapersWithCode API (paperswithcode.com/api/v1) now redirects
+to HuggingFace and is effectively defunct. This module uses web search
+as a fallback to find PwC task/benchmark pages.
+"""
 
 from __future__ import annotations
 
@@ -7,53 +12,54 @@ from typing import Any
 
 import httpx
 
-from mcp_server.utils import RateLimiter, fetch_with_retry, get_http_client
+from mcp_server.utils import RateLimiter, get_http_client
 
 logger = logging.getLogger(__name__)
 
-_limiter = RateLimiter(calls_per_second=5.0)
-
-PWC_API_BASE = "https://paperswithcode.com/api/v1"
+_limiter = RateLimiter(calls_per_second=2.0)
 
 
 async def search_tasks(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    """Search Papers With Code for ML tasks/benchmarks.
+    """Search for ML tasks/benchmarks via web search fallback.
+
+    The PaperswithCode API redirects to HuggingFace (defunct), so we use
+    DuckDuckGo to search paperswithcode.com directly.
 
     Args:
-        query: Search query for tasks (e.g. "image classification").
-        max_results: Maximum number of task results.
+        query: Search query for tasks.
+        max_results: Maximum number of results.
 
     Returns:
-        List of dicts with keys: id, name, description, url.
+        List of dicts with keys: name, url, description.
     """
-    await _limiter.acquire()
-
-    params = {"q": query, "page_size": min(max_results, 50)}
+    try:
+        from mcp_server.tools.web_search import search_web
+    except ImportError:
+        logger.warning("Web search not available for PwC fallback")
+        return []
 
     try:
-        async with get_http_client(timeout=15.0) as client:
-            resp = await fetch_with_retry(client.get, f"{PWC_API_BASE}/tasks/", params=params)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.TimeoutException:
-        logger.warning("PWC API timed out for query: %s", query[:100])
-        return []
-    except httpx.HTTPStatusError as exc:
-        logger.warning("PWC API returned HTTP %d for query: %s", exc.response.status_code, query[:100])
-        return []
-    except httpx.HTTPError as exc:
-        logger.warning("PWC API network error: %s", exc)
+        results = await search_web(
+            f"paperswithcode.com {query} benchmark SOTA",
+            max_results=max_results * 2,  # over-fetch since we filter
+        )
+    except Exception as e:
+        logger.warning("PwC web search failed: %s", e)
         return []
 
-    results = []
-    for item in data.get("results", [])[:max_results]:
-        results.append({
-            "id": item.get("id", ""),
-            "name": item.get("name", ""),
-            "description": item.get("description", ""),
-            "url": f"https://paperswithcode.com/task/{item.get('id', '')}",
+    tasks: list[dict[str, Any]] = []
+    for r in results:
+        url = r.get("url", "")
+        # Filter to actual PwC pages
+        if "paperswithcode.com" not in url:
+            continue
+        tasks.append({
+            "name": r.get("title", ""),
+            "url": url,
+            "description": r.get("snippet", ""),
         })
-    return results
+
+    return tasks[:max_results]
 
 
 async def get_sota(
@@ -61,69 +67,11 @@ async def get_sota(
 ) -> list[dict[str, Any]]:
     """Get SOTA leaderboard results for a given task.
 
-    Args:
-        task_id: Papers With Code task identifier (e.g. "image-classification").
-        dataset: Optional dataset name filter.
-        max_results: Maximum number of SOTA entries.
-
-    Returns:
-        List of dicts with keys: method, paper_title, paper_url, dataset, metric, value, rank.
+    NOTE: The PapersWithCode API is defunct. This now returns an empty list
+    with a warning. Use Semantic Scholar or web search for SOTA info instead.
     """
-    await _limiter.acquire()
-
-    # First get datasets for this task
-    url = f"{PWC_API_BASE}/tasks/{task_id}/datasets/"
-    params: dict[str, Any] = {"page_size": 10}
-
-    try:
-        async with get_http_client(timeout=15.0) as client:
-            resp = await fetch_with_retry(client.get, url, params=params)
-            resp.raise_for_status()
-            datasets_data = resp.json()
-    except httpx.TimeoutException:
-        logger.warning("PWC API timed out for task: %s", task_id)
-        return []
-    except httpx.HTTPStatusError as exc:
-        logger.warning("PWC API returned HTTP %d for task: %s", exc.response.status_code, task_id)
-        return []
-    except httpx.HTTPError as exc:
-        logger.warning("PWC API network error for task %s: %s", task_id, exc)
-        return []
-
-    datasets = datasets_data.get("results", [])
-    if dataset:
-        datasets = [d for d in datasets if dataset.lower() in d.get("name", "").lower()]
-
-    all_results: list[dict[str, Any]] = []
-    async with get_http_client(timeout=15.0) as client:
-        for ds in datasets[:3]:  # Limit to top 3 datasets
-            ds_id = ds.get("id", "")
-            ds_name = ds.get("name", "")
-            if not ds_id:
-                continue
-
-            await _limiter.acquire()
-            sota_url = f"{PWC_API_BASE}/datasets/{ds_id}/sota/"
-            try:
-                resp = await client.get(sota_url)
-                resp.raise_for_status()
-                sota_data = resp.json()
-            except Exception as e:
-                logger.warning("Failed to fetch SOTA for dataset %s: %s", ds_id, e)
-                continue
-
-            rows = sota_data.get("rows", [])
-            for rank, row in enumerate(rows[:max_results], start=1):
-                all_results.append({
-                    "method": row.get("method", ""),
-                    "paper_title": row.get("paper_title", ""),
-                    "paper_url": row.get("paper_url", ""),
-                    "dataset": ds_name,
-                    "metrics": row.get("metrics", {}),
-                    "rank": rank,
-                })
-
-            if len(all_results) >= max_results:
-                break
-
-    return all_results[:max_results]
+    logger.warning(
+        "PapersWithCode SOTA API is defunct (redirects to HuggingFace). "
+        "Use Semantic Scholar or web search for leaderboard data."
+    )
+    return []

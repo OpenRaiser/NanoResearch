@@ -92,10 +92,24 @@ class FeedbackAnalyzer:
         should_continue = termination["should_continue"]
         termination_reason = termination["reason"]
 
-        # LLM can also recommend stopping
+        # LLM can also recommend stopping — but override in early rounds
+        # when quick-eval hasn't produced any results yet (fixable bugs).
         if not llm_result.get("should_continue", True) and should_continue:
-            should_continue = False
-            termination_reason = llm_result.get("termination_reason") or "llm_recommendation"
+            # Never stop in early rounds if we have no metrics at all —
+            # implementation bugs are fixable with more iterations.
+            has_any_metrics = bool(metric_summary)
+            is_early_round = current_round <= 3
+            attribution = llm_result.get("attribution", "")
+            if is_early_round and not has_any_metrics:
+                logger.info(
+                    "Overriding LLM stop recommendation in round %d "
+                    "(no metrics yet, attribution=%s) — continuing",
+                    current_round, attribution,
+                )
+                # Keep should_continue = True
+            else:
+                should_continue = False
+                termination_reason = llm_result.get("termination_reason") or "llm_recommendation"
 
         return FeedbackAnalysis(
             metric_summary=metric_summary,
@@ -240,15 +254,29 @@ class FeedbackAnalyzer:
         if len(previous_rounds) >= patience:
             recent_deltas = []
             for r in previous_rounds[-patience:]:
-                if r.analysis and r.analysis.improvement_delta:
-                    vals = list(r.analysis.improvement_delta.values())
-                    if vals:
+                if r.analysis:
+                    delta = r.analysis.improvement_delta
+                    if delta:
+                        vals = list(delta.values())
                         recent_deltas.append(max(abs(v) for v in vals))
+                    elif r.analysis.metric_summary:
+                        # Metrics exist but no improvement — delta is 0
+                        recent_deltas.append(0.0)
             if improvement_delta:
                 recent_deltas.append(max(abs(v) for v in improvement_delta.values()))
+            elif metric_summary:
+                # Current round has metrics but no improvement delta
+                recent_deltas.append(0.0)
             # If we have enough data points and all are below threshold
             if len(recent_deltas) >= patience and all(d < threshold for d in recent_deltas[-patience:]):
                 return {"should_continue": False, "reason": "plateau"}
+
+        # 3b. Repetition: same hypothesis tried in consecutive rounds
+        if len(previous_rounds) >= 2:
+            recent_hyps = [r.hypothesis.hypothesis[:80] for r in previous_rounds[-3:]]
+            if len(set(recent_hyps)) == 1 and recent_hyps[0]:
+                logger.info("Detected repetitive hypothesis: %s", recent_hyps[0][:60])
+                return {"should_continue": False, "reason": "repetitive_hypothesis"}
 
         # 4. Degradation: current metrics worse than best by > 5%
         best_metrics = self._find_best_metrics(previous_rounds)

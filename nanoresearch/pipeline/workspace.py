@@ -321,10 +321,14 @@ class Workspace:
         if self.figures_dir.exists() and any(self.figures_dir.iterdir()):
             shutil.copytree(self.figures_dir, fig_dest, dirs_exist_ok=True)
 
-        # Copy code
+        # Copy code (skip .venv, __pycache__, node_modules to avoid long paths on Windows)
         code_dest = dest / "code"
+        _skip_dirs = {".venv", "venv", "__pycache__", "node_modules", ".git", ".tox"}
         if self.code_dir.exists() and any(self.code_dir.iterdir()):
-            shutil.copytree(self.code_dir, code_dest, dirs_exist_ok=True)
+            shutil.copytree(
+                self.code_dir, code_dest, dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns(*_skip_dirs),
+            )
         else:
             code_dest.mkdir(exist_ok=True)
             _copy_if_exists(self.plans_dir / "code_skeleton.py", code_dest / "experiment.py")

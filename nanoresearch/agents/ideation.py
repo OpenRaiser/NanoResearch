@@ -27,12 +27,13 @@ MAX_GITHUB_QUERIES = 2
 TARGET_CITATION_COUNT = 50
 MIN_HIGH_CITED_PAPERS = 10
 HIGH_CITATION_THRESHOLD = 100
-TOP_K_FULL_TEXT = 5
+TOP_K_FULL_TEXT = 8
 
 # Lazy imports to avoid hard dependency on mcp_server at import time
 _arxiv_search = None
 _s2_search = None
 _github_search = None
+_oa_search = None
 _import_lock = asyncio.Lock()
 
 
@@ -64,6 +65,20 @@ async def _get_github_search():
                 from mcp_server.tools.github_search import search_repos
                 _github_search = search_repos
     return _github_search
+
+
+async def _get_oa_search():
+    """Lazy import OpenAlex search (returns None if module unavailable)."""
+    global _oa_search
+    if _oa_search is None:
+        async with _import_lock:
+            if _oa_search is None:
+                try:
+                    from mcp_server.tools.openalex import search_openalex
+                    _oa_search = search_openalex
+                except ImportError:
+                    _oa_search = False  # mark as unavailable
+    return _oa_search if _oa_search else None
 
 
 from nanoresearch.skill_prompts import (
@@ -135,6 +150,18 @@ class IdeationAgent(BaseResearchAgent):
             papers = self._rank_and_filter_papers(papers)
             logger.info("[%s] After ranking/filtering: %d papers", self.stage.value, len(papers))
 
+            # Step 2c2: Enrich papers from web/PwC with citation counts
+            zero_cite = [p for p in papers if (p.get("citation_count", 0) or 0) == 0]
+            if zero_cite:
+                self.log(f"Enriching citation counts for {len(zero_cite)} papers")
+                await self._enrich_citation_counts(zero_cite)
+                # Re-rank after enrichment
+                papers = self._rank_and_filter_papers(papers)
+
+            # Step 2c3: Citation graph expansion (snowball sampling)
+            papers = await self._expand_via_citations(papers, top_k=5, max_new=15)
+            logger.info("[%s] After citation expansion: %d papers", self.stage.value, len(papers))
+
             # Step 2d: Enrich top papers with full-text PDF reading
             papers = await self._enrich_with_full_text(papers)
 
@@ -165,8 +192,13 @@ class IdeationAgent(BaseResearchAgent):
         # Step 3: LLM analysis — gaps + hypotheses (with ReAct tool use)
         output = await self._analyze_and_hypothesize(topic, queries, papers)
 
-        # Store must-cite titles
+        # Store must-cite titles and match to actual papers
         output.must_cites = must_cites
+        if must_cites:
+            mc_matches = self._match_must_cites_to_papers(must_cites, papers)
+            output.must_cite_matches = mc_matches
+            matched_count = sum(1 for m in mc_matches if m.get("matched"))
+            self.log(f"Must-cite matching: {matched_count}/{len(must_cites)} matched to papers")
 
         # Step 4: Extract quantitative evidence from paper abstracts
         evidence = await self._extract_evidence(papers)
@@ -233,11 +265,30 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
 
         search_arxiv = await _get_arxiv_search()
         search_s2 = await _get_s2_search()
+        search_oa = await _get_oa_search()
         success_count = 0
 
         for query in queries[:MAX_SEARCH_QUERIES]:
             if not query or not query.strip():
                 continue
+
+            # --- OpenAlex (primary, large quota) ---
+            if search_oa:
+                try:
+                    oa_results = await search_oa(query, max_results=MAX_RESULTS_PER_SEARCH)
+                    for p in oa_results:
+                        key = self._dedup_key(p)
+                        if key and key not in all_papers:
+                            all_papers[key] = p
+                    if oa_results:
+                        success_count += 1
+                        logger.debug("[%s] OpenAlex returned %d results for '%s'",
+                                     self.stage.value, len(oa_results), query[:60])
+                except Exception as e:
+                    logger.warning("[%s] OpenAlex search failed for '%s': %s",
+                                   self.stage.value, query, e)
+
+            # --- arXiv (always, good for preprints) ---
             try:
                 arxiv_results = await search_arxiv(
                     query, max_results=MAX_RESULTS_PER_SEARCH,
@@ -254,6 +305,7 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                 logger.warning("[%s] arXiv search failed for '%s': %s",
                                self.stage.value, query, e)
 
+            # --- S2 (supplement, save quota) ---
             try:
                 s2_results = await search_s2(query, max_results=MAX_RESULTS_PER_SEARCH)
                 for p in s2_results:
@@ -334,8 +386,21 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
         survey_papers: dict[str, dict] = {}
 
         search_s2 = await _get_s2_search()
+        search_oa = await _get_oa_search()
 
         for q in survey_queries:
+            # OpenAlex first (save S2 quota)
+            if search_oa:
+                try:
+                    oa_results = await search_oa(q, max_results=5)
+                    for p in oa_results:
+                        key = self._dedup_key(p)
+                        if key and key not in survey_papers:
+                            survey_papers[key] = p
+                except Exception as e:
+                    logger.warning("[%s] OpenAlex survey search failed for '%s': %s",
+                                   self.stage.value, q, e)
+
             try:
                 results = await search_s2(q, max_results=5)
                 for p in results:
@@ -343,7 +408,7 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                     if key and key not in survey_papers:
                         survey_papers[key] = p
             except Exception as e:
-                logger.warning("[%s] Survey search failed for '%s': %s",
+                logger.warning("[%s] S2 survey search failed for '%s': %s",
                                self.stage.value, q, e)
 
         return list(survey_papers.values())
@@ -398,6 +463,273 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
 
         result = other_papers[:other_slots] + recent_papers[:recent_slots]
         return result
+
+    async def _expand_via_citations(self, papers: list[dict], top_k: int = 5, max_new: int = 20) -> list[dict]:
+        """Snowball sampling: expand paper set via references of top-cited papers.
+
+        Uses S2 batch API to fetch all top-K papers in ONE request instead of K
+        individual calls, dramatically reducing API quota consumption.
+        """
+        try:
+            from mcp_server.tools.semantic_scholar import get_papers_batch
+        except ImportError:
+            # Fallback to single-paper endpoint
+            try:
+                from mcp_server.tools.semantic_scholar import get_paper_details
+            except ImportError:
+                self.log("S2 API not available, skipping citation expansion")
+                return papers
+            return await self._expand_via_citations_single(papers, top_k, max_new, get_paper_details)
+
+        # Pick top-K papers that have a paper_id
+        candidates = [
+            p for p in papers
+            if (p.get("paper_id") or p.get("arxiv_id", "")).strip()
+        ]
+        candidates.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+        candidates = candidates[:top_k]
+
+        if not candidates:
+            return papers
+
+        # Build lookup IDs for batch request
+        lookup_ids = []
+        for p in candidates:
+            pid = p.get("paper_id") or ""
+            arxiv_id = p.get("arxiv_id") or ""
+            lookup_id = pid if pid else f"ArXiv:{arxiv_id}" if arxiv_id else ""
+            if lookup_id:
+                lookup_ids.append(lookup_id)
+
+        if not lookup_ids:
+            return papers
+
+        # ONE batch call instead of N individual calls
+        self.log(f"Fetching references for {len(lookup_ids)} papers via batch API")
+        try:
+            batch_results = await get_papers_batch(
+                lookup_ids,
+                fields="paperId,title,references.paperId,references.title,references.year",
+            )
+        except Exception as e:
+            logger.warning("S2 batch citation expansion failed: %s", e)
+            return papers
+
+        existing_keys = {self._dedup_key(p) for p in papers}
+        new_papers: list[dict] = []
+
+        for details in batch_results:
+            if not details:
+                continue
+            for ref in details.get("references", []):
+                if isinstance(ref, dict):
+                    ref_title = (ref.get("title") or "").strip()
+                else:
+                    continue
+                if not ref_title:
+                    continue
+                ref_dict = {
+                    "paper_id": ref.get("paper_id", "") or ref.get("paperId", ""),
+                    "title": ref_title,
+                    "year": ref.get("year"),
+                    "authors": [],
+                    "abstract": "",
+                    "citation_count": 0,
+                    "source": "citation_expansion",
+                }
+                key = self._dedup_key(ref_dict)
+                if key and key not in existing_keys:
+                    new_papers.append(ref_dict)
+                    existing_keys.add(key)
+                if len(new_papers) >= max_new * 3:
+                    break
+
+        if not new_papers:
+            self.log("Citation expansion found no new papers")
+            return papers
+
+        # Enrich new papers with citation counts via batch API
+        enriched = await self._enrich_citation_counts(new_papers)
+
+        # Keep only papers with decent citation counts
+        enriched = [p for p in enriched if (p.get("citation_count", 0) or 0) >= 20]
+        enriched.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+        enriched = enriched[:max_new]
+
+        if enriched:
+            self.log(f"Citation expansion added {len(enriched)} papers from reference graphs")
+            papers.extend(enriched)
+
+        return papers
+
+    async def _expand_via_citations_single(self, papers, top_k, max_new, get_paper_details):
+        """Fallback: expand citations one-by-one if batch API unavailable."""
+        candidates = [
+            p for p in papers
+            if (p.get("paper_id") or p.get("arxiv_id", "")).strip()
+        ]
+        candidates.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+        candidates = candidates[:top_k]
+        if not candidates:
+            return papers
+
+        existing_keys = {self._dedup_key(p) for p in papers}
+        new_papers: list[dict] = []
+
+        for p in candidates:
+            pid = p.get("paper_id") or ""
+            arxiv_id = p.get("arxiv_id") or ""
+            lookup_id = pid if pid else f"ArXiv:{arxiv_id}" if arxiv_id else ""
+            if not lookup_id:
+                continue
+            try:
+                details = await get_paper_details(lookup_id)
+            except Exception as e:
+                logger.debug("Citation expansion failed for %s: %s", lookup_id, e)
+                continue
+            for ref in details.get("references", []):
+                ref_title = (ref.get("title") or "").strip()
+                if not ref_title:
+                    continue
+                ref_dict = {
+                    "paper_id": ref.get("paper_id", ""),
+                    "title": ref_title,
+                    "year": ref.get("year"),
+                    "authors": [], "abstract": "", "citation_count": 0,
+                    "source": "citation_expansion",
+                }
+                key = self._dedup_key(ref_dict)
+                if key and key not in existing_keys:
+                    new_papers.append(ref_dict)
+                    existing_keys.add(key)
+            if len(new_papers) >= max_new * 3:
+                break
+
+        if not new_papers:
+            self.log("Citation expansion found no new papers")
+            return papers
+        enriched = await self._enrich_citation_counts(new_papers)
+        enriched = [p for p in enriched if (p.get("citation_count", 0) or 0) >= 20]
+        enriched.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+        enriched = enriched[:max_new]
+        if enriched:
+            self.log(f"Citation expansion added {len(enriched)} papers from reference graphs")
+            papers.extend(enriched)
+        return papers
+
+    async def _enrich_citation_counts(self, papers: list[dict]) -> list[dict]:
+        """Enrich papers that have citation_count=0.
+
+        Strategy (minimizes S2 API calls):
+        0. OpenAlex title match first (free, large quota) — handles most papers
+        1. Remaining papers WITH paper_id → S2 batch API (1 call for up to 500)
+        2. Remaining papers WITHOUT paper_id → S2 title match API (1 call each)
+        """
+        need_enrich = [
+            p for p in papers
+            if (p.get("citation_count", 0) or 0) == 0
+            and (p.get("title") or "").strip()
+            and len((p.get("title") or "").strip()) >= 10
+        ]
+        if not need_enrich:
+            return papers
+
+        # ── Strategy 0: OpenAlex title match (save S2 quota) ──
+        try:
+            from mcp_server.tools.openalex import enrich_citation_counts_openalex
+            self.log(f"OpenAlex enriching citation counts for {len(need_enrich)} papers")
+            await enrich_citation_counts_openalex(need_enrich)
+            # Recompute need_enrich: only papers still at 0
+            still_zero = [
+                p for p in need_enrich
+                if (p.get("citation_count", 0) or 0) == 0
+            ]
+            if still_zero:
+                self.log(f"OpenAlex resolved {len(need_enrich) - len(still_zero)}/{len(need_enrich)}, "
+                         f"{len(still_zero)} remain for S2")
+            else:
+                self.log(f"OpenAlex resolved all {len(need_enrich)} papers")
+                return papers
+            need_enrich = still_zero
+        except ImportError:
+            logger.debug("OpenAlex not available for enrichment, falling back to S2")
+        except Exception as e:
+            logger.warning("OpenAlex enrichment failed: %s, falling back to S2", e)
+
+        # ── Strategy 1: S2 batch lookup for papers with paper_id ──
+        with_id = [p for p in need_enrich if (p.get("paper_id") or "").strip()]
+        without_id = [p for p in need_enrich if not (p.get("paper_id") or "").strip()]
+
+        if with_id:
+            try:
+                from mcp_server.tools.semantic_scholar import get_papers_batch
+                ids = [p["paper_id"] for p in with_id]
+                self.log(f"S2 batch enriching {len(ids)} papers with paper_id")
+                results = await get_papers_batch(
+                    ids,
+                    fields="paperId,title,authors,year,abstract,venue,citationCount,url,externalIds",
+                )
+                for p, r in zip(with_id, results):
+                    if r and r.get("citation_count", 0):
+                        p["citation_count"] = r.get("citation_count", 0) or 0
+                        p["abstract"] = p.get("abstract") or r.get("abstract", "")
+                        p["authors"] = p.get("authors") or r.get("authors", [])
+                        p["venue"] = p.get("venue") or r.get("venue", "")
+                        p["url"] = p.get("url") or r.get("url", "")
+            except ImportError:
+                without_id.extend(with_id)
+            except Exception as e:
+                logger.warning("S2 batch enrichment failed: %s", e)
+                without_id.extend(with_id)
+
+        # ── Strategy 2: S2 title match for papers without paper_id ──
+        if without_id:
+            try:
+                from mcp_server.tools.semantic_scholar import search_paper_by_title
+                self.log(f"S2 title-matching {len(without_id)} papers without paper_id")
+                for p in without_id:
+                    title = (p.get("title") or "").strip()
+                    try:
+                        r = await search_paper_by_title(title)
+                        if r and (r.get("citation_count", 0) or 0) > 0:
+                            t_words = set(title.lower().split())
+                            r_words = set((r.get("title") or "").lower().split())
+                            if t_words and r_words:
+                                overlap = len(t_words & r_words) / max(len(t_words), len(r_words))
+                                if overlap > 0.6:
+                                    p["citation_count"] = r.get("citation_count", 0) or 0
+                                    p["paper_id"] = p.get("paper_id") or r.get("paper_id", "")
+                                    p["abstract"] = p.get("abstract") or r.get("abstract", "")
+                                    p["authors"] = p.get("authors") or r.get("authors", [])
+                                    p["venue"] = p.get("venue") or r.get("venue", "")
+                                    p["url"] = p.get("url") or r.get("url", "")
+                    except Exception as e:
+                        logger.debug("S2 title match failed for '%s': %s", title[:50], e)
+            except ImportError:
+                search_s2 = await _get_s2_search()
+                for p in without_id:
+                    title = (p.get("title") or "").strip()
+                    try:
+                        results = await search_s2(title, max_results=3)
+                        title_lower = title.lower()
+                        for r in results:
+                            r_title = (r.get("title") or "").lower().strip()
+                            t_words = set(title_lower.split())
+                            r_words = set(r_title.split())
+                            if t_words and r_words:
+                                overlap = len(t_words & r_words) / max(len(t_words), len(r_words))
+                                if overlap > 0.7:
+                                    p["citation_count"] = r.get("citation_count", 0) or 0
+                                    p["paper_id"] = p.get("paper_id") or r.get("paper_id", "")
+                                    p["abstract"] = p.get("abstract") or r.get("abstract", "")
+                                    p["authors"] = p.get("authors") or r.get("authors", [])
+                                    p["venue"] = p.get("venue") or r.get("venue", "")
+                                    p["url"] = p.get("url") or r.get("url", "")
+                                    break
+                    except Exception as e:
+                        logger.debug("S2 citation enrichment failed for '%s': %s", title[:50], e)
+
+        return papers
 
     async def _enrich_with_full_text(self, papers: list[dict], top_k: int = TOP_K_FULL_TEXT) -> list[dict]:
         """Download and extract full text from top-K high-cited papers."""
@@ -472,6 +804,48 @@ Return JSON: {{"must_cite_titles": ["Paper Title 1", "Paper Title 2", ...]}}"""
             logger.warning("[%s] Must-cite extraction failed: %s", self.stage.value, e)
             return []
 
+    def _match_must_cites_to_papers(
+        self, must_cite_titles: list[str], papers: list[dict]
+    ) -> list[dict]:
+        """Match must-cite titles to actual paper objects in our collection.
+
+        Returns a list of dicts with 'title', 'paper_index', 'matched' (bool).
+        Papers not found in our collection are flagged as unmatched.
+        """
+        results = []
+        for mc_title in must_cite_titles:
+            mc_lower = mc_title.lower().strip()
+            mc_words = set(mc_lower.split())
+            best_match = None
+            best_score = 0.0
+
+            for i, p in enumerate(papers):
+                p_title = (p.get("title") or "").lower().strip()
+                p_words = set(p_title.split())
+                if not mc_words or not p_words:
+                    continue
+                overlap = len(mc_words & p_words) / max(len(mc_words), len(p_words))
+                if overlap > best_score:
+                    best_score = overlap
+                    best_match = i
+
+            if best_match is not None and best_score > 0.5:
+                results.append({
+                    "title": mc_title,
+                    "paper_index": best_match,
+                    "matched": True,
+                    "match_score": best_score,
+                })
+            else:
+                results.append({
+                    "title": mc_title,
+                    "paper_index": None,
+                    "matched": False,
+                    "match_score": best_score,
+                })
+
+        return results
+
     async def _build_search_tools(self) -> ToolRegistry:
         """Build a ToolRegistry with search tools for ReAct."""
         registry = ToolRegistry()
@@ -520,6 +894,26 @@ Return JSON: {{"must_cite_titles": ["Paper Title 1", "Paper Title 2", ...]}}"""
             },
             handler=_handle_s2,
         ))
+
+        # OpenAlex search (large quota, good for citation counts)
+        search_oa = await _get_oa_search()
+        if search_oa:
+            async def _handle_oa(query, max_results=10):
+                return await search_oa(query, max_results=max_results)
+
+            registry.register(ToolDefinition(
+                name="search_openalex",
+                description="Search OpenAlex for papers. Large quota, good citation counts. Covers ~250M works.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Search query"},
+                        "max_results": {"type": "integer", "description": "Max papers", "default": 10},
+                    },
+                    "required": ["query"],
+                },
+                handler=_handle_oa,
+            ))
 
         # Web search (optional, may not be available)
         try:
@@ -657,6 +1051,15 @@ Return ONLY valid JSON."""
                            self.stage.value, e)
             result = await self.generate_json(IDEATION_ANALYSIS_SYSTEM, prompt)
 
+        # Guard: LLM may return a bare list (e.g. list of hypotheses) instead of the
+        # expected top-level dict.  Wrap it so downstream .get() calls don't crash.
+        if isinstance(result, list):
+            logger.warning(
+                "[%s] LLM returned a list instead of dict; wrapping as {'hypotheses': ...}",
+                self.stage.value,
+            )
+            result = {"hypotheses": result}
+
         # Build PaperReference list
         paper_refs = []
         for p in papers:
@@ -688,6 +1091,7 @@ Return ONLY valid JSON."""
                     "future_work_mention": g.get("future_work_mention", ""),
                 }
                 for i, g in enumerate(result.get("gaps", []))
+                if isinstance(g, dict)
             ],
             hypotheses=[
                 {
@@ -704,6 +1108,7 @@ Return ONLY valid JSON."""
                     "closest_existing_work": h.get("closest_existing_work", ""),
                 }
                 for i, h in enumerate(result.get("hypotheses", []))
+                if isinstance(h, dict)
             ],
             selected_hypothesis=result.get("selected_hypothesis", ""),
             rationale=result.get("rationale", ""),

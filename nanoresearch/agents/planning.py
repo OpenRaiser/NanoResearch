@@ -255,6 +255,14 @@ Return ONLY valid JSON."""
                 if val is not None and not isinstance(val, str):
                     bl[key] = str(val)
 
+        # Proposed method string fields
+        pm = data.get("proposed_method")
+        if isinstance(pm, dict):
+            for key in ("name", "description", "architecture"):
+                val = pm.get(key)
+                if val is not None and not isinstance(val, str):
+                    pm[key] = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
+
         # ComputeRequirements string fields
         cr = data.get("compute_requirements")
         if isinstance(cr, dict):

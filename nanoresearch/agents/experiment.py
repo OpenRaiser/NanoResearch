@@ -31,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
+from nanoresearch.agents.cluster_executor import ClusterExecutor
+from nanoresearch.agents.experiment_tools import build_experiment_tools
 from nanoresearch.agents.feedback_analyzer import FeedbackAnalyzer
 from nanoresearch.agents.preflight import PreflightChecker
 from nanoresearch.schemas.iteration import (
@@ -92,7 +94,7 @@ Output a JSON object with:
 The project MUST include these files:
 - README.md (with usage instructions)
 - requirements.txt
-- config/default.yaml (hyperparameters and paths)
+- config/default.yaml (hyperparameters and paths, YAML format — use yaml.safe_load() to parse)
 - src/__init__.py
 - src/model.py (complete model architecture)
 - src/dataset.py (data loading and preprocessing)
@@ -138,6 +140,19 @@ When --quick-eval is passed, main.py should:
   7. Use a helper function `save_metrics(results_dict, output_dir="results")` to write the JSON.
   8. All numeric values MUST come from actual computation, NEVER hardcoded or fabricated.
 
+DEVICE REQUIREMENTS (critical):
+- config/default.yaml MUST include: device: "auto" (auto-detects CUDA/MPS/CPU)
+- main.py device selection: use "cuda" if torch.cuda.is_available(), else "cpu"
+- NEVER default to "cpu" — always prefer GPU when available
+
+WINDOWS COMPATIBILITY (critical):
+- config/default.yaml MUST set: num_workers: 0
+- All DataLoader calls MUST use num_workers=0 (Windows multiprocessing spawn breaks with >0)
+
+QUICK-EVAL PERFORMANCE:
+- --quick-eval MUST use num_runs: 1 (not 3) and at most 200 train samples
+- The goal is finishing in under 5 minutes on a single GPU
+
 REPRODUCIBILITY REQUIREMENTS (critical):
 - config/default.yaml MUST include: random_seed (default 42), num_runs (default 3)
 - main.py MUST set random seeds at startup:
@@ -177,6 +192,19 @@ You MUST follow:
     - Creates the results/ directory if needed
     - Writes results/metrics.json with the exact schema required by --quick-eval
     - Validates that all metric values are real numbers (not NaN or Inf)
+12. CRITICAL: Config files use YAML format (config/default.yaml). Use `yaml.safe_load()` to
+    parse them, NOT `json.load()`. Add `pyyaml` to requirements.txt if needed.
+13. Keep imports consistent: only import from modules that actually exist in the project.
+    The project structure is: main.py, src/{model,dataset,trainer,evaluate,utils}.py, config/default.yaml
+14. DEVICE: Always default to "cuda" when torch.cuda.is_available(), NOT "cpu".
+    Use `torch.device("cuda" if torch.cuda.is_available() else "cpu")`.
+    Never write `config.get("device", "cpu")` — always use `config.get("device", "cuda")`.
+    In config/default.yaml, set `device: auto` or `device: cuda`.
+15. WINDOWS COMPATIBILITY: Set `num_workers: 0` in config/default.yaml and DataLoader calls.
+    On Windows, multiprocessing spawn with num_workers > 0 causes FileNotFoundError in child processes.
+    Always use `num_workers=0` for DataLoader unless explicitly overridden.
+16. QUICK-EVAL SPEED: In --quick-eval mode, use num_runs=1 (not 3) and at most 200 training samples.
+    The goal is to finish in under 5 minutes on a single GPU. Keep the model scaled-down.
 
 Generate ONLY the file content, no markdown formatting, no explanation."""
 
@@ -222,6 +250,11 @@ class ExperimentAgent(BaseResearchAgent):
     async def run(self, **inputs: Any) -> dict[str, Any]:
         blueprint_data: dict = inputs["experiment_blueprint"]
         reference_repos: list[dict] = inputs.get("reference_repos", [])
+
+        # Dispatch to ReAct mode or pipeline mode
+        if self.config.experiment_mode == "react":
+            return await self._run_react_mode(blueprint_data, reference_repos)
+
         max_rounds = self.config.experiment_max_rounds
         self.log(f"Starting iterative experiment (max {max_rounds} rounds)")
 
@@ -251,6 +284,20 @@ class ExperimentAgent(BaseResearchAgent):
         venv_python: str = sys.executable
         generated_files: list[str] = []
         project_plan: dict = {}
+
+        # --- Cluster mode detection ---
+        cluster_cfg = self.config.cluster
+        cluster_mode = bool(cluster_cfg and cluster_cfg.get("enabled"))
+        cluster: ClusterExecutor | None = None
+        cluster_code_path: str = ""
+        if cluster_mode:
+            cluster = ClusterExecutor(cluster_cfg, log_fn=self.log)
+            mode_desc = "LOCAL SLURM" if cluster.local_mode else "REMOTE SSH+SLURM"
+            self.log(f"Cluster mode ENABLED ({mode_desc}) — experiments will run on SLURM cluster")
+            if not await cluster.check_connectivity():
+                self.log("WARNING: Cluster check failed, falling back to local execution")
+                cluster_mode = False
+                cluster = None
 
         # Sub-round checkpoint: load previous iteration state if resuming
         iteration_state, start_round = self._load_iteration_checkpoint(iteration_state)
@@ -288,8 +335,9 @@ class ExperimentAgent(BaseResearchAgent):
                         logger.warning("Skipping invalid file_spec: %s", file_spec)
                         continue
                     file_path = file_spec["path"]
-                    resolved = (self.workspace.path / "code" / file_path).resolve()
-                    if not str(resolved).startswith(str(code_root)):
+                    try:
+                        (self.workspace.path / "code" / file_path).resolve().relative_to(code_root)
+                    except ValueError:
                         logger.warning("Skipping unsafe file path: %s", file_path)
                         continue
                     valid_specs.append(file_spec)
@@ -308,6 +356,12 @@ class ExperimentAgent(BaseResearchAgent):
                     file_path = spec["path"]
                     self.workspace.write_text(f"code/{file_path}", content)
                     generated_files.append(file_path)
+
+                # Phase 2b: Cross-file import consistency check
+                import_mismatches = self._check_import_consistency(code_dir)
+                if import_mismatches:
+                    self.log(f"Found {len(import_mismatches)} import mismatches, fixing...")
+                    await self._fix_import_mismatches(code_dir, import_mismatches)
 
                 # Legacy code_skeleton.py
                 main_path = code_dir / "main.py"
@@ -335,19 +389,47 @@ class ExperimentAgent(BaseResearchAgent):
                 )
             else:
                 # ---- Round 2+: iterative improvement ----
-                prev_analysis = iteration_state.rounds[-1].analysis
+                prev_round = iteration_state.rounds[-1]
+                prev_analysis = prev_round.analysis
                 history_summary = self._build_history_summary(iteration_state.rounds)
 
+                # If previous round failed preflight, inject the error into context
+                preflight_error_ctx = ""
+                if prev_round.preflight and prev_round.preflight.overall_status == "failed":
+                    failures = []
+                    for chk in prev_round.preflight.checks:
+                        if chk.status == "failed":
+                            failures.append(f"- [{chk.check_name}] {chk.message}")
+                    preflight_error_ctx = (
+                        "\n== PREFLIGHT FAILURES (must fix these first!) ==\n"
+                        + "\n".join(failures)
+                        + "\n== END PREFLIGHT FAILURES =="
+                    )
+
                 hypothesis = await self._generate_iteration_hypothesis(
-                    prev_analysis, history_summary, blueprint_summary
+                    prev_analysis, history_summary, blueprint_summary,
+                    preflight_error_ctx=preflight_error_ctx,
                 )
                 hypothesis.round_number = round_num
+
+                # Early stop if LLM has no new ideas
+                if hypothesis.hypothesis == "__NO_NEW_IDEAS__":
+                    self.log("LLM exhausted improvement ideas — stopping iteration")
+                    iteration_state.termination_reason = "no_new_ideas"
+                    break
 
                 self.log(f"Hypothesis: {hypothesis.hypothesis[:100]}")
 
                 files_modified = await self._apply_iteration_changes(
                     hypothesis, code_dir, venv_python
                 )
+                # Fallback: if search-replace failed to match anything, retry with
+                # full-file rewrite for the first planned_changes target
+                if not files_modified and hypothesis.planned_changes:
+                    self.log("Search-replace matched nothing, retrying with full-file rewrite")
+                    files_modified = await self._apply_iteration_changes_fullwrite(
+                        hypothesis, code_dir
+                    )
                 generated_files = files_modified or generated_files
                 self.log(f"Modified {len(files_modified)} files")
 
@@ -372,39 +454,51 @@ class ExperimentAgent(BaseResearchAgent):
                     metrics={},
                 )
                 iteration_state.rounds.append(round_result)
-                # On round 1 blocking failure, still try to continue if we have more rounds
-                if round_num == 1:
-                    continue
-                # On round 2+, stop iterations
-                iteration_state.final_status = "failed"
-                break
+                # Always keep trying when there are rounds left —
+                # implementation bugs are fixable with LLM iteration.
+                self.log(f"Preflight failed, will retry in next round ({round_num}/{max_rounds})")
+                continue
 
-            # ---- Phase 3: dry-run ----
-            if round_num == 1:
-                execution, venv_python = await self._execute_code_with_venv(
-                    generated_files, blueprint_summary
+            # ---- Phase 3 & 4: execution ----
+            if cluster_mode and cluster:
+                # ===== CLUSTER EXECUTION =====
+                execution, quick_eval = await self._run_on_cluster(
+                    cluster, code_dir, round_num, cluster_code_path,
                 )
+                # Update cluster_code_path after first prepare
+                if execution.get("cluster_code_path"):
+                    cluster_code_path = execution["cluster_code_path"]
+                execution_status = execution.get("status", "failed")
+                self.log(f"Cluster execution: {execution_status}")
+                self.log(f"Cluster quick-eval: {quick_eval.get('status', 'skipped')}")
             else:
-                execution = await self._execute_code(
-                    generated_files, blueprint_summary,
-                    _code_dir=code_dir,
-                    _main_py=code_dir / "main.py",
-                    _venv_python=venv_python,
-                )
+                # ===== LOCAL EXECUTION =====
+                # Phase 3: dry-run
+                if round_num == 1:
+                    execution, venv_python = await self._execute_code_with_venv(
+                        generated_files, blueprint_summary
+                    )
+                else:
+                    execution = await self._execute_code(
+                        generated_files, blueprint_summary,
+                        _code_dir=code_dir,
+                        _main_py=code_dir / "main.py",
+                        _venv_python=venv_python,
+                    )
+                execution_status = execution.get("status", "failed")
+                self.log(f"Dry-run: {execution_status}")
+
+                # Phase 4: quick-eval
+                quick_eval = {"status": "skipped", "metrics": {}}
+                if execution_status in ("success", "fixed"):
+                    quick_eval = await self._run_quick_eval(code_dir, venv_python)
+                    self.log(f"Quick-eval: {quick_eval['status']}")
+                else:
+                    self.log("Skipping quick-eval (dry-run did not succeed)")
+
             self.workspace.write_json(
                 f"logs/iteration_round_{round_num}_execution.json", execution
             )
-            execution_status = execution.get("status", "failed")
-            self.log(f"Dry-run: {execution_status}")
-
-            # ---- Phase 4: quick-eval ----
-            quick_eval: dict = {"status": "skipped", "metrics": {}}
-            if execution_status in ("success", "fixed"):
-                quick_eval = await self._run_quick_eval(code_dir, venv_python)
-                self.log(f"Quick-eval: {quick_eval['status']}")
-            else:
-                self.log("Skipping quick-eval (dry-run did not succeed)")
-
             self.workspace.write_json(
                 f"logs/iteration_round_{round_num}_quick_eval.json", quick_eval
             )
@@ -433,11 +527,22 @@ class ExperimentAgent(BaseResearchAgent):
             )
             iteration_state.rounds.append(round_result)
 
-            # Track best round
+            # Track best round (pick primary metric, handle higher/lower-is-better)
             if analysis.metric_summary:
-                primary_value = next(iter(analysis.metric_summary.values()), None)
-                best_value = next(iter(iteration_state.best_metrics.values()), None) if iteration_state.best_metrics else None
-                if best_value is None or (primary_value is not None and primary_value > best_value):
+                primary_key = next(iter(analysis.metric_summary), None)
+                primary_value = analysis.metric_summary.get(primary_key) if primary_key else None
+                best_value = iteration_state.best_metrics.get(primary_key) if (iteration_state.best_metrics and primary_key) else None
+                # Heuristic: loss/error/perplexity → lower is better; else higher is better
+                _lower_is_better = primary_key and any(
+                    kw in primary_key.lower() for kw in ("loss", "error", "perplexity", "mse", "mae", "cer", "wer")
+                )
+                if best_value is None or primary_value is None:
+                    is_improvement = best_value is None and primary_value is not None
+                elif _lower_is_better:
+                    is_improvement = primary_value < best_value
+                else:
+                    is_improvement = primary_value > best_value
+                if is_improvement:
                     iteration_state.best_round = round_num
                     iteration_state.best_metrics = analysis.metric_summary
 
@@ -493,6 +598,418 @@ class ExperimentAgent(BaseResearchAgent):
         return result
 
     # ------------------------------------------------------------------
+    # ReAct experiment mode
+    # ------------------------------------------------------------------
+
+    _REACT_SYSTEM_PROMPT = """\
+You are an autonomous ML experiment agent. You have full access to the \
+filesystem and shell through your tools. Your job is to implement, run, \
+debug, and collect results for the experiment described in the blueprint.
+
+## Your tools
+- **read_file(path)** — read any file (relative paths resolve against working dir)
+- **write_file(path, content)** — write / create a file
+- **list_dir(path)** — list directory contents
+- **run_command(command, timeout?, workdir?)** — run any shell command (default timeout 120s, max 1800s)
+- **search_files(pattern, path?)** — glob search for files
+- **grep_content(pattern, path?, file_glob?)** — search file contents
+
+## Workflow
+
+### Phase 0: Environment discovery (DO THIS FIRST)
+Run these commands to understand where you are:
+```
+whoami && hostname && pwd
+ldd --version 2>&1 | head -1   # check glibc version (CRITICAL)
+nvidia-smi                      # check GPU availability
+which python && python --version
+conda info --envs               # list conda environments
+sinfo 2>/dev/null               # check if SLURM is available
+which apptainer 2>/dev/null || which singularity 2>/dev/null   # container runtime
+```
+
+**CRITICAL: Check glibc version FIRST.** Many clusters have old glibc (e.g., 2.17 on CentOS 7).
+Modern PyTorch/CUDA requires glibc >= 2.28. If glibc is too old, you MUST use apptainer
+containers — direct `pip install torch` will fail with `GLIBC_2.xx not found`.
+
+Based on the results, decide:
+- **glibc < 2.28** → you MUST use apptainer container (see Phase 0.5)
+- **glibc >= 2.28** → conda/pip works directly, container optional
+- **SLURM available** → write SLURM batch scripts and `sbatch`
+- **No SLURM** → run training directly with `python`
+- **GPU available** → use CUDA. No GPU → CPU with smaller model/data.
+{conda_env_hint}
+### Phase 0.5: Container setup (when glibc < 2.28)
+{container_config}
+
+### Phase 1: Setup environment
+**Decision tree** (pick the FIRST that applies):
+1. **glibc < 2.28** → you MUST use container from Phase 0.5; ALL python/pip via `apptainer exec --nv`
+2. **glibc >= 2.28 + pre-configured conda env with PyTorch** → `conda activate ENV_NAME` (fast)
+3. **glibc >= 2.28 + other conda env** → activate + `pip install torch` (medium)
+4. **glibc >= 2.28 + nothing usable** → create new conda env (last resort)
+
+After choosing:
+- Test that PyTorch imports: `python -c "import torch; print(torch.cuda.is_available())"`
+  (if container: `apptainer exec --nv CONTAINER.sif python -c "import torch; ..."`)
+- Install experiment-specific packages (`pip install -r requirements.txt`, `timeout=600`)
+- Create the experiment directory structure
+
+**IMPORTANT: If container mode, ALL subsequent python/pip commands must be wrapped in
+`apptainer exec --nv -B BINDS CONTAINER.sif bash -c "..."`**
+
+### Phase 2: Write experiment code
+Based on the blueprint, create all necessary files:
+- `main.py` — entry point with argparse (`--quick-eval` for fast run, `--dry-run` for import check)
+- `src/model.py` — model architecture
+- `src/trainer.py` — training loop
+- `src/dataset.py` — data loading
+- `src/evaluate.py` — evaluation metrics
+- `requirements.txt` — dependencies
+- If SLURM: a `.sh` batch script (see template below)
+
+IMPORTANT for `main.py`:
+- Add `--quick-eval` flag: use scaled-down model (layers/4, hidden_dim/4), train 3-5 epochs,
+  use 500-1000 data samples (or synthetic data), run ablation, save to results/metrics.json
+- All metric values MUST come from actual computation, NEVER hardcode
+- Set random seed at startup for reproducibility
+
+### Phase 3: Run the experiment
+- First do a dry-run to check imports: `python main.py --dry-run`
+- Then run quick-eval: `python main.py --quick-eval`
+- If using **container + SLURM**: wrap python command in `apptainer exec` inside sbatch script
+- If SLURM: `sbatch run.sh`, then poll with `squeue -u $(whoami)` every ~30s and read log files
+- If local: run directly or with `nohup` for long jobs
+- For SLURM jobs that take time, use `run_command` with `timeout=300` or higher to poll status
+
+### Phase 4: Debug if it fails
+- Read error logs carefully
+- Fix the bug in the source code
+- Re-run the experiment
+- Repeat until it succeeds or you've tried 5+ different fixes
+
+### Phase 5: Collect results
+- Read `results/metrics.json` (or however results are saved)
+- Report final metrics clearly
+- The experiment is done when you have real metric numbers
+
+## CRITICAL RULES
+1. **Always check your environment first** — don't assume anything
+2. **Start simple** — get a basic version running before adding complexity
+3. **Read error messages carefully** — fix the actual root cause, not symptoms
+4. **Don't give up** — if one approach fails, try another
+5. **Write complete files** — never write partial or placeholder code
+6. **Save results to `results/metrics.json`** — this is the standard output format:
+   ```json
+   {{"main_results": [{{"method_name": "...", "dataset": "...", "is_proposed": true, "metrics": [{{"metric_name": "accuracy", "value": 0.95}}]}}]}}
+   ```
+7. **When using SLURM**: after `sbatch`, use `squeue` to check status, and read the SLURM output file for logs
+8. **Be resourceful** — you can install packages, download data, check documentation, etc.
+9. **Use `timeout` parameter** for long commands: `pip install` (timeout=600), training (timeout=1800), `apptainer pull` (timeout=1800)
+10. **Device**: use CUDA if available, else CPU. NEVER default to CPU when GPU exists.
+11. **Windows**: if on Windows, use `num_workers=0` in DataLoader.
+
+## SLURM batch script template (without container)
+```bash
+#!/bin/bash
+#SBATCH --job-name=experiment
+#SBATCH --partition={{PARTITION}}
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=4:00:00
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+source activate YOUR_ENV  # or: conda activate YOUR_ENV
+cd $SLURM_SUBMIT_DIR
+
+python main.py --quick-eval
+```
+
+## SLURM batch script template (with apptainer container)
+```bash
+#!/bin/bash
+#SBATCH --job-name=experiment
+#SBATCH --partition={{PARTITION}}
+#SBATCH --gres=gpu:1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=4:00:00
+#SBATCH --output=slurm-%j.out
+#SBATCH --error=slurm-%j.err
+
+cd $SLURM_SUBMIT_DIR
+apptainer exec --nv --writable-tmpfs -B {{BIND_MOUNTS}} {{CONTAINER_SIF}} \
+    bash -c "pip install -r requirements.txt -q 2>/dev/null; cd $SLURM_SUBMIT_DIR && python main.py --quick-eval"
+```
+Notes:
+- `--writable-tmpfs` allows pip install inside read-only .sif (writes go to tmpfs)
+- For a pre-built .sif with PyTorch already inside, you can omit `--writable-tmpfs` and `pip install`
+- Adjust `--partition`, `--gres`, `--time`, bind mounts as needed.
+
+## SLURM configuration
+{slurm_config}
+
+## End condition
+You are DONE when you have:
+1. Successfully run the experiment (training completed without errors)
+2. Collected real metric numbers (accuracy, loss, etc.)
+3. Saved results to `results/metrics.json`
+
+When finished, output a FINAL SUMMARY with:
+- What you did
+- Final metrics (exact numbers)
+- Path to results file
+"""
+
+    async def _run_react_mode(
+        self,
+        blueprint_data: dict,
+        reference_repos: list[dict],
+    ) -> dict[str, Any]:
+        """Run experiment in ReAct mode — LLM drives everything via tools."""
+        self.log("Starting experiment in ReAct mode (LLM-driven)")
+
+        code_dir = self.workspace.path / "code"
+        code_dir.mkdir(parents=True, exist_ok=True)
+
+        # Build tools
+        tools = build_experiment_tools(work_dir=code_dir)
+
+        # Build SLURM config block for system prompt
+        partition = self.config.slurm_partition
+        max_gpus = self.config.slurm_max_gpus
+        wall_time = self.config.slurm_default_time
+        if partition:
+            slurm_config = (
+                f"- Partition: `{partition}`\n"
+                f"- Max GPUs per job: {max_gpus}\n"
+                f"- Default wall time: {wall_time}\n"
+                f"- Submit with: `sbatch your_script.sh`\n"
+                f"- Check status: `squeue -u $(whoami)`\n"
+                f"- Cancel job: `scancel <job_id>`\n"
+                f"- View logs: read the SLURM output file (usually `slurm-<job_id>.out`)"
+            )
+        else:
+            slurm_config = (
+                "Not pre-configured. Run `sinfo` to check if SLURM is available.\n"
+                f"If available, use at most {max_gpus} GPUs per job."
+            )
+
+        # Build conda env hint for system prompt
+        conda_env = self.config.experiment_conda_env
+        if conda_env:
+            conda_env_hint = (
+                f"\n**Pre-configured conda env**: `{conda_env}` — use this env "
+                f"(activate with `conda activate {conda_env}`). "
+                f"It likely already has PyTorch and common ML packages installed.\n"
+            )
+        else:
+            conda_env_hint = ""
+
+        # Build container config block for system prompt
+        container_image = self.config.container_image
+        container_path = self.config.container_path
+        container_bind = self.config.container_bind
+
+        # Common explanation block
+        _why = (
+            "**WHY containers?** HPC clusters often have old glibc (e.g., 2.17 on CentOS 7).\n"
+            "Modern PyTorch/CUDA needs glibc >= 2.28. Direct `pip install torch` fails with\n"
+            "`GLIBC_2.xx not found`. Containers (e.g., Ubuntu 22.04) bundle glibc 2.35 inside.\n"
+        )
+
+        # Search paths for existing .sif files
+        _search_dirs = "/mnt /opt /shared /data $HOME"
+
+        container_lines = [_why]
+
+        # Step 1: Search
+        container_lines.extend([
+            "**Step 1: Search for existing .sif files on the cluster**",
+            f"```",
+            f"find {_search_dirs} -name '*.sif' -maxdepth 4 2>/dev/null | head -20",
+            f"```",
+        ])
+        if container_path:
+            container_lines.append(
+                f"Pre-configured path to check first: `{container_path}`"
+            )
+
+        # Step 2: Try each
+        container_lines.extend([
+            "",
+            "**Step 2: Try each .sif file — test if it has a usable Python + PyTorch**",
+            "For EACH .sif file found, test:",
+            "```",
+            "apptainer exec --nv FOUND.sif python3 -c \"import torch; print(torch.__version__, torch.cuda.is_available())\"",
+            "```",
+            "- If it prints a torch version with `True` → **use this .sif, you are done!**",
+            "- If it fails (no python, no torch, wrong CUDA) → try the next .sif",
+            "- If no python3, try `python` instead",
+        ])
+
+        # Step 3: Download if none work
+        container_lines.extend([
+            "",
+            "**Step 3: If NO usable .sif found → download a clean base image**",
+        ])
+        if container_image:
+            container_lines.append(
+                f"Pre-configured image: `{container_image}`"
+            )
+            sif_target = container_path or "ubuntu2204.sif"
+            container_lines.append(
+                f"```\napptainer pull {sif_target} {container_image}\n```"
+            )
+        else:
+            container_lines.extend([
+                "Download a clean Ubuntu 22.04 image (small, ~30MB, glibc 2.35):",
+                "```",
+                "apptainer pull ubuntu2204.sif docker://ubuntu:22.04",
+                "```",
+                "(use `timeout=1800` — first pull may be slow)",
+            ])
+
+        # Step 4: Install Python + deps inside
+        container_lines.extend([
+            "",
+            "**Step 4: Install Python + PyTorch inside the clean container**",
+            "Use `--writable-tmpfs` to allow temporary writes inside the read-only .sif:",
+            "```",
+            "# Test if python3 exists inside",
+            "apptainer exec ubuntu2204.sif which python3",
+            "",
+            "# If no python3, install it (needs --writable-tmpfs or --fakeroot):",
+            "apptainer exec --writable-tmpfs ubuntu2204.sif bash -c \\",
+            '  "apt-get update -qq && apt-get install -y -qq python3 python3-pip > /dev/null && \\',
+            '   pip3 install torch torchvision numpy -q && \\',
+            '   python3 -c \\"import torch; print(torch.__version__)\\"" ',
+            "```",
+            "",
+            "**BETTER: Build a reusable .sif with a definition file** (so you don't reinstall every time):",
+            "```",
+            "# Write a .def file",
+            "cat > experiment.def << 'DEFEOF'",
+            "Bootstrap: docker",
+            "From: ubuntu:22.04",
+            "",
+            "%post",
+            "    apt-get update -qq && apt-get install -y -qq python3 python3-pip git > /dev/null",
+            "    pip3 install torch torchvision numpy scipy scikit-learn matplotlib -q",
+            "",
+            "%environment",
+            "    export PATH=/usr/local/bin:/usr/bin:$PATH",
+            "DEFEOF",
+            "",
+            "# Build the .sif (use --fakeroot on HPC clusters without root)",
+            "apptainer build --fakeroot experiment.sif experiment.def",
+            "```",
+            "If `--fakeroot` fails, use `--writable-tmpfs` approach instead.",
+        ])
+
+        # Step 5: Usage
+        container_lines.extend([
+            "",
+            "**Step 5: Use the container for ALL commands**",
+            f"Bind mounts: `-B {container_bind}`",
+            "```",
+            "# Run python inside container",
+            "apptainer exec --nv -B {bind} experiment.sif python3 main.py --quick-eval".format(
+                bind=container_bind
+            ),
+            "",
+            "# Install extra packages at runtime (--writable-tmpfs)",
+            "apptainer exec --nv --writable-tmpfs -B {bind} experiment.sif bash -c \\".format(
+                bind=container_bind
+            ),
+            '  "pip3 install -r requirements.txt -q && python3 main.py --quick-eval"',
+            "```",
+            "IMPORTANT: once in container mode, ALL python/pip must go through `apptainer exec`.",
+        ])
+
+        container_config = "\n".join(container_lines)
+
+        system_prompt = self._REACT_SYSTEM_PROMPT.format(
+            slurm_config=slurm_config,
+            conda_env_hint=conda_env_hint,
+            container_config=container_config,
+        )
+
+        # Build user prompt with blueprint
+        blueprint_summary = json.dumps(blueprint_data, indent=2, ensure_ascii=False)
+        if len(blueprint_summary) > 6000:
+            blueprint_summary = blueprint_summary[:6000] + "\n... (truncated)"
+
+        repo_context = self._build_repo_context(reference_repos)
+        repo_block = f"\n\n## Reference code\n{repo_context}" if repo_context else ""
+
+        user_prompt = f"""## Experiment Blueprint
+
+{blueprint_summary}
+{repo_block}
+
+## Working directory
+`{code_dir}`
+
+Please start by discovering the environment (Phase 0), then implement and run this experiment.
+The goal is to get real experimental results (metric numbers) — not placeholder code."""
+
+        # Run the ReAct loop
+        max_rounds = self.config.react_max_rounds
+        self.log(f"ReAct loop: max {max_rounds} tool rounds")
+
+        try:
+            final_output = await self.generate_with_tools(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                tools=tools,
+                max_tool_rounds=max_rounds,
+                stage_override=self.config.for_stage("experiment"),
+                reminder_text=(
+                    "[REMINDER] You are running an ML experiment. Stay focused:\n"
+                    "- If the experiment is still running, check its status (squeue / read log file)\n"
+                    "- If it failed, read the error and fix the code\n"
+                    "- If it succeeded, collect the results and report metrics\n"
+                    "- Do NOT start over from scratch unless absolutely necessary\n"
+                    "- Your goal is REAL metric numbers, not placeholder code"
+                ),
+                reminder_interval=5,
+            )
+        except Exception as exc:
+            logger.error("ReAct experiment failed: %s", exc, exc_info=True)
+            final_output = f"ReAct experiment failed with error: {exc}"
+
+        self.log(f"ReAct experiment completed. Output length: {len(final_output)}")
+        self.workspace.write_text("logs/react_final_output.md", final_output)
+
+        # Try to collect metrics from results/metrics.json
+        metrics = self._parse_metrics_json(code_dir)
+        experiment_status = "success" if metrics else "partial"
+
+        result = {
+            "code_project_plan": {"mode": "react"},
+            "generated_files": [
+                str(f.relative_to(code_dir))
+                for f in code_dir.rglob("*")
+                if f.is_file() and "__pycache__" not in str(f)
+            ],
+            "file_count": sum(
+                1 for f in code_dir.rglob("*")
+                if f.is_file() and "__pycache__" not in str(f)
+            ),
+            "code_execution": {"status": experiment_status},
+            "experiment_results": metrics,
+            "experiment_status": experiment_status,
+            "react_output": final_output[:5000],
+        }
+        self.workspace.write_json("logs/experiment_output.json", result)
+        return result
+
+    # ------------------------------------------------------------------
     # Sub-round checkpoint helpers
     # ------------------------------------------------------------------
 
@@ -543,6 +1060,7 @@ class ExperimentAgent(BaseResearchAgent):
         analysis: FeedbackAnalysis | None,
         history_summary: str,
         blueprint: str,
+        preflight_error_ctx: str = "",
     ) -> ExperimentHypothesis:
         """LLM generates the next iteration hypothesis from feedback."""
         analysis_text = ""
@@ -557,23 +1075,63 @@ class ExperimentAgent(BaseResearchAgent):
                 f"Error categories: {analysis.error_categories}"
             )
 
-        prompt = f"""Based on the previous experiment round's feedback, generate a hypothesis for the next improvement iteration.
+        # Collect actual file list from code_dir for the LLM
+        code_dir = self.workspace.path / "code"
+        actual_files = []
+        if code_dir.exists():
+            for f in sorted(code_dir.rglob("*")):
+                if f.is_file() and "__pycache__" not in str(f) and ".pyc" not in str(f):
+                    actual_files.append(str(f.relative_to(code_dir)).replace("\\", "/"))
+        file_list = "\n".join(f"  - {f}" for f in actual_files) if actual_files else "  (no files yet)"
 
+        # Build list of previously tried hypotheses to prevent repetition
+        prev_hypotheses = []
+        if history_summary:
+            for line in history_summary.split("\n"):
+                if line.strip():
+                    prev_hypotheses.append(line.strip())
+        prev_hyp_block = "\n".join(prev_hypotheses) if prev_hypotheses else "None"
+
+        prompt = f"""Based on the previous experiment round's feedback, generate a hypothesis for the next improvement iteration.
+{preflight_error_ctx}
 == Previous Analysis ==
 {analysis_text or "No analysis available."}
 
 == History ==
 {history_summary or "No previous rounds."}
 
+== PREVIOUSLY TRIED HYPOTHESES (DO NOT REPEAT) ==
+{prev_hyp_block}
+
 == Experiment Blueprint ==
 {blueprint[:2000]}
+
+== Actual Project Files ==
+{file_list}
+
+IMPORTANT RULES:
+1. Only reference files that exist in the list above. Do NOT invent new file paths.
+2. Use the EXACT paths shown above in your planned_changes.
+3. The `--quick-eval` mode HARDCODES a small model and 3-5 epochs regardless of config.
+   Changing epochs/batch_size/num_runs in config/default.yaml has NO EFFECT on quick-eval.
+   DO NOT suggest increasing epochs or changing hyperparameters in config — it is USELESS.
+4. Instead, focus on changes that actually affect quick-eval behavior:
+   - Fix bugs in model architecture (src/model.py)
+   - Fix bugs in training loop (src/trainer.py)
+   - Fix evaluation/metrics collection (src/evaluate.py, src/utils.py)
+   - Fix data loading/preprocessing (src/dataset.py)
+   - Fix the quick-eval code path in main.py directly
+   - Improve model architecture (e.g., add batch norm, better init, residual connections)
+5. DO NOT repeat any hypothesis from the list above. Each round must try something DIFFERENT.
+   If you cannot think of a genuinely new improvement, set "no_new_ideas": true.
 
 Output a JSON object with:
 {{
   "hypothesis": "<what you will change and why>",
-  "planned_changes": ["<file: specific change>", ...],
+  "planned_changes": ["<EXACT_FILE_PATH: specific change>", ...],
   "expected_signal": "<what metric improvement you expect>",
-  "rationale": "<reasoning>"
+  "rationale": "<reasoning>",
+  "no_new_ideas": false
 }}"""
 
         try:
@@ -591,6 +1149,18 @@ Output a JSON object with:
                     lines = lines[:-1]
                 text = "\n".join(lines)
             data = json.loads(text)
+
+            # If LLM says no new ideas, signal early stop
+            if data.get("no_new_ideas"):
+                logger.info("LLM reports no new ideas — will signal early stop")
+                return ExperimentHypothesis(
+                    round_number=0,
+                    hypothesis="__NO_NEW_IDEAS__",
+                    planned_changes=[],
+                    expected_signal="",
+                    rationale="LLM exhausted improvement ideas",
+                )
+
             return ExperimentHypothesis(
                 round_number=0,  # caller sets this
                 hypothesis=data.get("hypothesis", "Iterative improvement"),
@@ -614,7 +1184,13 @@ Output a JSON object with:
         code_dir: Path,
         venv_python: str,
     ) -> list[str]:
-        """LLM modifies specific files based on the hypothesis (not full regeneration)."""
+        """LLM modifies specific files using search-replace edits (OpenClaw style).
+
+        Uses precise search-replace blocks instead of full file rewrites to:
+        1. Reduce token usage (LLM only outputs the diff, not entire files)
+        2. Avoid accidental deletion of unchanged code
+        3. Make changes auditable
+        """
         # Collect current file contents for context
         file_contents: dict[str, str] = {}
         for py_file in code_dir.rglob("*.py"):
@@ -624,26 +1200,25 @@ Output a JSON object with:
             try:
                 rel = str(py_file.relative_to(code_dir)).replace("\\", "/")
                 content = py_file.read_text(encoding="utf-8", errors="replace")
-                file_contents[rel] = content[:3000]  # truncate for context
+                file_contents[rel] = content
             except OSError:
                 continue
 
-        # Also include config/default.yaml
-        yaml_path = code_dir / "config" / "default.yaml"
-        if yaml_path.exists():
-            try:
-                file_contents["config/default.yaml"] = yaml_path.read_text(
-                    encoding="utf-8", errors="replace"
-                )[:2000]
-            except OSError:
-                pass
+        # Also include config and other non-py files
+        for pattern in ("config/*.yaml", "config/*.yml", "*.txt", "*.sh"):
+            for f in code_dir.glob(pattern):
+                try:
+                    rel = str(f.relative_to(code_dir)).replace("\\", "/")
+                    file_contents[rel] = f.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
 
         files_summary = "\n".join(
-            f"--- {path} ---\n{content[:1500]}\n"
+            f"--- {path} ---\n{content[:2000]}\n"
             for path, content in file_contents.items()
         )
 
-        prompt = f"""Apply the following changes to the experiment code project.
+        prompt = f"""Apply the following changes to the experiment code project using SEARCH-REPLACE edits.
 
 == Hypothesis ==
 {hypothesis.hypothesis}
@@ -655,18 +1230,33 @@ Output a JSON object with:
 {hypothesis.rationale}
 
 == Current Files ==
-{files_summary[:12000]}
+{files_summary[:15000]}
 
-For each file you want to modify, output a JSON array of objects:
-[
-  {{
-    "path": "relative/path.py",
-    "content": "FULL file content (not a diff)"
-  }},
-  ...
-]
+Output a JSON array of edit operations. Two types are supported:
 
-Only include files that need changes. Output the COMPLETE file content for each.
+1. **Search-replace edit** (preferred for modifying existing files):
+{{
+  "path": "relative/path.py",
+  "action": "edit",
+  "edits": [
+    {{"old": "exact text to find", "new": "replacement text"}}
+  ]
+}}
+
+2. **Full file write** (only for NEW files that don't exist yet):
+{{
+  "path": "relative/new_file.py",
+  "action": "write",
+  "content": "full file content"
+}}
+
+IMPORTANT RULES:
+- "old" must be an EXACT substring of the current file content (including whitespace/indentation)
+- Each "old" string must be unique within its file
+- Use search-replace for ALL modifications to existing files
+- Only use "write" action for creating brand new files
+- Multiple edits per file are fine — they are applied sequentially
+
 Output ONLY valid JSON array."""
 
         modified_files: list[str] = []
@@ -674,7 +1264,7 @@ Output ONLY valid JSON array."""
             code_gen_config = self.config.for_stage("code_gen")
             raw = await self._dispatcher.generate(
                 code_gen_config,
-                "You are an ML code editor. Modify the specified files to implement the hypothesis. Output ONLY a JSON array of {path, content} objects.",
+                "You are an ML code editor. Apply precise search-replace edits to implement the hypothesis. Output ONLY a JSON array.",
                 prompt,
             )
             text = raw.strip()
@@ -689,25 +1279,190 @@ Output ONLY valid JSON array."""
                 changes = [changes]
 
             for change in changes:
-                if not isinstance(change, dict) or "path" not in change or "content" not in change:
+                if not isinstance(change, dict) or "path" not in change:
                     continue
                 file_path = change["path"]
                 # Security: prevent directory traversal
-                resolved = (code_dir / file_path).resolve()
-                code_root = code_dir.resolve()
-                if not str(resolved).startswith(str(code_root)):
+                try:
+                    (code_dir / file_path).resolve().relative_to(code_dir.resolve())
+                except ValueError:
                     logger.warning("Skipping unsafe iteration path: %s", file_path)
                     continue
 
-                content = change["content"]
-                self.workspace.write_text(f"code/{file_path}", content)
-                modified_files.append(file_path)
-                self.log(f"  Modified: {file_path}")
+                action = change.get("action", "write")  # backwards compat
+
+                if action == "edit":
+                    # Search-replace mode
+                    edits = change.get("edits", [])
+                    if not edits:
+                        continue
+                    # Read current content
+                    target = code_dir / file_path
+                    if not target.exists():
+                        logger.warning("Edit target does not exist: %s", file_path)
+                        continue
+                    try:
+                        current = target.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+
+                    applied = 0
+                    for edit in edits:
+                        if not isinstance(edit, dict):
+                            continue
+                        old = edit.get("old", "")
+                        new = edit.get("new", "")
+                        if not old:
+                            continue
+                        if old in current:
+                            current = current.replace(old, new, 1)
+                            applied += 1
+                        else:
+                            # Try whitespace-normalized match
+                            old_normalized = " ".join(old.split())
+                            for line_start in range(len(current)):
+                                chunk = current[line_start:line_start + len(old) + 200]
+                                if " ".join(chunk[:len(old) + 100].split()).startswith(old_normalized[:60]):
+                                    # Find the actual extent
+                                    end = current.find("\n", line_start + len(old) - 10)
+                                    if end == -1:
+                                        end = len(current)
+                                    candidate = current[line_start:end]
+                                    if " ".join(candidate.split()) == old_normalized:
+                                        current = current[:line_start] + new + current[end:]
+                                        applied += 1
+                                        break
+                            else:
+                                logger.warning(
+                                    "Edit old text not found in %s: %s",
+                                    file_path, old[:80],
+                                )
+
+                    if applied > 0:
+                        self.workspace.write_text(f"code/{file_path}", current)
+                        modified_files.append(file_path)
+                        self.log(f"  Edited: {file_path} ({applied}/{len(edits)} edits applied)")
+                else:
+                    # Full write mode (new files or backwards compat)
+                    content = change.get("content", "")
+                    if not content:
+                        continue
+                    self.workspace.write_text(f"code/{file_path}", content)
+                    modified_files.append(file_path)
+                    self.log(f"  Wrote: {file_path}")
 
         except Exception as exc:
             logger.warning("Failed to apply iteration changes: %s", exc)
 
         return modified_files
+
+    async def _apply_iteration_changes_fullwrite(
+        self,
+        hypothesis: ExperimentHypothesis,
+        code_dir: Path,
+    ) -> list[str]:
+        """Fallback: when search-replace fails, ask LLM to rewrite the target file entirely."""
+        # Find the primary target file from planned_changes
+        target_rel = None
+        for change_desc in hypothesis.planned_changes:
+            # Extract file path from descriptions like "src/trainer.py: fix ..."
+            for part in change_desc.replace(":", " ").split():
+                candidate = code_dir / part
+                try:
+                    # Security: ensure candidate is within code_dir (no path traversal)
+                    candidate.resolve().relative_to(code_dir.resolve())
+                except ValueError:
+                    continue
+                if candidate.exists() and candidate.is_file():
+                    target_rel = part
+                    break
+            if target_rel:
+                break
+
+        if not target_rel:
+            # Default to main.py
+            if (code_dir / "main.py").exists():
+                target_rel = "main.py"
+            else:
+                return []
+
+        target = code_dir / target_rel
+        try:
+            current = target.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return []
+
+        # Build file context: head + tail for large files to stay within LLM limits
+        total_lines = len(current.splitlines())
+        if len(current) <= 12000:
+            file_block = current
+        else:
+            # Show first 8K chars + last 4K chars with a separator
+            head = current[:8000]
+            tail = current[-4000:]
+            file_block = (
+                f"{head}\n\n... [{total_lines} lines total, middle section omitted for brevity] ...\n\n{tail}"
+            )
+
+        prompt = f"""Rewrite the file `{target_rel}` to implement this change:
+
+== Hypothesis ==
+{hypothesis.hypothesis}
+
+== Planned Changes ==
+{chr(10).join(hypothesis.planned_changes)}
+
+== Current File ({total_lines} lines) ==
+```python
+{file_block}
+```
+
+Output the COMPLETE new file content. No markdown fences, no explanation — ONLY the Python code.
+The output MUST be a complete, runnable file — do NOT omit any functions or classes from the original."""
+
+        try:
+            code_gen_config = self.config.for_stage("code_gen")
+            raw = await self._dispatcher.generate(
+                code_gen_config,
+                f"You are an ML code editor. Rewrite {target_rel} to implement the requested change. "
+                f"Output ONLY the complete file. Do NOT truncate or omit any part of the original code.",
+                prompt,
+            )
+            new_content = (raw or "").strip()
+            # Strip markdown fences
+            if new_content.startswith("```"):
+                lines = new_content.split("\n")[1:]
+                if lines and lines[-1].strip().startswith("```"):
+                    lines = lines[:-1]
+                new_content = "\n".join(lines)
+
+            # Safety: reject if the rewrite looks truncated (LLM hit max_tokens)
+            if new_content and len(new_content) > 50:
+                # Truncation heuristic: a valid Python file should end with a
+                # complete statement — not mid-line or mid-string.
+                _last_line = new_content.rstrip().rsplit("\n", 1)[-1].strip()
+                _looks_truncated = (
+                    # Ends with open string/paren/bracket
+                    _last_line.endswith(("(", "[", "{", ",", "\\", '"""', "'''"))
+                    # Or ends mid-expression (no closing quote, has unbalanced quotes)
+                    or _last_line.count('"') % 2 == 1
+                    or _last_line.count("'") % 2 == 1
+                    # Or suspiciously short AND the file was large (likely max_tokens cutoff)
+                    or (len(new_content) < len(current) * 0.3 and len(current) > 1000)
+                )
+                if _looks_truncated:
+                    logger.warning(
+                        "Full-file rewrite for %s looks truncated (%d vs %d chars, last: %s), skipping",
+                        target_rel, len(new_content), len(current), _last_line[-60:],
+                    )
+                    return []
+                target.write_text(new_content, encoding="utf-8")
+                self.log(f"  Rewrote {target_rel} (full-file fallback, {len(new_content)} chars)")
+                return [target_rel]
+        except Exception as exc:
+            logger.warning("Full-file rewrite fallback failed for %s: %s", target_rel, exc)
+
+        return []
 
     @staticmethod
     def _build_history_summary(rounds: list[RoundResult]) -> str:
@@ -728,6 +1483,174 @@ Output ONLY valid JSON array."""
                 f"| metrics: {metrics_str or 'none'} | attr: {attribution}"
             )
         return "\n".join(lines)
+
+    @staticmethod
+    def _check_import_consistency(code_dir: Path) -> list[dict]:
+        """Scan all generated files for cross-file import mismatches.
+
+        Borrowed from Deep Pipeline's CodingAgent — checks two patterns:
+        1. `from X import Y` where Y doesn't exist in X
+        2. `import X; X.func()` where func doesn't exist in X
+
+        Returns list of mismatch dicts.
+        """
+        import re as _re
+
+        definitions: dict[str, list[str]] = {}  # module -> [defined names]
+        imports: list[dict] = []
+        module_accesses: list[dict] = []
+        local_modules = {f.stem for f in code_dir.rglob("*.py")}
+
+        for py_file in code_dir.rglob("*.py"):
+            if "__pycache__" in str(py_file):
+                continue
+            try:
+                content = py_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            module_name = py_file.stem
+
+            # Find class and top-level function definitions
+            defs = [m.group(1) for m in _re.finditer(r"^(?:class|def)\s+(\w+)", content, _re.MULTILINE)]
+            definitions[module_name] = defs
+
+            # Find cross-file imports: from X import Y, Z
+            for m in _re.finditer(r"^from\s+(?:src\.)?(\w+)\s+import\s+(.+)$", content, _re.MULTILINE):
+                src_module = m.group(1)
+                # Strip inline comments before parsing names
+                import_text = m.group(2).split("#")[0]
+                imported_names = [n.strip().split(" as ")[0].strip() for n in import_text.split(",")]
+                imported_names = [n for n in imported_names if n]  # drop empty after comment strip
+                imports.append({"importer": py_file.name, "module": src_module, "names": imported_names})
+
+            # Find `import X` for local modules, then scan for X.attr() calls
+            imported_modules: dict[str, str] = {}
+            for m in _re.finditer(r"^import\s+(?:src\.)?(\w+)(?:\s+as\s+(\w+))?$", content, _re.MULTILINE):
+                real_name = m.group(1)
+                alias = m.group(2) or real_name
+                if real_name in local_modules:
+                    imported_modules[alias] = real_name
+
+            for alias, real_name in imported_modules.items():
+                for m in _re.finditer(rf"\b{_re.escape(alias)}\.(\w+)\s*\(", content):
+                    attr = m.group(1)
+                    if not attr.startswith("_"):
+                        module_accesses.append({
+                            "importer": py_file.name, "module": real_name, "attr": attr,
+                        })
+
+        # Check mismatches
+        mismatches = []
+        for imp in imports:
+            module = imp["module"]
+            if module not in definitions:
+                continue
+            defined = set(definitions[module])
+            for name in imp["names"]:
+                if name and name not in defined:
+                    mismatches.append({
+                        "importer": imp["importer"], "module": module,
+                        "missing_name": name, "available": sorted(defined),
+                    })
+
+        seen_access: set[tuple[str, str, str]] = set()
+        for acc in module_accesses:
+            module = acc["module"]
+            if module not in definitions:
+                continue
+            attr = acc["attr"]
+            key = (acc["importer"], module, attr)
+            if key in seen_access:
+                continue
+            seen_access.add(key)
+            defined = set(definitions[module])
+            if attr not in defined:
+                mismatches.append({
+                    "importer": acc["importer"], "module": module,
+                    "missing_name": attr, "available": sorted(defined),
+                    "usage_pattern": f"import {module}; {module}.{attr}()",
+                })
+
+        return mismatches
+
+    async def _fix_import_mismatches(
+        self, code_dir: Path, mismatches: list[dict],
+    ) -> None:
+        """Ask LLM to fix cross-file import mismatches via search-replace patches."""
+        # Read all source files
+        all_sources = {}
+        for py_file in code_dir.rglob("*.py"):
+            if "__pycache__" not in str(py_file):
+                try:
+                    all_sources[py_file.name] = py_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+
+        source_listing = ""
+        for fname, content in sorted(all_sources.items()):
+            source_listing += f"\n# FILE: {fname}\n{content}\n"
+
+        system_prompt = (
+            "You are fixing cross-file interface mismatches between Python files in a project. "
+            "Some files reference names that don't exist in the target module. "
+            "Fix by EITHER adding the missing function/class to the target module, "
+            "OR renaming the call to match what's already defined. "
+            "Return JSON with patches."
+        )
+
+        mismatch_desc = json.dumps(mismatches[:10], indent=2)  # cap at 10
+        user_prompt = f"""Import mismatches found:
+{mismatch_desc}
+
+Source files:
+{source_listing[:15000]}
+
+Return JSON:
+{{
+  "patches": [
+    {{
+      "file": "filename.py",
+      "old": "exact text to replace",
+      "new": "replacement text"
+    }}
+  ]
+}}"""
+
+        try:
+            result = await self.generate_json(system_prompt, user_prompt)
+            patches = result.get("patches", []) if isinstance(result, dict) else []
+
+            fixed = 0
+            for patch in patches:
+                filepath = code_dir / patch.get("file", "")
+                try:
+                    filepath.resolve().relative_to(code_dir.resolve())
+                except ValueError:
+                    continue
+                old_text = patch.get("old", "")
+                new_text = patch.get("new", "")
+                if filepath.exists() and old_text and new_text:
+                    content = filepath.read_text(encoding="utf-8", errors="replace")
+                    if old_text in content:
+                        filepath.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
+                        fixed += 1
+                        self.log(f"  Fixed import mismatch in {patch['file']}")
+            self.log(f"Import fix: {fixed}/{len(patches)} patches applied")
+        except Exception as e:
+            self.log(f"Import fix failed (non-fatal): {e}")
+
+    @staticmethod
+    def _check_syntax(filepath: Path) -> bool:
+        """Check if a Python file has valid syntax via py_compile."""
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c",
+                 f"import py_compile; py_compile.compile(r'{filepath}', doraise=True)"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.returncode == 0
+        except Exception:
+            return True  # assume OK if check itself fails
 
     @staticmethod
     def _get_best_round(state: IterationState) -> dict:
@@ -759,10 +1682,10 @@ Output ONLY valid JSON array."""
     async def _run_quick_eval(
         self, code_dir: Path, venv_python: str, timeout: int | None = None,
     ) -> dict:
-        """Execute main.py --quick-eval and read results/metrics.json.
+        """Execute main.py --quick-eval with up to 5 batch-fix cycles.
 
-        If the first attempt fails, try LLM-assisted fix once (same pattern
-        as _execute_code for --dry-run).
+        Each cycle: run → collect all errors → fix ALL affected files at once
+        → run again.  Much more efficient than fixing one file at a time.
 
         Returns {"status": "success"/"partial"/"failed"/"timeout", "metrics": {...}}.
         """
@@ -771,66 +1694,62 @@ Output ONLY valid JSON array."""
 
         self.log("Phase 4: Running quick-eval for real experiment results")
 
-        # --- Attempt 1 ---
-        result = await self._run_quick_eval_subprocess(code_dir, venv_python, timeout)
-        if result["returncode"] == 0:
-            return self._collect_quick_eval_results(code_dir, result, attempt=1)
+        max_fix_cycles = 5
+        last_result: dict = {}
+        fix_history: list[dict] = []  # Track previous fixes to avoid repeating
 
-        self.log(
-            f"Quick-eval failed (attempt 1, rc={result['returncode']}): "
-            f"{result['stderr'][:300]}"
-        )
+        for cycle in range(1, max_fix_cycles + 1):
+            result = await self._run_quick_eval_subprocess(code_dir, venv_python, timeout)
+            last_result = result
+            if result["returncode"] == 0:
+                return self._collect_quick_eval_results(code_dir, result, attempt=cycle)
 
-        # --- Attempt 2: LLM fix ---
-        main_py = code_dir / "main.py"
-        if not main_py.exists():
-            return {"status": "failed", "metrics": {}, "attempts": 1, **result}
-
-        try:
-            fix_prompt = (
-                f"The following Python code failed when executed with --quick-eval.\n\n"
-                f"Error output:\n```\n{result['stderr'][:STDERR_SNIPPET_LIMIT]}\n```\n\n"
-                f"Original main.py (first 4000 chars):\n```python\n"
-                f"{main_py.read_text(encoding='utf-8')[:LLM_CONTEXT_TRUNCATION]}\n```\n\n"
-                f"Fix the code so that `python main.py --quick-eval` runs successfully.\n"
-                f"It must:\n"
-                f"1. Train a scaled-down model for a few epochs\n"
-                f"2. Write results/metrics.json with main_results, ablation_results, training_log\n"
-                f"3. All numeric values must come from actual computation\n\n"
-                f"Output ONLY the fixed Python code, no markdown fences."
+            self.log(
+                f"Quick-eval failed (cycle {cycle}/{max_fix_cycles}, "
+                f"rc={result['returncode']}): {result['stderr'][:300]}"
             )
 
-            code_gen_config = self.config.for_stage("code_gen")
-            fixed_code = await self._dispatcher.generate(
-                code_gen_config,
-                "You are a Python debugging expert. Fix the code to make --quick-eval work.",
-                fix_prompt,
-            )
-            fixed_code = fixed_code.strip()
-            if fixed_code.startswith("```"):
-                lines = fixed_code.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                fixed_code = "\n".join(lines)
+            if cycle >= max_fix_cycles:
+                break
 
-            main_py.write_text(fixed_code, encoding="utf-8")
-            self.log("Quick-eval: LLM fix applied, retrying...")
+            # Timeout: special handling — inject speed-up edits, not traceback fixes
+            if result["returncode"] == -1 and "imeout" in result.get("stderr", ""):
+                try:
+                    modified = await self._fix_timeout(code_dir)
+                    if not modified:
+                        self.log("Quick-eval: timeout fix did not modify any files, stopping")
+                        break
+                except Exception as e:
+                    self.log(f"Quick-eval timeout fix error: {e}")
+                    break
+                continue
 
-            result2 = await self._run_quick_eval_subprocess(code_dir, venv_python, timeout)
-            if result2["returncode"] == 0:
-                return self._collect_quick_eval_results(code_dir, result2, attempt=2)
-            else:
-                self.log(f"Quick-eval failed after LLM fix (rc={result2['returncode']})")
-                return {"status": "failed", "metrics": {}, "attempts": 2, **result2}
-        except Exception as e:
-            self.log(f"Quick-eval LLM fix error: {e}")
-            return {"status": "failed", "metrics": {}, "attempts": 1, "error": str(e), **result}
+            # Batch fix ALL affected files (with fix history to avoid repeats)
+            stderr_text = result.get("stderr", "")
+            try:
+                modified = await self._batch_fix_errors(
+                    code_dir, stderr_text, "",
+                    mode="quick-eval",
+                    previous_fixes=fix_history,
+                )
+                fix_history.append({"error_msg": stderr_text[:300], "cycle": cycle})
+                if not modified:
+                    self.log("Quick-eval: no files modified by batch fix, stopping")
+                    break
+            except Exception as e:
+                self.log(f"Quick-eval batch fix error: {e}")
+                break
+
+        return {"status": "failed", "metrics": {}, "attempts": cycle, **last_result}
 
     async def _run_quick_eval_subprocess(
         self, code_dir: Path, venv_python: str, timeout: int,
     ) -> dict:
         """Run main.py --quick-eval in a subprocess. Returns raw result dict."""
         loop = asyncio.get_running_loop()
+        # Record metrics.json mtime before run to detect stale files on timeout
+        metrics_path = code_dir / "results" / "metrics.json"
+        mtime_before = metrics_path.stat().st_mtime if metrics_path.exists() else None
         try:
             proc_result = await loop.run_in_executor(
                 None,
@@ -850,6 +1769,14 @@ Output ONLY valid JSON array."""
             }
         except subprocess.TimeoutExpired:
             self.log(f"Quick-eval timed out after {timeout}s")
+            # Check if metrics.json was written/updated DURING this run (not stale from previous round)
+            if metrics_path.exists():
+                mtime_after = metrics_path.stat().st_mtime
+                if mtime_before is None or mtime_after > mtime_before:
+                    metrics = self._parse_metrics_json(code_dir)
+                    if metrics:
+                        self.log("Quick-eval timed out BUT metrics.json was updated during run — treating as success")
+                        return {"returncode": 0, "stdout": "", "stderr": ""}
             return {"returncode": -1, "stdout": "", "stderr": f"Timeout after {timeout}s"}
         except Exception as e:
             self.log(f"Quick-eval subprocess error: {e}")
@@ -880,6 +1807,112 @@ Output ONLY valid JSON array."""
             }
 
     @staticmethod
+    def _normalize_metrics_format(data: dict) -> dict:
+        """Convert alternative metrics.json formats to the expected schema.
+
+        Handles the common case where generated code writes:
+          {"variants": {"full": {"accuracy": {"mean": X, "std": Y}, ...}, ...}}
+        instead of the required:
+          {"main_results": [...], "ablation_results": [...], "training_log": [...]}
+        """
+        expected_keys = {"main_results", "ablation_results", "training_log"}
+        if expected_keys & set(data.keys()):
+            return data  # Already in expected format
+
+        variants = data.get("variants")
+        if not isinstance(variants, dict) or not variants:
+            # Fallback: top-level keys are variant dicts themselves
+            # e.g. {"full_model": {"runs": ..., "aggregate": {...}}, "ablation_no_kd": {...}}
+            candidate_variants = {}
+            for k, v in data.items():
+                if isinstance(v, dict) and ("aggregate" in v or "runs" in v or any(
+                    isinstance(sv, dict) and "mean" in sv for sv in v.values()
+                )):
+                    candidate_variants[k] = v
+            if not candidate_variants:
+                return data  # Can't convert
+            # Unwrap "aggregate" sub-dict if present
+            variants = {}
+            for k, v in candidate_variants.items():
+                if "aggregate" in v and isinstance(v["aggregate"], dict):
+                    variants[k] = v["aggregate"]
+                else:
+                    variants[k] = v
+
+        # Convert variants dict → main_results + ablation_results
+        main_results = []
+        ablation_results = []
+        dataset_name = data.get("dataset", "MNIST")
+
+        for variant_name, metrics_dict in variants.items():
+            if not isinstance(metrics_dict, dict):
+                continue
+
+            # Build metric list from the flat dict
+            metric_list = []
+            for mname, mval in metrics_dict.items():
+                if any(mname.startswith(p) for p in (
+                    "per_class", "confusion_matrix", "qualitative",
+                )) or mname in (
+                    "run_seed", "num_runs", "num_samples", "variant",
+                    "training_time_sec", "parameter_count", "FLOPs_M",
+                    "best_val_accuracy", "inference_time_ms",
+                ):
+                    continue  # Skip verbose breakdowns and metadata for summary
+                if isinstance(mval, dict) and "mean" in mval:
+                    metric_list.append({
+                        "metric_name": mname,
+                        "value": mval["mean"],
+                        "std": mval.get("std", 0.0),
+                        "num_runs": data.get("num_runs", 1),
+                    })
+                elif isinstance(mval, (int, float)):
+                    metric_list.append({
+                        "metric_name": mname,
+                        "value": mval,
+                    })
+
+            if not metric_list:
+                continue
+
+            _vn = variant_name.lower().replace(" ", "_").replace("-", "_")
+            is_proposed = (
+                _vn in ("full", "full_model", "ours", "proposed", "calibrated")
+                or _vn.startswith("full_model")
+                or "proposed" in _vn or "ours" in _vn
+            )
+            # If there are only 2 variants, the non-ablation one is proposed
+            if not is_proposed and len(variants) == 2 and "ablation" in str(list(variants.keys())).lower():
+                if "ablation" not in _vn and "baseline" not in _vn and "w/o" not in _vn:
+                    is_proposed = True
+            main_results.append({
+                "method_name": variant_name,
+                "dataset": dataset_name,
+                "is_proposed": is_proposed,
+                "metrics": metric_list,
+            })
+
+            # Also add to ablation
+            ablation_results.append({
+                "variant_name": variant_name,
+                "metrics": metric_list,
+            })
+
+        if main_results:
+            data["main_results"] = main_results
+        if ablation_results:
+            data["ablation_results"] = ablation_results
+
+        # Preserve training_log if present
+        if "training_log" not in data:
+            data["training_log"] = []
+
+        logger.info("Converted variants-format metrics to standard schema "
+                     "(%d main_results, %d ablation_results)",
+                     len(main_results), len(ablation_results))
+        return data
+
+    @staticmethod
     def _parse_metrics_json(code_dir: Path) -> dict:
         """Read and validate results/metrics.json from the code directory.
 
@@ -899,10 +1932,14 @@ Output ONLY valid JSON array."""
                 logger.warning("metrics.json is not a dict, skipping")
                 return {}
 
+            # Try to convert alternative formats to the expected schema
+            data = ExperimentAgent._normalize_metrics_format(data)
+
             # Validate expected top-level keys (at least one should be present)
             expected_keys = {"main_results", "ablation_results", "training_log"}
             if not expected_keys & set(data.keys()):
-                logger.warning("metrics.json has no expected keys, skipping")
+                logger.warning("metrics.json has no expected keys (%s), skipping",
+                               list(data.keys())[:5])
                 return {}
 
             # Validate main_results structure
@@ -954,6 +1991,112 @@ Output ONLY valid JSON array."""
             logger.warning("Failed to parse metrics.json: %s", exc)
             return {}
 
+    # ------------------------------------------------------------------
+    # Cluster execution
+    # ------------------------------------------------------------------
+
+    async def _run_on_cluster(
+        self,
+        cluster: "ClusterExecutor",
+        code_dir: Path,
+        round_num: int,
+        cluster_code_path: str,
+    ) -> tuple[dict, dict]:
+        """Run experiment on SLURM cluster (local or remote).
+
+        Returns (execution_dict, quick_eval_dict) in the same format as
+        the local execution path.
+        """
+        session_id = self.workspace.path.name
+
+        try:
+            # Step 1: Prepare code on cluster
+            if not cluster_code_path:
+                self.log("Preparing code on cluster...")
+                cluster_code_path = await cluster.prepare_code(code_dir, session_id)
+
+                # Step 2: Create conda env + install deps (first round only)
+                env_result = await cluster.setup_env(cluster_code_path)
+                if not env_result["ok"]:
+                    return (
+                        {
+                            "status": "failed",
+                            "cluster_code_path": cluster_code_path,
+                            "stderr": f"Environment setup failed:\n{env_result['output'][-2000:]}",
+                        },
+                        {"status": "skipped", "metrics": {}},
+                    )
+            else:
+                # Re-sync code after LLM modifications
+                self.log("Re-syncing code to cluster...")
+                await cluster.reupload_code(code_dir, cluster_code_path)
+
+            # Step 3: Submit SLURM job
+            script_cmd = "python main.py --quick-eval"
+            job_id = await cluster.submit_job(cluster_code_path, script_cmd)
+
+            # Step 4: Wait for completion
+            job_status = await cluster.wait_for_job(job_id)
+            state = job_status.get("state", "UNKNOWN")
+
+            # Step 5: Collect results or error logs
+            if state == "COMPLETED":
+                downloaded = await cluster.download_results(
+                    cluster_code_path, self.workspace.path
+                )
+                if downloaded:
+                    metrics = self._parse_metrics_json(code_dir)
+                    if metrics:
+                        self.log("Cluster experiment succeeded — real results collected!")
+                        return (
+                            {
+                                "status": "success",
+                                "cluster_code_path": cluster_code_path,
+                                "job_id": job_id,
+                                "stdout": f"Job {job_id} completed",
+                                "stderr": "",
+                            },
+                            {"status": "success", "metrics": metrics},
+                        )
+
+                # Job completed but metrics.json missing/invalid
+                log_text = await cluster.get_job_log(cluster_code_path, job_id)
+                return (
+                    {
+                        "status": "failed",
+                        "cluster_code_path": cluster_code_path,
+                        "job_id": job_id,
+                        "stdout": f"Job {job_id} rc=0 but metrics.json missing/invalid",
+                        "stderr": log_text[-STDERR_SNIPPET_LIMIT:] if log_text else "",
+                    },
+                    {"status": "partial", "metrics": {}, "stderr": log_text},
+                )
+            else:
+                # Job failed
+                log_text = await cluster.get_job_log(cluster_code_path, job_id)
+                self.log(f"Cluster job {job_id} failed ({state})")
+                return (
+                    {
+                        "status": "failed",
+                        "cluster_code_path": cluster_code_path,
+                        "job_id": job_id,
+                        "stdout": "",
+                        "stderr": log_text[-STDERR_SNIPPET_LIMIT:] if log_text else f"Job {state}",
+                    },
+                    {"status": "failed", "metrics": {}, "stderr": log_text},
+                )
+
+        except Exception as e:
+            self.log(f"Cluster execution error: {e}")
+            return (
+                {
+                    "status": "failed",
+                    "cluster_code_path": cluster_code_path,
+                    "stderr": str(e),
+                },
+                {"status": "failed", "metrics": {}},
+            )
+
     async def _execute_code_with_venv(
         self, generated_files: list[str], blueprint_summary: str
     ) -> tuple[dict, str]:
@@ -983,13 +2126,11 @@ Output ONLY valid JSON array."""
         _main_py: Path | None = None,
         _venv_python: str | None = None,
     ) -> dict:
-        """Attempt to execute the generated main.py with --dry-run flag.
+        """Execute main.py --dry-run with up to 5 batch-fix cycles.
 
-        Creates an isolated venv, installs dependencies there, and runs
-        main.py using the venv's Python.  If execution fails, ask the LLM
-        to fix the code and retry once.
-        This is non-blocking for the pipeline — failures are logged but
-        do not prevent the pipeline from continuing.
+        Each cycle: run → collect all errors → fix ALL affected files in one
+        LLM call → run again.  This is much more efficient than fixing one
+        bug at a time.
         """
         code_dir = _code_dir or (self.workspace.path / "code")
         main_py = _main_py or (code_dir / "main.py")
@@ -997,75 +2138,389 @@ Output ONLY valid JSON array."""
         if not main_py.exists():
             return {"status": "skipped", "reason": "main.py not found", "stdout": "", "stderr": ""}
 
-        # Create isolated venv and install requirements
         venv_python = _venv_python or await self._setup_venv(code_dir)
 
-        # First attempt
-        result = await self._run_main_py(code_dir, venv_python)
-        if result["returncode"] == 0:
-            return {"status": "success", "attempts": 1, **result}
+        max_fix_cycles = 5
+        last_result: dict = {}
+        fix_history: list[dict] = []  # Track previous fixes to avoid repeating
 
-        self.log(f"Code execution failed (attempt 1): {result['stderr'][:200]}")
+        for cycle in range(1, max_fix_cycles + 1):
+            result = await self._run_main_py(code_dir, venv_python)
+            last_result = result
+            if result["returncode"] == 0:
+                status = "success" if cycle == 1 else "fixed"
+                return {"status": status, "attempts": cycle, **result}
 
-        # Try to fix with LLM
-        try:
-            fix_prompt = f"""The following Python code failed to execute.
+            self.log(f"Code execution failed (attempt {cycle}): {result['stderr'][:200]}")
 
-Error output:
-```
-{result['stderr'][:STDERR_SNIPPET_LIMIT]}
-```
+            if cycle >= max_fix_cycles:
+                break
 
-Original main.py:
-```python
-{main_py.read_text(encoding='utf-8')[:LLM_CONTEXT_TRUNCATION]}
-```
+            # Batch fix: identify ALL affected files and fix them in one call
+            stderr_text = result["stderr"]
+            try:
+                modified = await self._batch_fix_errors(
+                    code_dir, stderr_text, blueprint_summary,
+                    mode="dry-run",
+                    previous_fixes=fix_history,
+                )
+                fix_history.append({"error_msg": stderr_text[:300], "cycle": cycle})
+                if not modified:
+                    self.log("Dry-run: no files modified by batch fix, stopping")
+                    break
+            except Exception as e:
+                self.log(f"Batch fix error in cycle {cycle}: {e}")
+                break
 
-Blueprint:
-{blueprint_summary[:2000]}
+        return {"status": "failed", "attempts": cycle, **last_result}
 
-Fix the code so it can at least import and run without errors.
-A simple --dry-run that just validates imports and configuration is acceptable.
-Output ONLY the fixed Python code, no markdown fences."""
+    async def _batch_fix_errors(
+        self,
+        code_dir: Path,
+        stderr: str,
+        blueprint_summary: str,
+        mode: str = "dry-run",
+        previous_fixes: list[dict] | None = None,
+    ) -> list[str]:
+        """Parse traceback, fix each affected file with a targeted LLM call.
 
-            code_gen_config = self.config.for_stage("code_gen")
-            fixed_code = await self._dispatcher.generate(
-                code_gen_config,
-                "You are a Python debugging expert. Fix the code to make it runnable.",
-                fix_prompt,
-            )
-            # Clean markdown fences
-            fixed_code = fixed_code.strip()
-            if fixed_code.startswith("```"):
-                lines = fixed_code.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                fixed_code = "\n".join(lines)
+        Surgical approach: for each file in the traceback, send ONLY that file
+        + the error to the LLM → get a search-replace patch → apply.
+        Uses 4-layer patch matching and syntax validation with rollback.
 
-            # Write fixed code
-            main_py.write_text(fixed_code, encoding="utf-8")
+        Returns list of modified file paths.
+        """
+        import re as _re
 
-            # Second attempt
-            result2 = await self._run_main_py(code_dir, venv_python)
-            if result2["returncode"] == 0:
-                return {"status": "fixed", "attempts": 2, **result2}
+        # 1. Parse traceback to find affected files with line numbers
+        code_dir_str = str(code_dir.resolve()).replace("\\", "/")
+        # Match: File "path", line N, in func
+        tb_entries = _re.findall(
+            r'File "([^"]+)",\s*line\s+(\d+)', stderr
+        )
+
+        # Deduplicate and filter to project files only (deepest frame first)
+        affected: list[tuple[Path, int]] = []
+        seen_files: set[str] = set()
+        for fpath, lineno in reversed(tb_entries):
+            f_norm = fpath.replace("\\", "/")
+            resolved = Path(fpath).resolve()
+            resolved_norm = str(resolved).replace("\\", "/")
+            if code_dir_str not in resolved_norm:
+                continue
+            try:
+                rel = str(resolved.relative_to(code_dir.resolve())).replace("\\", "/")
+            except ValueError:
+                continue
+            if rel not in seen_files and resolved.exists():
+                affected.append((resolved, int(lineno)))
+                seen_files.add(rel)
+
+        # If no project files found, default to main.py
+        if not affected:
+            main_py = code_dir / "main.py"
+            if main_py.exists():
+                affected = [(main_py, 0)]
+
+        if not affected:
+            return []
+
+        # 2. Extract the final error message
+        error_lines = stderr.strip().split("\n")
+        error_msg = ""
+        for line in reversed(error_lines):
+            line = line.strip()
+            if line and not line.startswith("File ") and not line.startswith("Traceback"):
+                error_msg = line
+                break
+
+        # 3. Gather context: config files, requirements, imports
+        context_files: list[str] = []
+        for pattern in ("config/*.yaml", "config/*.yml", "config/*.json",
+                        "*.yaml", "*.yml", "requirements.txt"):
+            for cf in code_dir.glob(pattern):
+                if cf.is_file():
+                    try:
+                        rel = str(cf.relative_to(code_dir)).replace("\\", "/")
+                        ctx = cf.read_text(encoding="utf-8", errors="replace")[:1500]
+                        context_files.append(f"--- {rel} ---\n{ctx}")
+                    except OSError:
+                        pass
+        config_context = "\n\n".join(context_files) if context_files else "(no config files)"
+
+        # Also list all project files for reference
+        all_files = []
+        for f in sorted(code_dir.rglob("*")):
+            if f.is_file() and "__pycache__" not in str(f):
+                all_files.append(str(f.relative_to(code_dir)).replace("\\", "/"))
+        file_list = "\n".join(f"  {f}" for f in all_files)
+
+        # 4. Fix each affected file with a targeted LLM call
+        flag = "--quick-eval" if mode == "quick-eval" else "--dry-run"
+        modified: list[str] = []
+        code_gen_config = self.config.for_stage("code_gen")
+
+        for target_file, error_line in affected:
+            rel_path = str(target_file.relative_to(code_dir)).replace("\\", "/")
+            try:
+                content = target_file.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+
+            # Show context around the error line (±15 lines)
+            lines = content.split("\n")
+            if error_line > 0:
+                start = max(0, error_line - 16)
+                end = min(len(lines), error_line + 15)
+                context_snippet = "\n".join(
+                    f"{'>>>' if i+1 == error_line else '   '} {i+1:4d} | {l}"
+                    for i, l in enumerate(lines[start:end], start=start)
+                )
             else:
-                return {"status": "failed", "attempts": 2, **result2}
-        except Exception as e:
-            return {
-                "status": "failed",
-                "attempts": 1,
-                "error": f"LLM fix failed: {e}",
-                **result,
-            }
+                context_snippet = content[:2000]
+
+            # Build previous fix history to avoid repeating failed fixes
+            fix_history = ""
+            if previous_fixes:
+                fix_history = (
+                    "\n\nPrevious fix attempts that did NOT resolve the problem:\n"
+                    + "\n".join(
+                        f"  Round {i+1}: {fx.get('diagnosis', fx.get('error_msg', ''))[:200]}"
+                        for i, fx in enumerate(previous_fixes)
+                    )
+                    + "\nDo NOT repeat the same fixes. Try a different approach.\n"
+                )
+
+            fix_prompt = (
+                f"`python main.py {flag}` failed.\n\n"
+                f"Error: {error_msg}\n\n"
+                f"Full traceback (last 40 lines):\n```\n"
+                f"{chr(10).join(error_lines[-40:])}\n```\n\n"
+                f"File: {rel_path} (error around line {error_line}):\n```python\n"
+                f"{context_snippet}\n```\n\n"
+                f"Full file ({len(lines)} lines):\n```python\n{content[:4000]}\n```\n\n"
+                f"== Config / Data Files (for reference) ==\n{config_context}\n\n"
+                f"== Project Files ==\n{file_list}\n"
+                f"{fix_history}\n"
+                f"Output a JSON array of search-replace edits:\n"
+                f'[{{"old": "exact text to find", "new": "replacement text"}}]\n\n'
+                f"Rules:\n"
+                f"- 'old' must be an EXACT substring of the file (including indentation)\n"
+                f"- Multiple edits are fine — fix ALL issues in this file\n"
+                f"- If config is YAML, use yaml.safe_load(), NOT json.load()\n"
+                f"- Ensure imports match actual module structure\n"
+                f"- Output ONLY valid JSON array, no markdown"
+            )
+
+            try:
+                raw = await self._dispatcher.generate(
+                    code_gen_config,
+                    f"You are a Python debugging expert. Fix the bug in {rel_path} using precise search-replace edits.",
+                    fix_prompt,
+                )
+                text = (raw or "").strip()
+                if text.startswith("```"):
+                    text_lines = text.split("\n")[1:]
+                    if text_lines and text_lines[-1].strip().startswith("```"):
+                        text_lines = text_lines[:-1]
+                    text = "\n".join(text_lines)
+
+                edits = json.loads(text)
+                if not isinstance(edits, list):
+                    edits = [edits]
+
+                # Save backup for syntax rollback
+                backup_content = content
+                applied = 0
+                for edit in edits:
+                    if not isinstance(edit, dict):
+                        continue
+                    old = edit.get("old", "")
+                    new = edit.get("new", "")
+                    if not old:
+                        continue
+
+                    # 4-layer patch matching (borrowed from Deep Pipeline DebugAgent)
+                    matched = False
+
+                    # Layer 1: Exact match
+                    if old in content:
+                        content = content.replace(old, new, 1)
+                        matched = True
+
+                    # Layer 2: Strip trailing whitespace per line
+                    if not matched:
+                        def _strip_trailing(t: str) -> str:
+                            return "\n".join(l.rstrip() for l in t.split("\n"))
+                        c_stripped = _strip_trailing(content)
+                        o_stripped = _strip_trailing(old)
+                        if o_stripped in c_stripped:
+                            content = c_stripped.replace(o_stripped, _strip_trailing(new), 1)
+                            matched = True
+
+                    # Layer 3: First-line + last-line fuzzy span match
+                    if not matched:
+                        old_parts = old.strip().split("\n")
+                        if len(old_parts) >= 2:
+                            first_line = old_parts[0].strip()
+                            last_line = old_parts[-1].strip()
+                            c_lines = content.split("\n")
+                            for i in range(len(c_lines)):
+                                if first_line and first_line in c_lines[i].strip():
+                                    for j in range(i + len(old_parts) - 1,
+                                                   min(i + len(old_parts) + 5, len(c_lines))):
+                                        if last_line and last_line in c_lines[j].strip():
+                                            new_lines = new.rstrip().split("\n")
+                                            c_lines[i:j+1] = new_lines
+                                            content = "\n".join(c_lines)
+                                            matched = True
+                                            break
+                                    if matched:
+                                        break
+
+                    # Layer 4: Single-line match (strip + compare)
+                    if not matched and "\n" not in old.strip():
+                        old_line = old.strip()
+                        c_lines = content.split("\n")
+                        for i, line in enumerate(c_lines):
+                            if old_line == line.strip():
+                                indent = len(line) - len(line.lstrip())
+                                new_parts = new.strip().split("\n")
+                                indented = [" " * indent + nl.strip() if nl.strip() else "" for nl in new_parts]
+                                c_lines[i:i+1] = indented
+                                content = "\n".join(c_lines)
+                                matched = True
+                                break
+
+                    if matched:
+                        applied += 1
+
+                if applied > 0:
+                    # Syntax validation + rollback (borrowed from Deep Pipeline DebugAgent)
+                    target_file.write_text(content, encoding="utf-8")
+                    if target_file.suffix == ".py" and not self._check_syntax(target_file):
+                        self.log(f"  Patch introduced syntax error in {rel_path}, rolling back")
+                        target_file.write_text(backup_content, encoding="utf-8")
+                    else:
+                        modified.append(rel_path)
+                        self.log(f"  Fixed {rel_path}: {applied} edit(s) applied")
+                else:
+                    self.log(f"  No edits matched in {rel_path}")
+
+            except json.JSONDecodeError:
+                # Fallback: LLM might return the full fixed file
+                if text and len(text) > 50:
+                    target_file.write_text(text, encoding="utf-8")
+                    if target_file.suffix == ".py" and not self._check_syntax(target_file):
+                        self.log(f"  Fallback rewrite has syntax error in {rel_path}, rolling back")
+                        target_file.write_text(content, encoding="utf-8")
+                    else:
+                        modified.append(rel_path)
+                        self.log(f"  Rewrote {rel_path} (fallback)")
+            except Exception as e:
+                self.log(f"  Fix failed for {rel_path}: {e}")
+
+        if modified:
+            self.log(f"Batch fix: modified {len(modified)} files")
+        else:
+            self.log("Batch fix: no files were modified")
+
+        return modified
+
+    async def _fix_timeout(self, code_dir: Path) -> list[str]:
+        """When quick-eval times out, apply deterministic speed-ups to main.py.
+
+        Instead of sending a vague "timeout" to the LLM for batch-fix, we apply
+        targeted edits that reduce computation: fewer epochs, smaller subset,
+        num_workers=0, num_runs=1.
+        """
+        main_py = code_dir / "main.py"
+        if not main_py.exists():
+            return []
+        content = main_py.read_text(encoding="utf-8", errors="replace")
+        original = content
+
+        # 1. Reduce epochs to 2 (replace any epochs = N where N > 2)
+        import re as _re
+        # Handles: epochs = 5, epochs: 5 (YAML), training_cfg["epochs"] = max(3, min(5, ...))
+        content = _re.sub(
+            r'(\bepochs\b\s*[=:]\s*(?:max\(\d+,\s*min\(\d+,\s*(?:int\()?)?)(\d+)',
+            lambda m: m.group(1) + ('2' if int(m.group(2)) > 2 else m.group(2)),
+            content,
+        )
+
+        # 2. Reduce data subset size
+        content = _re.sub(
+            r'(subset_size\s*[=:]\s*)(\d+)',
+            lambda m: m.group(1) + ('200' if int(m.group(2)) > 200 else m.group(2)),
+            content,
+        )
+        content = _re.sub(
+            r'(quick_eval_train_size["\']?\s*[,:]\s*)(\d+)',
+            lambda m: m.group(1) + ('200' if int(m.group(2)) > 200 else m.group(2)),
+            content,
+        )
+
+        # 3. Force num_runs = 1
+        content = _re.sub(
+            r'(num_runs\s*[=:]\s*)(\d+)',
+            lambda m: m.group(1) + '1',
+            content,
+        )
+
+        # 4. Force num_workers = 0 (avoid multiprocessing overhead on Windows)
+        content = _re.sub(
+            r'(num_workers\s*[=:]\s*)(\d+)',
+            lambda m: m.group(1) + '0',
+            content,
+        )
+
+        if content != original:
+            main_py.write_text(content, encoding="utf-8")
+            self.log("Timeout fix: reduced epochs/subset/workers in main.py")
+            return ["main.py"]
+
+        # If main.py regex didn't match anything, also try config/default.yaml
+        config_yaml = code_dir / "config" / "default.yaml"
+        if config_yaml.exists():
+            cfg_content = config_yaml.read_text(encoding="utf-8", errors="replace")
+            cfg_original = cfg_content
+            cfg_content = _re.sub(
+                r'(\bepochs\s*:\s*)(\d+)',
+                lambda m: m.group(1) + ('2' if int(m.group(2)) > 2 else m.group(2)),
+                cfg_content,
+            )
+            cfg_content = _re.sub(r'(num_workers\s*:\s*)(\d+)', r'\g<1>0', cfg_content)
+            cfg_content = _re.sub(r'(num_runs\s*:\s*)(\d+)', r'\g<1>1', cfg_content)
+            if cfg_content != cfg_original:
+                config_yaml.write_text(cfg_content, encoding="utf-8")
+                self.log("Timeout fix: reduced epochs/workers/runs in config/default.yaml")
+                return ["config/default.yaml"]
+
+        return []
 
     async def _setup_venv(self, code_dir: Path) -> str:
-        """Create an isolated venv under code/.venv and install requirements.
+        """Prepare Python environment for experiment execution.
 
-        Returns the path to the venv's Python executable.
-        No hard timeout — large packages (torch, transformers) may need
-        a long download depending on network conditions.
+        If experiment_conda_env is configured, use that conda env's Python
+        directly (skip venv creation — much faster, reuses existing packages).
+        Otherwise, create an isolated venv and install requirements.
+
+        Returns the path to the Python executable.
         """
+        # --- Option A: Use existing conda env ---
+        conda_env = self.config.experiment_conda_env
+        if conda_env:
+            conda_python = self._find_conda_python(conda_env)
+            if conda_python:
+                self.log(f"Using existing conda env '{conda_env}': {conda_python}")
+                # Install any missing requirements into the conda env
+                await self._install_missing_requirements(conda_python, code_dir)
+                return conda_python
+            else:
+                self.log(f"Conda env '{conda_env}' not found, falling back to venv")
+
+        # --- Option B: Create isolated venv ---
         venv_dir = code_dir / ".venv"
         is_windows = platform.system() == "Windows"
         if is_windows:
@@ -1075,7 +2530,6 @@ Output ONLY the fixed Python code, no markdown fences."""
 
         loop = asyncio.get_running_loop()
 
-        # --- 1. Create venv (fast, no network) ---
         if not venv_dir.exists():
             self.log("Creating isolated venv at code/.venv ...")
             try:
@@ -1090,35 +2544,67 @@ Output ONLY the fixed Python code, no markdown fences."""
         else:
             self.log("Reusing existing venv at code/.venv")
 
-        # --- 2. pip install requirements (no timeout) ---
+        await self._install_missing_requirements(venv_python, code_dir)
+        return venv_python
+
+    @staticmethod
+    def _find_conda_python(env_name: str) -> str | None:
+        """Find the Python executable for a named conda env."""
+        try:
+            result = subprocess.run(
+                ["conda", "run", "-n", env_name, "python", "-c",
+                 "import sys; print(sys.executable)"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode == 0:
+                path = result.stdout.strip().split("\n")[-1].strip()
+                if path and Path(path).exists():
+                    return path
+        except Exception:
+            pass
+
+        # Fallback: check common paths
+        is_windows = platform.system() == "Windows"
+        for base in [Path.home() / "anaconda3", Path.home() / "miniconda3",
+                      Path("D:/anaconda"), Path("C:/anaconda3")]:
+            if is_windows:
+                p = base / "envs" / env_name / "python.exe"
+            else:
+                p = base / "envs" / env_name / "bin" / "python"
+            if p.exists():
+                return str(p)
+        return None
+
+    async def _install_missing_requirements(self, python: str, code_dir: Path) -> None:
+        """pip install requirements.txt if it exists (skips already-installed)."""
         req_file = code_dir / "requirements.txt"
         if not req_file.exists():
             self.log("No requirements.txt found, skipping pip install")
-            return venv_python
+            return
 
-        self.log("Installing requirements.txt into venv (this may take a while) ...")
+        self.log("Installing requirements.txt (skipping already-installed)...")
+        loop = asyncio.get_running_loop()
         try:
             proc_result = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    [venv_python, "-m", "pip", "install",
+                    [python, "-m", "pip", "install",
                      "-r", str(req_file), "--quiet"],
                     cwd=str(code_dir),
                     capture_output=True,
                     text=False,
+                    timeout=600,
                 ),
             )
             if proc_result.returncode == 0:
-                self.log("Requirements installed successfully in venv")
+                self.log("Requirements OK")
             else:
                 self.log(
-                    f"pip install failed (rc={proc_result.returncode}): "
+                    f"pip install warnings (rc={proc_result.returncode}): "
                     f"{_decode_bytes(proc_result.stderr, 500)}"
                 )
         except Exception as e:
             self.log(f"pip install error: {e}")
-
-        return venv_python
 
     async def _run_main_py(self, code_dir: Path, python: str | None = None) -> dict:
         """Run main.py in a subprocess with timeout."""

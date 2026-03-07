@@ -78,10 +78,34 @@ def _setup_logging(verbose: bool = False) -> None:
 def _load_config_safe(config_path: Path | None) -> ResearchConfig:
     """Load config with user-friendly error messages."""
     try:
-        return ResearchConfig.load(config_path)
+        cfg = ResearchConfig.load(config_path)
     except (RuntimeError, ValueError) as exc:
         console.print(f"[red]Configuration error:[/red] {exc}")
         raise typer.Exit(1)
+
+    # Propagate optional third-party API keys from config.json → env vars
+    _propagate_api_keys(config_path)
+    return cfg
+
+
+def _propagate_api_keys(config_path: Path | None) -> None:
+    """Read optional API keys from config.json and set as env vars."""
+    path = config_path or Path.home() / ".nanobot" / "config.json"
+    if not path.is_file():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    research = data.get("research", {})
+    key_map = {
+        "openalex_api_key": "OPENALEX_API_KEY",
+        "s2_api_key": "S2_API_KEY",
+    }
+    for json_key, env_key in key_map.items():
+        val = research.get(json_key, "")
+        if val and not os.environ.get(env_key):
+            os.environ[env_key] = str(val)
 
 
 def _load_workspace_safe(path: Path) -> Workspace:
@@ -529,3 +553,27 @@ def inspect(
             exists = (ws.path / path).is_file()
             icon = "[green]exists[/green]" if exists else "[dim]missing[/dim]"
             console.print(f"  {name:12s} {icon}  ({path})")
+
+
+@app.command()
+def feishu(
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """启动飞书机器人，通过飞书消息触发 NanoResearch pipeline。
+
+    需要先在飞书开放平台创建应用并配置 App ID/Secret。
+    凭证通过环境变量 FEISHU_APP_ID/FEISHU_APP_SECRET 或
+    ~/.nanobot/config.json 中的 feishu.app_id/app_secret 配置。
+    """
+    _setup_logging(verbose)
+    from nanoresearch.feishu_bot import main as feishu_main
+    console.print(Panel(
+        "[bold]NanoResearch 飞书机器人[/bold]\n\n"
+        "在飞书中给机器人发消息即可启动 pipeline。\n"
+        "支持的命令：/run <主题>、/status、/list、/stop、/help\n"
+        "或直接发送研究主题。\n\n"
+        "按 Ctrl+C 停止。",
+        title="Feishu Bot",
+        border_style="blue",
+    ))
+    feishu_main()

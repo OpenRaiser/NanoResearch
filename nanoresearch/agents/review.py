@@ -77,6 +77,12 @@ class ReviewAgent(BaseResearchAgent):
         if figure_issues:
             self.log(f"Found {len(figure_issues)} figure alignment issues")
 
+        # Step 2d: Citation coverage check
+        citation_issues = self._check_citation_coverage(paper_tex, ideation_output)
+        review.consistency_issues.extend(citation_issues)
+        if citation_issues:
+            self.log(f"Found {len(citation_issues)} citation coverage issues")
+
         # Step 2b: Fix incoherent reviews (low score but no issues)
         for sr in review.section_reviews:
             if sr.score < MIN_SECTION_SCORE and not sr.issues:
@@ -137,6 +143,25 @@ class ReviewAgent(BaseResearchAgent):
             # Apply this round's revisions to get updated tex for re-review
             if round_revised:
                 current_tex = self._apply_revisions(current_tex, round_revised)
+
+                # Backpressure: verify revision didn't break LaTeX structure
+                # Quick structural checks (no compilation — that happens at the end)
+                bp_issues = []
+                begins = len(re.findall(r'\\begin\{', current_tex))
+                ends = len(re.findall(r'\\end\{', current_tex))
+                if begins != ends:
+                    bp_issues.append(f"Unbalanced environments: {begins} \\begin vs {ends} \\end")
+                if '\\documentclass' not in current_tex:
+                    bp_issues.append("Missing \\documentclass")
+                if '\\end{document}' not in current_tex:
+                    bp_issues.append("Missing \\end{document}")
+                if bp_issues:
+                    self.log(f"  Backpressure FAILED: {bp_issues}, reverting round {revision_round}")
+                    # Revert this round's changes
+                    for sec_name in round_revised:
+                        review.revised_sections.pop(sec_name, None)
+                    current_tex = self._apply_revisions(paper_tex, review.revised_sections)
+                    continue  # skip re-review, try next round
 
             # Re-run all consistency checks after revision
             review.consistency_issues = self._run_consistency_checks(current_tex)
@@ -288,6 +313,30 @@ class ReviewAgent(BaseResearchAgent):
 
             # Sanitize the revised LaTeX (fix Unicode, LLM artifacts, etc.)
             revised_tex = self._sanitize_revised_tex(revised_tex)
+
+            # Deduplicate figures: keep only the first occurrence of each figure
+            seen_fig_labels: set[str] = set()
+            seen_fig_files: set[str] = set()
+            def _dedup_fig(m: re.Match) -> str:
+                block = m.group(0)
+                label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
+                if label_m:
+                    lbl = label_m.group(1)
+                    if lbl in seen_fig_labels:
+                        return ""
+                    seen_fig_labels.add(lbl)
+                file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
+                if file_m:
+                    fname = file_m.group(1)
+                    if fname in seen_fig_files:
+                        return ""
+                    seen_fig_files.add(fname)
+                return block
+            revised_tex = re.sub(
+                r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
+                _dedup_fig, revised_tex, flags=re.DOTALL,
+            )
+            revised_tex = re.sub(r'\n{3,}', '\n\n', revised_tex)
 
             # Resolve any new citations introduced during revision
             bib_path = self.workspace.path / "drafts" / "references.bib"
@@ -1020,6 +1069,70 @@ Return JSON:
 
         return issues
 
+    def _check_citation_coverage(self, tex: str, ideation_output: dict) -> list[ConsistencyIssue]:
+        """Check citation coverage: total count and must-cite enforcement."""
+        import re
+        issues: list[ConsistencyIssue] = []
+
+        # Count total unique citations
+        cite_pattern = re.compile(r"\\cite[tp]?\{([^}]+)\}")
+        cited: set[str] = set()
+        for m in cite_pattern.finditer(tex):
+            for k in m.group(1).split(","):
+                k = k.strip()
+                if k:
+                    cited.add(k)
+
+        total = len(cited)
+        if total < 10:
+            issues.append(ConsistencyIssue(
+                issue_type="low_citation_count",
+                description=(
+                    f"Paper has only {total} unique citations. "
+                    "A top-venue paper typically needs 25+ citations. "
+                    "Add more references, especially in Related Work and Introduction."
+                ),
+                severity="high",
+                locations=["Related Work", "Introduction"],
+            ))
+        elif total < 20:
+            issues.append(ConsistencyIssue(
+                issue_type="moderate_citation_count",
+                description=(
+                    f"Paper has {total} unique citations. "
+                    "Consider adding more to strengthen Related Work (target: 25+)."
+                ),
+                severity="medium",
+                locations=["Related Work"],
+            ))
+
+        # Check Related Work section specifically
+        rw_pattern = re.compile(
+            r'\\section\{Related Work\}(.*?)(?=\\section\{|\\end\{document\})',
+            re.DOTALL
+        )
+        rw_match = rw_pattern.search(tex)
+        if rw_match:
+            rw_content = rw_match.group(1)
+            rw_cited: set[str] = set()
+            for m in cite_pattern.finditer(rw_content):
+                for k in m.group(1).split(","):
+                    k = k.strip()
+                    if k:
+                        rw_cited.add(k)
+            if len(rw_cited) < 10:
+                issues.append(ConsistencyIssue(
+                    issue_type="sparse_related_work_citations",
+                    description=(
+                        f"Related Work has only {len(rw_cited)} unique citations. "
+                        "A thorough survey needs 15+ citations minimum."
+                    ),
+                    severity="medium",
+                    locations=["Related Work"],
+                ))
+
+        return issues
+
     def _check_figure_text_alignment(self, tex: str) -> list[ConsistencyIssue]:
         """Check that figure references match figure definitions."""
         import re
@@ -1056,6 +1169,7 @@ Return JSON:
 
         try:
             from nanoresearch.agents.checkers import (
+                check_ai_writing_patterns,
                 check_bare_special_chars,
                 check_latex_consistency,
                 check_math_formulas,
@@ -1070,6 +1184,7 @@ Return JSON:
                 check_bare_special_chars,
                 check_unicode_issues,
                 validate_equations_sympy,
+                check_ai_writing_patterns,
             ):
                 try:
                     for issue in checker(tex):
@@ -1190,27 +1305,52 @@ Return JSON:
 
     @staticmethod
     def _sanitize_revised_tex(tex: str) -> str:
-        """Sanitize revised LaTeX using WritingAgent's sanitizer."""
+        """Sanitize revised LaTeX using WritingAgent's sanitizer.
+
+        Falls back to inline critical fixes if WritingAgent import fails.
+        """
         try:
             from nanoresearch.agents.writing import WritingAgent
             tex = WritingAgent._sanitize_latex(tex)
-        except ImportError:
-            logger.debug("WritingAgent not available for sanitization, skipping")
+        except Exception as exc:
+            logger.warning("WritingAgent._sanitize_latex failed (%s), applying inline fixes", exc)
+            # Inline fallback: at minimum fix the most critical issues
+            import re as _re
+            # [H]/[h]/[h!] → [t!] (preserve * for column-spanning variants)
+            tex = _re.sub(r'\\begin\{figure\}\s*\[[Hh]!?\]', r'\\begin{figure}[t!]', tex)
+            tex = _re.sub(r'\\begin\{figure\*\}\s*\[[Hh]!?\]', r'\\begin{figure*}[t!]', tex)
+            tex = _re.sub(r'\\begin\{table\}\s*\[[Hh]!?\]', r'\\begin{table}[t!]', tex)
+            tex = _re.sub(r'\\begin\{table\*\}\s*\[[Hh]!?\]', r'\\begin{table*}[t!]', tex)
+            # Unicode dashes
+            tex = tex.replace("\u2014", "---").replace("\u2013", "--")
+            tex = tex.replace("\u201c", "``").replace("\u201d", "''")
         return tex
 
     async def _compile_pdf_with_fix_loop(self, tex_path: Path) -> dict:
         """Compile LaTeX to PDF with automatic error-fix loop.
 
         If compilation fails, feed the error back to the LLM, apply the fix,
-        and retry up to MAX_LATEX_FIX_ATTEMPTS times. This mirrors the
-        WritingAgent's _compile_pdf logic.
+        and retry up to MAX_LATEX_FIX_ATTEMPTS times.
+
+        Safety features (OpenClaw-inspired):
+        - Backs up original tex before fix loop; restores on total failure
+        - Post-write verification: re-reads file to confirm write succeeded
         """
+        import shutil
+
         try:
             from mcp_server.tools.pdf_compile import compile_pdf
         except ImportError:
             return {"error": "PDF compiler module not available"}
 
         tex_path = Path(tex_path)
+
+        # Backup original tex before any fix attempts
+        backup_path = tex_path.with_suffix('.tex.bak')
+        try:
+            shutil.copy2(tex_path, backup_path)
+        except OSError:
+            pass  # non-fatal
 
         result: dict = {}
         for attempt in range(MAX_LATEX_FIX_ATTEMPTS + 1):
@@ -1235,6 +1375,13 @@ Return JSON:
 
             if attempt >= MAX_LATEX_FIX_ATTEMPTS:
                 self.log(f"PDF compilation failed after {MAX_LATEX_FIX_ATTEMPTS} fix attempts")
+                # Restore backup on total failure
+                if backup_path.exists():
+                    try:
+                        shutil.copy2(backup_path, tex_path)
+                        self.log("  Restored original tex from backup")
+                    except OSError:
+                        pass
                 return result
 
             # Feed error to LLM and fix
@@ -1258,6 +1405,15 @@ Return JSON:
                 except OSError as exc:
                     logger.error("Cannot write fixed tex file: %s", exc)
                     return result
+                # Post-write verification
+                try:
+                    verify = tex_path.read_text(encoding="utf-8")
+                    if verify != fixed_tex:
+                        self.log("  WARNING: post-write verification failed, reverting")
+                        tex_path.write_text(current_tex, encoding="utf-8")
+                        return result
+                except OSError:
+                    pass
                 self.log(f"  Applied LLM fix (attempt {attempt + 1})")
             else:
                 self.log("  LLM returned no changes, aborting fix loop")
@@ -1266,163 +1422,367 @@ Return JSON:
         return result
 
     async def _fix_latex_errors(self, tex_source: str, error_log: str) -> str | None:
-        """Fix LaTeX compilation errors using surgical line-level replacement.
+        """Fix LaTeX compilation errors using a 2-level strategy.
 
-        Instead of asking the LLM to return the entire document, we:
-        1. Extract the error line number from the error log
-        2. Send only ±10 lines around the error to the LLM
-        3. LLM returns ONLY the fixed lines
-        4. We splice them back into the original document
+        Level 1: Deterministic fixes (no LLM) — Unicode, missing packages, preamble junk
+        Level 2: Search-replace LLM fix — LLM outputs {"old":"...","new":"..."} pairs,
+                 applied via str.replace(). Safe: no match = no change.
 
-        Falls back to full-document mode only when no line number is found.
+        Inspired by OpenClaw's edit tool: minimal LLM output, exact text matching.
+        NEVER sends the full document to the LLM for rewriting.
         """
         if len(error_log) > 3000:
             error_log = error_log[:1500] + "\n...[truncated]...\n" + error_log[-1500:]
 
-        # Extract error line number
-        error_line = None
-        line_match = re.search(r'(?:line\s+|l\.)(\d+)', error_log)
-        if line_match:
-            error_line = int(line_match.group(1))
+        # Extract error line number(s) — prioritize actual error lines over warnings
+        error_lines: list[int] = []
+        for log_line in error_log.split('\n'):
+            if 'error:' in log_line.lower():
+                for m in re.finditer(r'\.tex:(\d+):', log_line):
+                    ln = int(m.group(1))
+                    if ln not in error_lines:
+                        error_lines.append(ln)
+                for m in re.finditer(r'(?:input line\s+|line\s+|l\.)(\d+)', log_line):
+                    ln = int(m.group(1))
+                    if ln not in error_lines:
+                        error_lines.append(ln)
+        # Fallback: any line number in the full error log
+        if not error_lines:
+            for m in re.finditer(r'(?:\.tex:(\d+):)', error_log):
+                ln = int(m.group(1))
+                if ln not in error_lines:
+                    error_lines.append(ln)
+            for m in re.finditer(r'(?:line\s+|l\.)(\d+)', error_log):
+                ln = int(m.group(1))
+                if ln not in error_lines:
+                    error_lines.append(ln)
+        error_line = error_lines[0] if error_lines else None
 
         tex_lines = tex_source.split('\n')
-
-        # Classify error for targeted guidance
         error_lower = error_log.lower()
-        targeted_hint = ""
+
+        # ──────────── Level 1: Deterministic fixes ────────────
+        fixed_deterministic = self._try_deterministic_fix(tex_source, tex_lines, error_log, error_lower, error_line)
+        if fixed_deterministic and fixed_deterministic != tex_source:
+            self.log("  Level 1: deterministic fix applied")
+            return fixed_deterministic
+
+        # Classify error for LLM hint
+        targeted_hint = self._classify_error(error_lower)
+
+        # ──────────── Level 2: Search-replace LLM fix ────────────
+        # LLM outputs {"old": "...", "new": "..."} pairs, we apply with str.replace().
+        # Safe: if old text not found, nothing changes.
+        result = await self._search_replace_llm_fix(
+            tex_source, tex_lines, error_line, error_log, targeted_hint
+        )
+        if result:
+            return result
+
+        self.log("  All fix levels exhausted, no fix found")
+        return None
+
+    def _try_deterministic_fix(
+        self,
+        tex_source: str,
+        tex_lines: list[str],
+        error_log: str,
+        error_lower: str,
+        error_line: int | None,
+    ) -> str | None:
+        """Level 1: Apply deterministic fixes that don't need LLM."""
+        modified = tex_source
+
+        # 1. Garbage before \documentclass
+        dc_match = re.search(r'\\documentclass[\[{]', modified)
+        if dc_match and dc_match.start() > 0:
+            # Check if there's real content before \documentclass (not just comments)
+            prefix = modified[:dc_match.start()]
+            if re.search(r'[a-zA-Z]', prefix.replace('%', '')):
+                modified = modified[dc_match.start():]
+                self.log("  Deterministic: removed junk before \\documentclass")
+
+        # 2. Missing \end{document}
+        if "\\begin{document}" in modified and "\\end{document}" not in modified:
+            modified += "\n\\end{document}\n"
+            self.log("  Deterministic: added missing \\end{document}")
+
+        # 3. Unicode replacements (common compilation killers)
+        unicode_map = {
+            "\u2018": "`", "\u2019": "'", "\u201c": "``", "\u201d": "''",
+            "\u2014": "---", "\u2013": "--", "\u2026": "\\ldots{}",
+            "\u00d7": "$\\times$", "\u2264": "$\\leq$", "\u2265": "$\\geq$",
+            "\u2260": "$\\neq$", "\u221e": "$\\infty$", "\u03b1": "$\\alpha$",
+            "\u03b2": "$\\beta$", "\u03b3": "$\\gamma$", "\u03b4": "$\\delta$",
+            "\u03bb": "$\\lambda$", "\u03c0": "$\\pi$", "\u03c3": "$\\sigma$",
+            "\u2192": "$\\rightarrow$", "\u2190": "$\\leftarrow$",
+            "\u00b1": "$\\pm$", "\u2248": "$\\approx$",
+            "\u00e9": "{\\'e}",
+        }
+        if "invalid" in error_lower or "character" in error_lower or "unicode" in error_lower:
+            for char, repl in unicode_map.items():
+                if char in modified:
+                    modified = modified.replace(char, repl)
+                    self.log(f"  Deterministic: replaced U+{ord(char):04X}")
+
+            # Control characters (0x00-0x1F except \t \n \r)
+            control_map = {
+                '\x00': '', '\x01': '', '\x02': '', '\x03': '', '\x04': '',
+                '\x05': '', '\x06': '', '\x07': '', '\x08': '',
+                '\x0B': '', '\x0C': '', '\x0E': '', '\x0F': '',
+                '\x10': '', '\x11': '', '\x12': '', '\x13': '', '\x14': '',
+                '\x15': '', '\x16': '', '\x17': '', '\x18': '', '\x19': '',
+                '\x1A': '', '\x1B': '', '\x1C': '', '\x1D': '', '\x1E': '', '\x1F': '',
+            }
+            for char, repl in control_map.items():
+                if char in modified:
+                    modified = modified.replace(char, repl)
+                    self.log(f"  Deterministic: removed control char 0x{ord(char):02X}")
+
+        # 4. Missing packages — check for known undefined control sequences
+        preamble_end = modified.find("\\begin{document}")
+        if preamble_end > 0:
+            preamble = modified[:preamble_end]
+            package_fixes = {
+                "\\multirow": ("multirow", "\\usepackage{multirow}"),
+                # \multicolumn is a core LaTeX command — no package needed; omitted
+                "\\toprule": ("booktabs", "\\usepackage{booktabs}"),
+                "\\midrule": ("booktabs", "\\usepackage{booktabs}"),
+                "\\bottomrule": ("booktabs", "\\usepackage{booktabs}"),
+                "\\FloatBarrier": ("placeins", "\\usepackage{placeins}"),
+                "\\url{": ("url", "\\usepackage{url}"),
+                "\\href{": ("hyperref", "\\usepackage{hyperref}"),
+                "\\textcolor": ("xcolor", "\\usepackage{xcolor}"),
+                "\\cellcolor": ("xcolor", "\\usepackage[table]{xcolor}"),
+            }
+            if "undefined control sequence" in error_lower:
+                for cmd, (pkg, use_line) in package_fixes.items():
+                    if cmd in modified and pkg not in preamble:
+                        # Insert before \begin{document}
+                        modified = modified[:preamble_end] + use_line + "\n" + modified[preamble_end:]
+                        preamble_end += len(use_line) + 1
+                        self.log(f"  Deterministic: added {use_line}")
+
+        # 5. Mismatched environments at the error line
+        # Use modified (not original tex_lines) since prior steps may have changed line counts
+        modified_lines = modified.split('\n')
+        if error_line and error_line <= len(modified_lines):
+            err_line_text = modified_lines[error_line - 1]
+            # Common: \begin{figure} without matching \end{figure}
+            for env in ("figure", "figure*", "table", "table*", "align", "equation"):
+                begin_tag = f"\\begin{{{env}}}"
+                end_tag = f"\\end{{{env}}}"
+                if begin_tag in err_line_text or end_tag in err_line_text:
+                    begin_count = modified.count(begin_tag)
+                    end_count = modified.count(end_tag)
+                    if begin_count > end_count:
+                        # Missing \end — insert before \end{document}
+                        end_doc = modified.rfind("\\end{document}")
+                        if end_doc > 0:
+                            modified = modified[:end_doc] + end_tag + "\n\n" + modified[end_doc:]
+                            self.log(f"  Deterministic: added missing {end_tag}")
+                    elif end_count > begin_count:
+                        # Extra \end — remove the one at error line
+                        if error_line - 1 < len(modified_lines) and end_tag in modified_lines[error_line - 1]:
+                            modified_lines[error_line - 1] = modified_lines[error_line - 1].replace(end_tag, '', 1)
+                            modified = '\n'.join(modified_lines)
+                            self.log(f"  Deterministic: removed extra {end_tag} at line {error_line}")
+
+        return modified if modified != tex_source else None
+
+    @staticmethod
+    def _classify_error(error_lower: str) -> str:
+        """Classify LaTeX error for targeted LLM guidance."""
         if "invalid character" in error_lower or "unicode" in error_lower or "character" in error_lower:
-            targeted_hint = (
+            return (
                 "Likely cause: Unicode characters (em-dash, en-dash, smart quotes, "
                 "non-ASCII). Replace with LaTeX equivalents: --- for em-dash, -- for "
                 "en-dash, standard quotes, \\alpha etc."
             )
-        elif "undefined control sequence" in error_lower:
-            targeted_hint = "Likely cause: Typo in command name or missing \\usepackage."
-        elif "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
-            targeted_hint = "Likely cause: Mismatched \\begin/\\end environments."
-        elif "missing \\begin{document}" in error_lower:
-            targeted_hint = "Likely cause: Non-LaTeX content before \\begin{document}."
+        if "undefined control sequence" in error_lower:
+            return "Likely cause: Typo in command name or missing \\usepackage."
+        if "ended by" in error_lower:
+            return (
+                "Likely cause: \\begin{X} ended by \\end{Y} — typo in environment name. "
+                "Check for misspelled environment names like 'equaton' vs 'equation'."
+            )
+        if "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
+            return "Likely cause: Mismatched \\begin/\\end environments."
+        if "missing \\begin{document}" in error_lower:
+            return "Likely cause: Non-LaTeX content before \\begin{document}."
+        if "missing $" in error_lower:
+            return "Likely cause: Math symbols used outside math mode. Wrap with $...$."
+        if "extra }" in error_lower or "missing {" in error_lower or "missing }" in error_lower:
+            return (
+                "Likely cause: Mismatched braces { }. Look for an extra } or missing { "
+                "near the error line. Count braces carefully in math formulas like \\frac{}{}."
+            )
+        if "extra alignment" in error_lower or "misplaced" in error_lower:
+            return "Likely cause: & used outside tabular, or wrong number of columns in table."
+        return ""
 
-        # ---- Surgical mode: line number known ----
+    async def _search_replace_llm_fix(
+        self,
+        tex_source: str,
+        tex_lines: list[str],
+        error_line: int | None,
+        error_log: str,
+        targeted_hint: str,
+    ) -> str | None:
+        """Level 2: Search-replace fix — LLM outputs exact old/new text pairs.
+
+        Inspired by OpenClaw's edit tool: the LLM identifies the broken text
+        and provides a replacement. We apply it with str.replace().
+        If the old text isn't found, nothing is changed (safe by design).
+        """
+        # Build context snippet around error for LLM to see
         if error_line and error_line <= len(tex_lines):
-            err_idx = error_line - 1  # 0-indexed
-            window_radius = 10
-            win_start = max(0, err_idx - window_radius)
-            win_end = min(len(tex_lines), err_idx + window_radius + 1)
-            snippet_lines = tex_lines[win_start:win_end]
+            err_idx = error_line - 1
+            win_start = max(0, err_idx - 20)
+            win_end = min(len(tex_lines), err_idx + 20 + 1)
 
-            # Number lines for clarity
-            numbered = "\n".join(
-                f"{win_start + i + 1:>5}: {line}"
-                for i, line in enumerate(snippet_lines)
-            )
-
-            system = (
-                "You are a LaTeX error fixer. You will receive a small snippet of "
-                "LaTeX lines around an error. Fix ONLY the broken lines.\n\n"
-                "Rules:\n"
-                "- Return ONLY the fixed lines (same count as input, no line numbers)\n"
-                "- Do NOT add or remove lines — keep exactly the same number of lines\n"
-                "- Do NOT wrap in markdown fences\n"
-                "- Change as little as possible — only fix the error"
-            )
-
-            prompt = (
-                f"LaTeX compilation error at line {error_line}:\n"
-                f"{error_log}\n\n"
-                f"{targeted_hint}\n\n"
-                f"Lines {win_start + 1}-{win_end} of the document:\n"
-                f"{numbered}\n\n"
-                f"Return the fixed version of these {len(snippet_lines)} lines. "
-                f"Output EXACTLY {len(snippet_lines)} lines, no more, no less."
-            )
-
-            revision_config = self.config.for_stage("revision")
-            try:
-                fixed_text = await self.generate(
-                    system, prompt, stage_override=revision_config
-                )
-                fixed_text = fixed_text.strip()
-                # Strip markdown fences
-                if fixed_text.startswith("```"):
-                    flines = fixed_text.split("\n")
-                    flines = flines[1:]
-                    if flines and flines[-1].strip().startswith("```"):
-                        flines = flines[:-1]
-                    fixed_text = "\n".join(flines)
-                # Strip any line number prefixes the LLM might add
-                fixed_lines = fixed_text.split('\n')
-                cleaned = []
-                for fl in fixed_lines:
-                    stripped = re.sub(r'^\s*\d+\s*:\s?', '', fl)
-                    cleaned.append(stripped)
-                fixed_lines = cleaned
-
-                # Validate: should be roughly same line count
-                if abs(len(fixed_lines) - len(snippet_lines)) <= 2:
-                    # Splice back
-                    new_lines = tex_lines[:win_start] + fixed_lines + tex_lines[win_end:]
-                    result = '\n'.join(new_lines)
-                    self.log(
-                        f"  Surgical fix: replaced lines {win_start+1}-{win_end} "
-                        f"({len(snippet_lines)}→{len(fixed_lines)} lines)"
-                    )
-                    return result
-                else:
-                    self.log(
-                        f"  Surgical fix line count mismatch: "
-                        f"expected ~{len(snippet_lines)}, got {len(fixed_lines)}, "
-                        f"falling back to full-document mode"
-                    )
-            except Exception as exc:
-                self.log(f"  Surgical fix failed: {exc}, falling back")
-
-        # ---- Fallback: no line number or surgical fix failed ----
-        # Send a compact snippet (preamble + end) and ask for full doc
-        if len(tex_source) > 40000:
-            tex_for_prompt = (
-                '\n'.join(tex_lines[:80])
-                + "\n% ... [middle omitted] ...\n"
-                + '\n'.join(tex_lines[-50:])
-            )
+            # Expand to environment boundaries
+            env_stack: list[int] = []
+            for i in range(win_start, win_end):
+                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    env_stack.append(i)
+                if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    if env_stack:
+                        env_stack.pop()
+            if env_stack:
+                for i in range(win_end, min(len(tex_lines), win_end + 30)):
+                    if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                        win_end = i + 1
+                        env_stack.pop()
+                        if not env_stack:
+                            break
+            for i in range(win_start - 1, max(-1, win_start - 30), -1):
+                if i < 0:
+                    break
+                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
+                    win_start = i
+                    break
         else:
-            tex_for_prompt = tex_source
+            # No line number — show preamble + first 40 lines
+            win_start = 0
+            win_end = min(len(tex_lines), 40)
+
+        snippet_lines = tex_lines[win_start:win_end]
+        numbered = "\n".join(
+            f"{win_start + i + 1:>5}: {line}"
+            for i, line in enumerate(snippet_lines)
+        )
 
         system = (
-            "You are a LaTeX expert. Fix the compilation errors.\n"
-            "Return the COMPLETE fixed LaTeX document.\n"
-            "Do NOT wrap in markdown fences. Output ONLY LaTeX source.\n"
-            "Must start with \\documentclass and end with \\end{document}."
+            "You are a LaTeX error fixer. You will see a code snippet with an error.\n\n"
+            "Your job: identify the EXACT broken text and provide a replacement.\n\n"
+            "Reply with ONLY a JSON array of edit operations:\n"
+            '[\n'
+            '  {"old": "exact broken text from the snippet", "new": "fixed replacement text"}\n'
+            ']\n\n'
+            "Rules:\n"
+            "- old MUST be an EXACT substring copied from the snippet (including whitespace)\n"
+            "- old should be as SHORT as possible — just the broken part + enough context to be unique\n"
+            "- new is the corrected version of old\n"
+            "- You may include multiple edits if there are multiple errors\n"
+            "- Output ONLY the JSON array, nothing else\n"
+            "- Do NOT wrap in markdown fences"
         )
+
+        line_ref = f" at line {error_line}" if error_line else ""
         prompt = (
-            f"=== ERROR ===\n{error_log}\n=== END ERROR ===\n"
+            f"LaTeX compilation error{line_ref}:\n"
+            f"{error_log}\n\n"
             f"{targeted_hint}\n\n"
-            f"=== LATEX SOURCE ===\n{tex_for_prompt}\n=== END SOURCE ===\n\n"
-            f"Fix the error and return the complete document."
+            f"Code snippet (lines {win_start + 1}-{win_end}):\n"
+            f"{numbered}\n\n"
+            f"Provide the search-replace edits as a JSON array."
         )
 
         revision_config = self.config.for_stage("revision")
         try:
-            fixed = await self.generate(
-                system, prompt, stage_override=revision_config
-            )
-            fixed = fixed.strip()
-            if fixed.startswith("```"):
-                lines = fixed.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                fixed = "\n".join(lines)
-            if "\\documentclass" in fixed:
-                idx = fixed.index("\\documentclass")
-                if idx > 0:
-                    fixed = fixed[idx:]
-            if "\\documentclass" not in fixed:
-                self.log("  LLM fix missing \\documentclass, discarding")
+            raw = await self.generate(system, prompt, stage_override=revision_config)
+            edits = self._parse_edit_json(raw)
+
+            if not edits:
+                self.log("  Level 2: LLM returned no valid edits")
                 return None
-            return fixed
-        except Exception as e:
-            logger.warning("LLM latex fix failed: %s", e)
-            return None
+
+            result = tex_source
+            applied = 0
+            for edit in edits:
+                old = edit.get("old", "")
+                new = edit.get("new", "")
+                if not old or old == new:
+                    continue
+                if old in result:
+                    result = result.replace(old, new, 1)
+                    applied += 1
+                    self.log(f"  Level 2: applied edit ({len(old)} chars → {len(new)} chars)")
+                else:
+                    # Try with normalized whitespace as fallback
+                    old_norm = ' '.join(old.split())
+                    result_lines = result.split('\n')
+                    matched = False
+                    for line_idx, line in enumerate(result_lines):
+                        line_norm = ' '.join(line.split())
+                        if old_norm in line_norm:
+                            # Replace only the matched fragment, not the entire line
+                            indent = line[:len(line) - len(line.lstrip())]
+                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
+                            result_lines[line_idx] = indent + new_line_norm
+                            result = '\n'.join(result_lines)
+                            applied += 1
+                            self.log(f"  Level 2: applied edit with whitespace normalization")
+                            matched = True
+                            break
+                    if not matched:
+                        self.log(f"  Level 2: old text not found, skipping edit")
+
+            if applied > 0 and result != tex_source:
+                self.log(f"  Level 2: {applied} edit(s) applied successfully")
+                return result
+
+        except Exception as exc:
+            self.log(f"  Level 2 search-replace fix failed: {exc}")
+
+        return None
+
+    @staticmethod
+    def _parse_edit_json(raw: str) -> list[dict]:
+        """Parse LLM output as JSON array of {"old": ..., "new": ...} edits."""
+        import json
+
+        raw = raw.strip()
+        # Strip markdown fences
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = lines[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        # Try direct JSON parse
+        try:
+            data = json.loads(raw)
+            if isinstance(data, list):
+                return [e for e in data if isinstance(e, dict) and "old" in e and "new" in e]
+            if isinstance(data, dict) and "old" in data and "new" in data:
+                return [data]
+        except json.JSONDecodeError:
+            pass
+
+        # Try to extract JSON array from surrounding text
+        arr_match = re.search(r'\[.*\]', raw, re.DOTALL)
+        if arr_match:
+            try:
+                data = json.loads(arr_match.group(0))
+                if isinstance(data, list):
+                    return [e for e in data if isinstance(e, dict) and "old" in e and "new" in e]
+            except json.JSONDecodeError:
+                pass
+
+        return []
 
     @staticmethod
     def _apply_revisions(paper_tex: str, revised_sections: dict[str, str]) -> str:
