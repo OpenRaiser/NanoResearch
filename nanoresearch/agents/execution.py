@@ -421,12 +421,23 @@ class ExecutionAgent(BaseResearchAgent):
                 # — those will be installed on the cluster node
                 if any(pkg in err_text for pkg in [
                     "No module named 'torch'",
+                    "No module named 'torchvision'",
+                    "No module named 'torchaudio'",
+                    "No module named 'timm'",
                     "No module named 'transformers'",
                     "No module named 'torch_geometric'",
                     "No module named 'torch_scatter'",
                     "No module named 'torch_sparse'",
                     "No module named 'esm'",
                     "No module named 'dgl'",
+                    "No module named 'accelerate'",
+                    "No module named 'datasets'",
+                    "No module named 'einops'",
+                    "No module named 'wandb'",
+                    "No module named 'scipy'",
+                    "No module named 'sklearn'",
+                    "No module named 'cv2'",
+                    "No module named 'PIL'",
                     "CUDA",
                 ]):
                     continue
