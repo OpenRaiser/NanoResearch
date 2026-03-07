@@ -968,7 +968,7 @@ The goal is to get real experimental results (metric numbers) — not placeholde
                 user_prompt=user_prompt,
                 tools=tools,
                 max_tool_rounds=max_rounds,
-                stage_override=self.config.for_stage("experiment"),
+                stage_override=self.config.for_stage("code_gen"),
                 reminder_text=(
                     "[REMINDER] You are running an ML experiment. Stay focused:\n"
                     "- If the experiment is still running, check its status (squeue / read log file)\n"
