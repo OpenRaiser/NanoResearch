@@ -204,6 +204,28 @@ PAPER_SECTIONS = [
 ]
 
 
+def _escape_latex_text(text: str) -> str:
+    """Escape LaTeX special characters in plain text (captions, method names, etc.).
+
+    If the text already contains LaTeX commands (backslash + alpha sequence),
+    it is returned as-is to avoid double-escaping things like ``$\\alpha$-Net``.
+    """
+    if not isinstance(text, str):
+        text = str(text)
+    # If text already looks like it contains LaTeX commands, leave it alone
+    if '\\' in text and re.search(r'\\[a-zA-Z]+', text):
+        return text
+    # Order matters: backslash first, then others
+    text = text.replace("\\", "\\textbackslash{}")
+    for ch, esc in [
+        ("&", "\\&"), ("%", "\\%"), ("$", "\\$"),
+        ("#", "\\#"), ("_", "\\_"), ("^", "\\^{}"),
+        ("~", "\\~{}"),
+    ]:
+        text = text.replace(ch, esc)
+    return text
+
+
 class WritingAgent(BaseResearchAgent):
     stage = PipelineStage.WRITING
 
@@ -479,12 +501,10 @@ class WritingAgent(BaseResearchAgent):
                 block = m.group(0)
                 # Check by label
                 label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
-                if label_m:
-                    lbl = label_m.group(1)
-                    if lbl in seen_fig_labels:
-                        self.log(f"  Removed duplicate figure {lbl} from {sec.heading}")
-                        return ""
-                    seen_fig_labels.add(lbl)
+                lbl = label_m.group(1) if label_m else None
+                if lbl and lbl in seen_fig_labels:
+                    self.log(f"  Removed duplicate figure {lbl} from {sec.heading}")
+                    return ""
                 # Check by includegraphics filename
                 file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
                 if file_m:
@@ -493,6 +513,9 @@ class WritingAgent(BaseResearchAgent):
                         self.log(f"  Removed duplicate figure file {fname} from {sec.heading}")
                         return ""
                     seen_fig_files.add(fname)
+                # Register label AFTER both checks pass (avoid phantom labels)
+                if lbl:
+                    seen_fig_labels.add(lbl)
                 return block
             sec.content = re.sub(
                 r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
@@ -681,11 +704,15 @@ class WritingAgent(BaseResearchAgent):
 
         hypothesis = ""
         for h in ideation.get("hypotheses", []):
+            if not isinstance(h, dict):
+                continue
             if h.get("hypothesis_id") == ideation.get("selected_hypothesis"):
                 hypothesis = h.get("statement", "")
                 break
 
-        method = blueprint.get("proposed_method", {})
+        method = blueprint.get("proposed_method") or {}
+        if not isinstance(method, dict):
+            method = {}
         datasets = blueprint.get("datasets", [])
         metrics = blueprint.get("metrics", [])
         baselines = blueprint.get("baselines", [])
@@ -757,10 +784,10 @@ Main Hypothesis: {hypothesis}
 Proposed Method:
 {method_str}
 
-Datasets: {json.dumps([d.get('name', '') for d in datasets], ensure_ascii=False)}
-Metrics: {json.dumps([m.get('name', '') for m in metrics], ensure_ascii=False)}
-Baselines: {json.dumps([b.get('name', '') for b in baselines], ensure_ascii=False)}
-Ablation Groups: {json.dumps([a.get('group_name', '') for a in ablations], ensure_ascii=False)}
+Datasets: {json.dumps([d.get('name', '') for d in datasets if isinstance(d, dict)], ensure_ascii=False)}
+Metrics: {json.dumps([m.get('name', '') for m in metrics if isinstance(m, dict)], ensure_ascii=False)}
+Baselines: {json.dumps([b.get('name', '') for b in baselines if isinstance(b, dict)], ensure_ascii=False)}
+Ablation Groups: {json.dumps([a.get('group_name', '') for a in ablations if isinstance(a, dict)], ensure_ascii=False)}
 
 {evidence_lines}
 
@@ -779,7 +806,7 @@ Ablation Groups: {json.dumps([a.get('group_name', '') for a in ablations], ensur
 === CONTRIBUTION-EXPERIMENT ALIGNMENT ===
 Each contribution in Introduction MUST map to experimental evidence:
 - Method components: {json.dumps([c for c in method.get('key_components', [])], ensure_ascii=False)}
-- Ablation groups: {json.dumps([a.get('group_name', '') for a in ablations], ensure_ascii=False)}
+- Ablation groups: {json.dumps([a.get('group_name', '') for a in ablations if isinstance(a, dict)], ensure_ascii=False)}
 Every component listed above should appear in the ablation table.
 === END ALIGNMENT ===
 
@@ -1136,31 +1163,47 @@ Every component listed above should appear in the ablation table.
             "\\midrule",
         ]
 
+        # Determine which metrics are lower-is-better
+        _LOWER_KW = ("loss", "error", "perplexity", "mse", "mae", "cer", "wer", "fid")
+        lower_is_better_metrics: set[str] = {
+            mn for mn in all_metrics
+            if any(kw in mn.lower() for kw in _LOWER_KW)
+        }
+
         # Find best value per metric (for bolding)
+        _NUM_RE = re.compile(r'[+-]?(?:\d+\.?\d*|\.\d+)')
+
+        def _extract_leading_number(s: str) -> float | None:
+            """Extract leading numeric value from a metric string like '87.58 +/- 2.99'."""
+            m = _NUM_RE.match(s.strip())
+            return float(m.group(0)) if m else None
+
         best_vals: dict[str, float] = {}
         for _, _, mv in sorted_rows:
             for metric_name in all_metrics:
                 val_str = mv.get(metric_name, "")
-                try:
-                    val_num = float(val_str.split("$")[0].strip())
-                    if metric_name not in best_vals or val_num > best_vals[metric_name]:
-                        best_vals[metric_name] = val_num
-                except (ValueError, IndexError):
-                    pass
+                val_num = _extract_leading_number(val_str)
+                if val_num is None:
+                    continue
+                lower = metric_name in lower_is_better_metrics
+                if metric_name not in best_vals:
+                    best_vals[metric_name] = val_num
+                elif lower and val_num < best_vals[metric_name]:
+                    best_vals[metric_name] = val_num
+                elif not lower and val_num > best_vals[metric_name]:
+                    best_vals[metric_name] = val_num
 
         for method, is_proposed, metric_vals in sorted_rows:
             cells = []
             for metric_name in all_metrics:
                 val_str = metric_vals.get(metric_name, "--")
                 # Bold best value
-                try:
-                    val_num = float(val_str.split("$")[0].strip())
-                    if metric_name in best_vals and abs(val_num - best_vals[metric_name]) < 1e-9:
+                val_num = _extract_leading_number(val_str)
+                if val_num is not None and metric_name in best_vals:
+                    if abs(val_num - best_vals[metric_name]) < 1e-9:
                         val_str = f"\\textbf{{{val_str}}}"
-                except (ValueError, IndexError):
-                    pass
                 cells.append(val_str)
-            method_display = f"{method} (Ours)" if is_proposed else method
+            method_display = f"{_escape_latex_text(method)} (Ours)" if is_proposed else _escape_latex_text(method)
             lines.append(f"{method_display} & {' & '.join(cells)} \\\\")
 
         lines.extend([
@@ -1211,7 +1254,7 @@ Every component listed above should appear in the ablation table.
         ]
 
         for entry in ablation_results:
-            variant = entry.get("variant_name", "?")
+            variant = _escape_latex_text(entry.get("variant_name", "?"))
             cells = []
             for metric_name in all_metrics:
                 val_str = "--"
@@ -1489,7 +1532,7 @@ Every component listed above should appear in the ablation table.
                 if "error" in fig_data and "png_path" not in fig_data:
                     continue  # skip failed figures with no output
 
-                caption = fig_data.get("caption", f"Figure: {fig_key}")
+                caption = _escape_latex_text(fig_data.get("caption", f"Figure: {fig_key}"))
                 # Derive a LaTeX-friendly label from fig_key
                 # e.g., "fig1_architecture" -> "fig:architecture"
                 #        "fig2_results"     -> "fig:results"
@@ -1836,7 +1879,8 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
     # ---- missing citation resolver -------------------------------------------
 
-    _CITE_KEY_RE = re.compile(r"\\cite[tp]?(?:\[[^\]]*\])*\{([^}]+)\}")
+    # Match \cite, \citet, \citep, \citeauthor, \citealp, \citealt, \Citet, etc.
+    _CITE_KEY_RE = re.compile(r"\\[Cc]ite(?:t|p|author|year|alp|alt|num)?(?:\*)?(?:\[[^\]]*\])*\{([^}]+)\}")
     _BIB_KEY_RE = re.compile(r"@\w+\s*\{\s*([^,\s]+)")
 
     async def _resolve_missing_citations(
@@ -2075,10 +2119,12 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
         injection = "\n".join(inject_lines)
 
         # Find the Related Work section and inject before its end
+        # Handle common heading variants (Related Works, Prior Work, etc.)
         rw_pattern = re.compile(
-            r'(\\section\{Related Work\}.*?)'
+            r'(\\section\{(?:Related Works?|Prior Work|Literature Review'
+            r'|Background(?:\s+and\s+Related\s+Work)?)\}.*?)'
             r'(\\section\{)',
-            re.DOTALL
+            re.DOTALL | re.IGNORECASE,
         )
         m = rw_pattern.search(latex)
         if m:
@@ -2442,23 +2488,21 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                     applied += 1
                     self.log(f"  Level 2: applied edit ({len(old)}→{len(new)} chars)")
                 else:
-                    old_norm = ' '.join(old.split())
-                    result_lines = result.split('\n')
-                    matched = False
-                    for line_idx, line in enumerate(result_lines):
-                        line_norm = ' '.join(line.split())
-                        if old_norm in line_norm:
-                            # Replace only the matched fragment, not the entire line
-                            indent = line[:len(line) - len(line.lstrip())]
-                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
-                            result_lines[line_idx] = indent + new_line_norm
-                            result = '\n'.join(result_lines)
+                    # Try with normalized whitespace as fallback:
+                    # Build a regex from `old` where each whitespace run matches \s+,
+                    # then apply re.sub on the original text to preserve formatting.
+                    old_tokens = old.split()
+                    if old_tokens:
+                        ws_pattern = r'\s+'.join(re.escape(t) for t in old_tokens)
+                        ws_match = re.search(ws_pattern, result)
+                        if ws_match:
+                            result = result[:ws_match.start()] + new + result[ws_match.end():]
                             applied += 1
                             self.log(f"  Level 2: applied edit with whitespace normalization")
-                            matched = True
-                            break
-                    if not matched:
-                        self.log(f"  Level 2: old text not found, skipping edit")
+                        else:
+                            self.log(f"  Level 2: old text not found, skipping edit")
+                    else:
+                        self.log(f"  Level 2: old text empty after split, skipping edit")
 
             if applied > 0 and result != tex_source:
                 self.log(f"  Level 2: {applied} edit(s) applied successfully")
@@ -2767,6 +2811,36 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                 deduped_entries.append(entry.strip())
             bib = "\n\n".join(deduped_entries) + "\n"
 
+        # ── 1. HTML entity decoding ──
+        # APIs (Semantic Scholar, OpenAlex) sometimes return HTML entities in titles.
+        # Must convert BEFORE Unicode replacements since some entities decode to Unicode.
+        import html as _html
+        bib = _html.unescape(bib)
+        # After unescape, bare '&' needs LaTeX escaping in TEXT fields (title,
+        # booktitle, journal, etc.) but NOT in url/doi/eprint fields where '&'
+        # is a valid query-string separator.
+        _URL_FIELDS = {"url", "doi", "eprint", "howpublished", "note"}
+
+        def _escape_ampersand_in_entry(entry_text: str) -> str:
+            """Escape bare & only in non-URL BibTeX fields."""
+            def _field_repl(fm: re.Match) -> str:
+                field_name = fm.group(1).strip().lower()
+                field_body = fm.group(2)
+                if field_name in _URL_FIELDS:
+                    return fm.group(0)  # leave URL fields untouched
+                # Escape bare & (not already-escaped \&) in text fields
+                return fm.group(0).replace(
+                    field_body,
+                    re.sub(r'(?<!\\)&', r'\\&', field_body),
+                )
+            # Match field = {value} or field = "value"
+            return re.sub(
+                r'(\b\w+)\s*=\s*(\{(?:[^{}]|\{[^{}]*\})*\}|"[^"]*")',
+                _field_repl, entry_text,
+            )
+
+        bib = _escape_ampersand_in_entry(bib)
+
         replacements = {
             "\u00e9": r"{\'e}",
             "\u00e8": r"{\`e}",
@@ -2802,7 +2876,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
             return f'{key} = {{{val}}}'
 
         bib = re.sub(
-            r'((?:book)?title)\s*=\s*\{([^}]*)\}',
+            r'((?:book)?title)\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}',
             _fix_title_underscores,
             bib,
             flags=re.IGNORECASE,
@@ -2875,7 +2949,7 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
 
             # This figure is missing — build an emergency block
             self.log(f"  VALIDATION: '{fig_key}' missing from LaTeX, injecting")
-            caption = fig_data.get("caption", f"Figure: {fig_key}")
+            caption = _escape_latex_text(fig_data.get("caption", f"Figure: {fig_key}"))
             parts = fig_key.split("_", 1)
             label_suffix = parts[1] if len(parts) > 1 else fig_key
             include_name = pdf_name if fig_data.get("pdf_path") else png_name

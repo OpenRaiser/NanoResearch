@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import traceback
 from typing import Any
@@ -98,6 +99,10 @@ class DeepPipelineOrchestrator:
             if stage_record and stage_record.status == "completed":
                 logger.info("Skipping completed stage: %s", stage.value)
                 results.update(self._load_stage_output(stage, require=True))
+                # Advance state machine so subsequent stages can transition.
+                # Use _current directly: transition() would reject if the
+                # manifest's current_stage put us out-of-order after a crash.
+                self.state_machine._current = stage
                 continue
 
             if not self.state_machine.can_transition(stage):
@@ -207,7 +212,9 @@ class DeepPipelineOrchestrator:
 
                 if attempt < max_retries:
                     self.workspace.increment_retry(stage)
-                    logger.info("Retrying %s...", stage.value)
+                    delay = 3.0 * (2.0 ** attempt)  # exponential backoff
+                    logger.info("Retrying %s in %.0fs...", stage.value, delay)
+                    await asyncio.sleep(delay)
                 else:
                     self.workspace.mark_stage_failed(stage, last_error)
                     raise RuntimeError(

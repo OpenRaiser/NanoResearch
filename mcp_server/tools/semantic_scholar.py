@@ -18,8 +18,20 @@ logger = logging.getLogger(__name__)
 # With an API key the limit is higher, so we check for that.
 _S2_RATE_FREE = 0.3   # calls per second without API key
 _S2_RATE_KEYED = 3.0  # calls per second with API key
-_has_key = bool(os.environ.get("S2_API_KEY", ""))
-_limiter = RateLimiter(calls_per_second=_S2_RATE_KEYED if _has_key else _S2_RATE_FREE)
+# Lazy-init the limiter so that API keys set after import (e.g. by
+# cli._propagate_api_keys()) are respected.
+_limiter: RateLimiter | None = None
+
+
+def _get_limiter() -> RateLimiter:
+    """Return (and lazily create) the rate limiter with the correct rate."""
+    global _limiter
+    if _limiter is None:
+        has_key = bool(os.environ.get("S2_API_KEY", ""))
+        _limiter = RateLimiter(
+            calls_per_second=_S2_RATE_KEYED if has_key else _S2_RATE_FREE,
+        )
+    return _limiter
 
 # Global circuit breaker: pause ALL S2 calls after consecutive 429s
 _CB_THRESHOLD = 3       # consecutive 429s before tripping
@@ -74,7 +86,7 @@ async def search_semantic_scholar(
         List of paper metadata dicts.
     """
     await _circuit_breaker_check()
-    await _limiter.acquire()
+    await _get_limiter().acquire()
     headers = {}
     api_key = os.environ.get("S2_API_KEY", "")
     if api_key:
@@ -121,7 +133,7 @@ async def get_paper_details(paper_id: str) -> dict[str, Any]:
         Paper metadata with citations and references.
     """
     await _circuit_breaker_check()
-    await _limiter.acquire()
+    await _get_limiter().acquire()
     headers = {}
     api_key = os.environ.get("S2_API_KEY", "")
     if api_key:
@@ -177,7 +189,7 @@ async def get_papers_batch(
         return []
 
     await _circuit_breaker_check()
-    await _limiter.acquire()
+    await _get_limiter().acquire()
     headers = {"Content-Type": "application/json"}
     api_key = os.environ.get("S2_API_KEY", "")
     if api_key:
@@ -188,7 +200,7 @@ async def get_papers_batch(
     for i in range(0, len(paper_ids), 500):
         chunk = paper_ids[i:i + 500]
         if i > 0:
-            await _limiter.acquire()
+            await _get_limiter().acquire()
         try:
             async with get_http_client() as client:
                 resp = await fetch_with_retry(
@@ -215,7 +227,22 @@ async def get_papers_batch(
             if item is None:
                 results.append({})
             else:
-                results.append(_normalize_paper(item))
+                paper = _normalize_paper(item)
+                # Reconstruct references/citations if requested in fields
+                # (_normalize_paper strips these nested fields)
+                if "references" in fields:
+                    paper["references"] = [
+                        {"paper_id": r.get("paperId", ""), "title": r.get("title", ""), "year": r.get("year")}
+                        for r in (item.get("references") or [])
+                        if isinstance(r, dict)
+                    ]
+                if "citations" in fields:
+                    paper["citations"] = [
+                        {"paper_id": c.get("paperId", ""), "title": c.get("title", ""), "year": c.get("year")}
+                        for c in (item.get("citations") or [])
+                        if isinstance(c, dict)
+                    ]
+                results.append(paper)
     return results
 
 
@@ -236,7 +263,7 @@ async def search_paper_by_title(
         Paper metadata dict, or None if no match found.
     """
     await _circuit_breaker_check()
-    await _limiter.acquire()
+    await _get_limiter().acquire()
     headers = {}
     api_key = os.environ.get("S2_API_KEY", "")
     if api_key:

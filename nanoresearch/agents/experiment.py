@@ -348,11 +348,14 @@ class ExperimentAgent(BaseResearchAgent):
                         spec, interface_contract, blueprint_summary, repo_context
                     )
                     for spec in valid_specs
-                ))
+                ), return_exceptions=True)
 
                 # Write files sequentially (filesystem ops)
                 for spec, content in zip(valid_specs, contents):
                     file_path = spec["path"]
+                    if isinstance(content, BaseException):
+                        logger.error("Failed to generate %s: %s", file_path, content)
+                        continue
                     self.workspace.write_text(f"code/{file_path}", content)
                     generated_files.append(file_path)
 
@@ -414,7 +417,7 @@ class ExperimentAgent(BaseResearchAgent):
                 # Early stop if LLM has no new ideas
                 if hypothesis.hypothesis == "__NO_NEW_IDEAS__":
                     self.log("LLM exhausted improvement ideas — stopping iteration")
-                    iteration_state.termination_reason = "no_new_ideas"
+                    iteration_state.final_status = "no_new_ideas"
                     break
 
                 self.log(f"Hypothesis: {hypothesis.hypothesis[:100]}")
@@ -1484,7 +1487,8 @@ The output MUST be a complete, runnable file — do NOT omit any functions or cl
             metrics_str = ""
             if r.analysis and r.analysis.metric_summary:
                 metrics_str = ", ".join(
-                    f"{k}={v:.4f}" for k, v in r.analysis.metric_summary.items()
+                    f"{k}={v:.4f}" if isinstance(v, (int, float)) else f"{k}={v}"
+                    for k, v in r.analysis.metric_summary.items()
                 )
             hyp_short = r.hypothesis.hypothesis[:80]
             attribution = r.analysis.attribution if r.analysis else "n/a"
@@ -2626,7 +2630,7 @@ Output the project plan as a JSON object."""
         )
 
         # Parse JSON (handle markdown fences)
-        text = raw.strip()
+        text = (raw or "").strip()
         if text.startswith("```"):
             lines = text.split("\n")
             # Remove opening fence (e.g. ```json)
@@ -2692,7 +2696,7 @@ Generate the COMPLETE file content. Follow the interface contract exactly."""
         )
 
         # Clean up: remove markdown fences if present (handles ```python, ```json, etc.)
-        content = content.strip()
+        content = (content or "").strip()
         if content.startswith("```"):
             lines = content.split("\n")
             # Remove opening fence line

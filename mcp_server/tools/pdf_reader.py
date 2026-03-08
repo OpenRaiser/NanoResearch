@@ -43,11 +43,19 @@ async def download_and_extract(
     Returns:
         Dict with keys: full_text, sections, method_text, experiment_text, page_count.
     """
+    _MAX_PDF_SIZE = 50 * 1024 * 1024  # 50 MB
     try:
         async with get_http_client(timeout=60.0) as client:
             resp = await client.get(pdf_url)
             resp.raise_for_status()
+            content_length = resp.headers.get("content-length")
+            if content_length and int(content_length) > _MAX_PDF_SIZE:
+                logger.warning("PDF too large (%s bytes): %s", content_length, pdf_url[:200])
+                return {"full_text": "", "sections": {}, "method_text": "", "experiment_text": "", "page_count": 0}
             pdf_bytes = resp.content
+            if len(pdf_bytes) > _MAX_PDF_SIZE:
+                logger.warning("PDF body too large (%d bytes): %s", len(pdf_bytes), pdf_url[:200])
+                return {"full_text": "", "sections": {}, "method_text": "", "experiment_text": "", "page_count": 0}
     except httpx.TimeoutException:
         logger.warning("PDF download timed out for: %s", pdf_url[:200])
         return {"full_text": "", "sections": {}, "method_text": "", "experiment_text": "", "page_count": 0}

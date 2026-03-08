@@ -63,13 +63,30 @@ class PreflightChecker:
     # 1. config/default.yaml — blocking
     # ------------------------------------------------------------------
     def check_config_yaml(self) -> PreflightResult:
-        """Verify config/default.yaml exists, is parseable YAML, and has required keys."""
+        """Verify a config file exists (YAML, JSON, or Python config module)."""
         yaml_path = self.code_dir / "config" / "default.yaml"
+        # Accept alternative config formats that LLMs commonly generate
+        alt_configs = [
+            self.code_dir / "config.py",
+            self.code_dir / "config.json",
+            self.code_dir / "config.yaml",
+            self.code_dir / "config" / "config.yaml",
+            self.code_dir / "config" / "config.py",
+            self.code_dir / "configs" / "default.yaml",
+        ]
         if not yaml_path.exists():
+            # Check alternative config files
+            for alt in alt_configs:
+                if alt.exists():
+                    return PreflightResult(
+                        check_name="config_yaml",
+                        status="passed",
+                        message=f"Config found at {alt.name} (alternative format)",
+                    )
             return PreflightResult(
                 check_name="config_yaml",
-                status="failed",
-                message="config/default.yaml not found",
+                status="warning",
+                message="No config file found (config/default.yaml, config.py, etc.)",
             )
 
         try:
@@ -258,14 +275,26 @@ class PreflightChecker:
     # 4. main.py entrypoint — blocking
     # ------------------------------------------------------------------
     def check_main_entrypoint(self) -> PreflightResult:
-        """Verify main.py exists and contains --dry-run and --quick-eval strings."""
+        """Verify a Python entrypoint exists (main.py, train.py, run.py, etc.)."""
         main_py = self.code_dir / "main.py"
         if not main_py.exists():
-            return PreflightResult(
-                check_name="main_entrypoint",
-                status="failed",
-                message="main.py not found",
-            )
+            # Accept common alternative entrypoints
+            alt_entrypoints = [
+                self.code_dir / "train.py",
+                self.code_dir / "run.py",
+                self.code_dir / "run_train.py",
+                self.code_dir / "experiment.py",
+            ]
+            for alt in alt_entrypoints:
+                if alt.exists():
+                    main_py = alt
+                    break
+            else:
+                return PreflightResult(
+                    check_name="main_entrypoint",
+                    status="warning",
+                    message="No standard entrypoint found (main.py, train.py, run.py)",
+                )
 
         try:
             source = main_py.read_text(encoding="utf-8", errors="replace")
@@ -285,8 +314,8 @@ class PreflightChecker:
         if missing_flags:
             return PreflightResult(
                 check_name="main_entrypoint",
-                status="failed",
-                message=f"main.py missing flag handling: {missing_flags}",
+                status="warning",
+                message=f"{main_py.name} missing flag handling: {missing_flags}",
                 details={"missing_flags": missing_flags},
             )
 

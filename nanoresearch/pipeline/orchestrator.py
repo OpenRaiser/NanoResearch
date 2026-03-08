@@ -90,6 +90,8 @@ class PipelineOrchestrator:
                     # Load previous output — raise if file is missing
                     output = self._load_stage_output(stage, require=True)
                     results.update(output)
+                    # Advance state machine so subsequent stages can transition.
+                    self.state_machine._current = stage
                     continue
 
                 # Skip stages configured to be skipped

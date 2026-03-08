@@ -36,8 +36,9 @@ _CMD_TIMEOUT_MAX = 1800           # 30 min ceiling
 _MAX_LIST_ENTRIES = 200           # max items from list_dir
 _MAX_GREP_RESULTS = 50            # max matches from grep
 _BLOCKED_COMMANDS = re.compile(
-    r"(\brm\s+-rf\s+/|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|"
-    r"\bchmod\s+777\s+/|:\(\)\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:)"
+    r"(\brm\s+-rf\s+[/~.]|\brm\s+-r\s+[/~.]|\bmkfs\b|\bdd\s+if=|\bshutdown\b|\breboot\b|"
+    r"\bchmod\s+777\s+[/~]|:\s*\(\)\s*\{[^}]*\|\s*:\s*&|"
+    r"\bcurl\b[^;|]*\|\s*(?:ba)?sh\b|\bwget\b[^;|]*\|\s*(?:ba)?sh\b)"
 )
 
 
@@ -80,6 +81,12 @@ async def _write_file(path: str, content: str, _base: Path | None = None) -> dic
     if len(content) > _MAX_WRITE_SIZE:
         return {"error": f"Content too large ({len(content)} chars, max {_MAX_WRITE_SIZE})"}
     p = _resolve(path, _base)
+    # Safety: restrict writes to within the work directory (if set)
+    if _base is not None:
+        try:
+            p.resolve().relative_to(_base.resolve())
+        except ValueError:
+            return {"error": f"Path traversal blocked: {path} is outside work directory"}
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")

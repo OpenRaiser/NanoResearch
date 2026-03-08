@@ -228,6 +228,8 @@ Design a runnable project. Return JSON:
 }}"""
 
         result = await self.generate_json(system_prompt, user_prompt)
+        if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
+            result = result[0]
         return result if isinstance(result, dict) else {}
 
     async def _generate_file(
@@ -351,7 +353,10 @@ Return ONLY the Python code, no markdown fences."""
     ) -> str:
         """Generate a SLURM batch script for training."""
         compute = blueprint.get("compute_requirements", {})
-        num_gpus = min(compute.get("num_gpus", 1), 4)  # cap at 4
+        try:
+            num_gpus = min(int(compute.get("num_gpus", 1)), 4)  # cap at 4
+        except (ValueError, TypeError):
+            num_gpus = 1
         project_name = code_plan.get("project_name", "experiment")
 
         script = f"""#!/bin/bash
@@ -711,4 +716,4 @@ Return JSON:
             self.log(f"Import fix failed (non-fatal): {e}")
 
     async def close(self) -> None:
-        pass
+        await super().close()

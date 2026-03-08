@@ -588,6 +588,8 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                 logger.debug("Citation expansion failed for %s: %s", lookup_id, e)
                 continue
             for ref in details.get("references", []):
+                if not isinstance(ref, dict):
+                    continue
                 ref_title = (ref.get("title") or "").strip()
                 if not ref_title:
                     continue
@@ -1063,18 +1065,21 @@ Return ONLY valid JSON."""
         # Build PaperReference list
         paper_refs = []
         for p in papers:
-            paper_refs.append(PaperReference(
-                paper_id=p.get("paper_id", p.get("arxiv_id", "")),
-                title=p.get("title", ""),
-                authors=p.get("authors", []),
-                year=p.get("year"),
-                abstract=(p.get("abstract", "") or "")[:MAX_ABSTRACT_LENGTH],
-                venue=p.get("venue", ""),
-                citation_count=p.get("citation_count", 0),
-                url=p.get("url", ""),
-                method_text=(p.get("method_text", "") or "")[:3000],
-                experiment_text=(p.get("experiment_text", "") or "")[:3000],
-            ))
+            try:
+                paper_refs.append(PaperReference(
+                    paper_id=p.get("paper_id", p.get("arxiv_id", "")),
+                    title=p.get("title", ""),
+                    authors=p.get("authors") or [],
+                    year=p.get("year"),
+                    abstract=(p.get("abstract", "") or "")[:MAX_ABSTRACT_LENGTH],
+                    venue=p.get("venue", ""),
+                    citation_count=p.get("citation_count") or 0,
+                    url=p.get("url", ""),
+                    method_text=(p.get("method_text", "") or "")[:3000],
+                    experiment_text=(p.get("experiment_text", "") or "")[:3000],
+                ))
+            except Exception as exc:
+                logger.warning("Skipping malformed paper entry: %s (error: %s)", p.get("title", "?"), exc)
 
         return IdeationOutput(
             topic=topic,
@@ -1188,6 +1193,12 @@ Return JSON: {{"extracted_metrics": [...], "extraction_notes": "brief summary", 
             system_prompt, prompt, stage_override=evidence_config
         )
 
+        if isinstance(result, list):
+            logger.warning(
+                "[%s] _extract_evidence: LLM returned a list; wrapping as {'extracted_metrics': ...}",
+                self.stage.value,
+            )
+            result = {"extracted_metrics": result}
         metrics = []
         for m in result.get("extracted_metrics", []):
             try:

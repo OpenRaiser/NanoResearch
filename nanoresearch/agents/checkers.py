@@ -300,6 +300,10 @@ def check_unmatched_braces(tex: str) -> list[dict]:
             elif ch == "}":
                 depth -= 1
         if depth != 0:
+            # Small imbalances (±1, ±2) are often multi-line macros (\newcommand,
+            # \def, etc.) — use "medium" severity. Large imbalances (±3+) are
+            # more likely genuine errors — use "high".
+            sev = "high" if abs(depth) >= 3 else "medium"
             issues.append({
                 "issue_type": "unmatched_braces",
                 "description": (
@@ -307,7 +311,7 @@ def check_unmatched_braces(tex: str) -> list[dict]:
                     f"brace(s) (net imbalance: {depth:+d})"
                 ),
                 "locations": [f"line {lineno}"],
-                "severity": "high",
+                "severity": sev,
             })
     return issues
 
@@ -342,11 +346,13 @@ def check_bare_special_chars(tex: str) -> list[dict]:
     # Remove math environments to avoid false positives
     masked = _MATH_ENV_RE.sub(lambda m: " " * len(m.group()), tex)
 
-    # Also mask tabular / table environments (& is legal there)
+    # Also mask tabular / table / align environments (& is legal there)
     masked = re.sub(
-        r"\\begin\{(?:tabular|tabularx|array|matrix|pmatrix|bmatrix|cases)\*?\}"
+        r"\\begin\{(?:tabular|tabularx|array|matrix|pmatrix|bmatrix|cases"
+        r"|align|alignat|flalign|gathered|split)\*?\}"
         r".*?"
-        r"\\end\{(?:tabular|tabularx|array|matrix|pmatrix|bmatrix|cases)\*?\}",
+        r"\\end\{(?:tabular|tabularx|array|matrix|pmatrix|bmatrix|cases"
+        r"|align|alignat|flalign|gathered|split)\*?\}",
         lambda m: " " * len(m.group()),
         masked,
         flags=re.DOTALL,

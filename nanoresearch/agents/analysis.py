@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -296,14 +297,14 @@ IMPORTANT:
 
             # Write and execute the plotting code
             script_path = figures_dir / f"{fig_id}_plot.py"
-            script_path.write_text(plot_code)
+            script_path.write_text(plot_code, encoding="utf-8")
 
             png_path = figures_dir / f"{fig_id}.png"
             pdf_path = figures_dir / f"{fig_id}.pdf"
 
             try:
                 result = await self._run_shell(
-                    f"cd {figures_dir} && python3 {script_path}",
+                    f'cd "{figures_dir}" && "{sys.executable}" "{script_path}"',
                     timeout=60,
                 )
                 if png_path.exists():
@@ -416,4 +417,4 @@ Return ONLY the Python code, no markdown fences."""
         }
 
     async def close(self) -> None:
-        pass
+        await super().close()

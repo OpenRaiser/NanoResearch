@@ -251,29 +251,38 @@ class ModelDispatcher:
         logger.debug("Generating image (openai) model=%s size=%s", config.model, size)
 
         loop = asyncio.get_running_loop()
-        try:
-            response = await loop.run_in_executor(
-                None,
-                partial(
-                    client.images.generate,
-                    model=config.model,
-                    prompt=prompt,
-                    size=size,
-                    quality=quality,
-                    n=1,
-                    response_format="b64_json",
-                ),
-            )
-        except Exception as exc:
-            logger.error("OpenAI image generation failed (model=%s): %s", config.model, exc)
-            raise RuntimeError(
-                f"Image generation via OpenAI failed (model={config.model}): {exc}"
-            ) from exc
+        last_exc: Exception | None = None
+        for attempt in range(3):
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    partial(
+                        client.images.generate,
+                        model=config.model,
+                        prompt=prompt,
+                        size=size,
+                        quality=quality,
+                        n=1,
+                        response_format="b64_json",
+                    ),
+                )
+                if not response.data:
+                    logger.warning("OpenAI image API returned no images (model=%s)", config.model)
+                    return []
+                return [img.b64_json for img in response.data if img.b64_json]
+            except Exception as exc:
+                last_exc = exc
+                if attempt < 2 and self._is_retryable(exc):
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    logger.warning("Image gen failed (attempt %d/3): %s. Retrying in %.1fs...", attempt + 1, exc, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    break
 
-        if not response.data:
-            logger.warning("OpenAI image API returned no images (model=%s)", config.model)
-            return []
-        return [img.b64_json for img in response.data if img.b64_json]
+        logger.error("OpenAI image generation failed (model=%s): %s", config.model, last_exc)
+        raise RuntimeError(
+            f"Image generation via OpenAI failed (model={config.model}): {last_exc}"
+        ) from last_exc
 
     async def _generate_image_gemini(
         self,
@@ -316,30 +325,27 @@ class ModelDispatcher:
             config.model, config.aspect_ratio, config.image_size,
         )
 
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.post(url, json=payload, headers=headers)
-                response.raise_for_status()
-                data = response.json()
-        except httpx.TimeoutException as exc:
-            logger.error("Gemini image API timed out after %.1fs: %s", timeout, exc)
-            raise RuntimeError(
-                f"Gemini image API timed out after {timeout}s"
-            ) from exc
-        except httpx.HTTPStatusError as exc:
-            logger.error(
-                "Gemini image API returned HTTP %d: %s",
-                exc.response.status_code, exc.response.text[:500],
-            )
-            raise RuntimeError(
-                f"Gemini image API HTTP {exc.response.status_code}: "
-                f"{exc.response.text[:200]}"
-            ) from exc
-        except httpx.HTTPError as exc:
-            logger.error("Gemini image API network error: %s", exc)
-            raise RuntimeError(
-                f"Gemini image API network error: {exc}"
-            ) from exc
+        last_exc: Exception | None = None
+        data: dict = {}
+        for attempt in range(3):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.post(url, json=payload, headers=headers)
+                    response.raise_for_status()
+                    data = response.json()
+                break  # success
+            except (httpx.TimeoutException, httpx.HTTPError) as exc:
+                last_exc = exc
+                retryable = isinstance(exc, httpx.TimeoutException) or (
+                    isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 502, 503, 504)
+                )
+                if attempt < 2 and retryable:
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    logger.warning("Gemini image gen failed (attempt %d/3): %s. Retrying in %.1fs...", attempt + 1, exc, delay)
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error("Gemini image API failed: %s", exc)
+                    raise RuntimeError(f"Gemini image API failed: {exc}") from exc
 
         # Extract base64 images from Gemini response
         images: list[str] = []

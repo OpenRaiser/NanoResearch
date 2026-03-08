@@ -262,6 +262,10 @@ Return ONLY valid JSON."""
                 val = pm.get(key)
                 if val is not None and not isinstance(val, str):
                     pm[key] = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
+            # key_components: LLM may return a comma-separated string instead of list
+            kc = pm.get("key_components")
+            if isinstance(kc, str):
+                pm["key_components"] = [s.strip() for s in kc.split(",") if s.strip()]
 
         # ComputeRequirements string fields
         cr = data.get("compute_requirements")

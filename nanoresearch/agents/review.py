@@ -326,17 +326,18 @@ class ReviewAgent(BaseResearchAgent):
             def _dedup_fig(m: re.Match) -> str:
                 block = m.group(0)
                 label_m = re.search(r'\\label\{(fig:[^}]+)\}', block)
-                if label_m:
-                    lbl = label_m.group(1)
-                    if lbl in seen_fig_labels:
-                        return ""
-                    seen_fig_labels.add(lbl)
+                lbl = label_m.group(1) if label_m else None
+                if lbl and lbl in seen_fig_labels:
+                    return ""
                 file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', block)
                 if file_m:
                     fname = file_m.group(1)
                     if fname in seen_fig_files:
                         return ""
                     seen_fig_files.add(fname)
+                # Register label AFTER both checks pass
+                if lbl:
+                    seen_fig_labels.add(lbl)
                 return block
             revised_tex = re.sub(
                 r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
@@ -539,9 +540,8 @@ class ReviewAgent(BaseResearchAgent):
         if in_string:
             repaired += '"'
 
-        # Count open brackets/braces and close them
-        opens = {'[': 0, '{': 0}
-        closes = {']': '[', '}': '{'}
+        # Count open brackets/braces using a stack (close in correct LIFO order)
+        stack: list[str] = []
         in_str = False
         esc = False
         for ch in repaired:
@@ -555,13 +555,16 @@ class ReviewAgent(BaseResearchAgent):
                 in_str = not in_str
             if in_str:
                 continue
-            if ch in opens:
-                opens[ch] += 1
-            elif ch in closes:
-                opens[closes[ch]] = max(0, opens[closes[ch]] - 1)
+            if ch in ('{', '['):
+                stack.append(ch)
+            elif ch == '}' and stack and stack[-1] == '{':
+                stack.pop()
+            elif ch == ']' and stack and stack[-1] == '[':
+                stack.pop()
 
-        repaired += ']' * opens['[']
-        repaired += '}' * opens['{']
+        closers = {'{': '}', '[': ']'}
+        for bracket in reversed(stack):
+            repaired += closers.get(bracket, '')
 
         try:
             return json.loads(repaired)
@@ -653,8 +656,9 @@ Return JSON:
                 section_review_system, prompt, json_mode=True,
                 stage_override=review_config,
             )
+            raw = raw or ""
             result = self._repair_truncated_json(raw)
-            if result is None:
+            if result is None or isinstance(result, list):
                 logger.warning("Could not parse review for section %s, using defaults", heading)
                 result = {"section": heading, "score": 5, "issues": [], "suggestions": []}
 
@@ -864,7 +868,7 @@ If the section contains \\subsection{{}} commands, include them in your output."
             revised = await self.generate(
                 REVISION_SYSTEM_PROMPT, prompt, stage_override=revision_config
             )
-            return revised.strip()
+            return (revised or "").strip()
         except Exception as e:
             logger.warning("Failed to revise section '%s': %s", section_review.section, e)
             return ""
@@ -970,6 +974,8 @@ Return JSON:
             logger.warning("Meta-refine diagnosis failed for '%s': %s", section_name, exc)
             return None
 
+        if isinstance(result, list):
+            result = {"extra_constraints": result}
         diagnosis = result.get("diagnosis", "unknown")
         extra_constraints = result.get("extra_constraints", [])
         self.log(f"  '{section_name}' diagnosis: {diagnosis[:120]}")
@@ -1073,17 +1079,17 @@ Return JSON:
         bp_metrics = {
             m.get("name", "").lower()
             for m in blueprint.get("metrics", [])
-            if m.get("name")
+            if isinstance(m, dict) and m.get("name")
         }
         bp_datasets = {
             d.get("name", "").lower()
             for d in blueprint.get("datasets", [])
-            if d.get("name")
+            if isinstance(d, dict) and d.get("name")
         }
         bp_baselines = {
             b.get("name", "").lower()
             for b in blueprint.get("baselines", [])
-            if b.get("name")
+            if isinstance(b, dict) and b.get("name")
         }
 
         # Check for baseline methods mentioned in \textbf{} or table rows
@@ -1103,6 +1109,8 @@ Return JSON:
 
         # Check proposed method name appears in paper
         proposed = blueprint.get("proposed_method", {})
+        if not isinstance(proposed, dict):
+            proposed = {}
         method_name = proposed.get("name", "")
         if method_name and len(method_name) > 2:
             if method_name.lower() not in tex_lower:
@@ -1123,8 +1131,8 @@ Return JSON:
         import re
         issues: list[ConsistencyIssue] = []
 
-        # Count total unique citations
-        cite_pattern = re.compile(r"\\cite[tp]?\{([^}]+)\}")
+        # Count total unique citations (handle natbib variants + optional args)
+        cite_pattern = re.compile(r"\\[Cc]ite[tp]?(?:\w*)(?:\*)?(?:\[[^\]]*\])*\{([^}]+)\}")
         cited: set[str] = set()
         for m in cite_pattern.finditer(tex):
             for k in m.group(1).split(","):
@@ -1155,10 +1163,12 @@ Return JSON:
                 locations=["Related Work"],
             ))
 
-        # Check Related Work section specifically
+        # Check Related Work section specifically (handle common heading variants)
         rw_pattern = re.compile(
-            r'\\section\{Related Work\}(.*?)(?=\\section\{|\\end\{document\})',
-            re.DOTALL
+            r'\\section\{(?:Related Works?|Prior Work|Literature Review'
+            r'|Background(?:\s+and\s+Related\s+Work)?)\}'
+            r'(.*?)(?=\\section\{|\\end\{document\})',
+            re.DOTALL | re.IGNORECASE,
         )
         rw_match = rw_pattern.search(tex)
         if rw_match:
@@ -1314,7 +1324,7 @@ Return JSON:
             best = None
             for r in results:
                 r_year = str(r.get("year", ""))
-                r_authors = " ".join(r.get("authors", []))
+                r_authors = " ".join(a.get("name", str(a)) if isinstance(a, dict) else str(a) for a in r.get("authors", []))
                 if year and r_year == year and surname.lower() in r_authors.lower():
                     best = r
                     break
@@ -1328,7 +1338,7 @@ Return JSON:
 
             if best:
                 authors = best.get("authors", [])
-                author_str = " and ".join(authors[:5]) if authors else surname
+                author_str = " and ".join(a.get("name", str(a)) if isinstance(a, dict) else str(a) for a in authors[:5]) if authors else surname
                 title = best.get("title", "Unknown")
                 venue = best.get("venue", "") or "arXiv preprint"
                 r_year = best.get("year", year or 2024)
@@ -1432,6 +1442,23 @@ Return JSON:
                     except OSError:
                         pass
                 return result
+
+            # ── Check if error originates from .bbl (BibTeX) ──
+            # Errors like "paper.bbl:64: Misplaced alignment tab character &"
+            # can only be fixed by editing references.bib, not paper.tex.
+            if '.bbl' in error_msg or 'alignment tab' in error_msg.lower():
+                bib_path = tex_path.parent / "references.bib"
+                if bib_path.exists():
+                    try:
+                        from nanoresearch.agents.writing import WritingAgent
+                        bib_content = bib_path.read_text(encoding="utf-8")
+                        fixed_bib = WritingAgent._sanitize_bibtex(bib_content)
+                        if fixed_bib != bib_content:
+                            bib_path.write_text(fixed_bib, encoding="utf-8")
+                            self.log(f"  Fixed BibTeX file (attempt {attempt + 1})")
+                            continue  # retry compilation with fixed .bib
+                    except Exception as bib_exc:
+                        self.log(f"  BibTeX fix failed: {bib_exc}")
 
             # Feed error to LLM and fix
             self.log(
@@ -1610,6 +1637,7 @@ Return JSON:
                         # Insert before \begin{document}
                         modified = modified[:preamble_end] + use_line + "\n" + modified[preamble_end:]
                         preamble_end += len(use_line) + 1
+                        preamble = modified[:preamble_end]
                         self.log(f"  Deterministic: added {use_line}")
 
         # 5. Mismatched environments at the error line
@@ -1769,24 +1797,21 @@ Return JSON:
                     applied += 1
                     self.log(f"  Level 2: applied edit ({len(old)} chars → {len(new)} chars)")
                 else:
-                    # Try with normalized whitespace as fallback
-                    old_norm = ' '.join(old.split())
-                    result_lines = result.split('\n')
-                    matched = False
-                    for line_idx, line in enumerate(result_lines):
-                        line_norm = ' '.join(line.split())
-                        if old_norm in line_norm:
-                            # Replace only the matched fragment, not the entire line
-                            indent = line[:len(line) - len(line.lstrip())]
-                            new_line_norm = line_norm.replace(old_norm, ' '.join(new.split()), 1)
-                            result_lines[line_idx] = indent + new_line_norm
-                            result = '\n'.join(result_lines)
+                    # Try with normalized whitespace as fallback:
+                    # Build a regex from `old` where each whitespace run matches \s+,
+                    # then apply re.sub on the original text to preserve formatting.
+                    old_tokens = old.split()
+                    if old_tokens:
+                        ws_pattern = r'\s+'.join(re.escape(t) for t in old_tokens)
+                        ws_match = re.search(ws_pattern, result)
+                        if ws_match:
+                            result = result[:ws_match.start()] + new + result[ws_match.end():]
                             applied += 1
                             self.log(f"  Level 2: applied edit with whitespace normalization")
-                            matched = True
-                            break
-                    if not matched:
-                        self.log(f"  Level 2: old text not found, skipping edit")
+                        else:
+                            self.log(f"  Level 2: old text not found, skipping edit")
+                    else:
+                        self.log(f"  Level 2: old text empty after split, skipping edit")
 
             if applied > 0 and result != tex_source:
                 self.log(f"  Level 2: {applied} edit(s) applied successfully")
@@ -1853,6 +1878,14 @@ Return JSON:
             body_start = 0
 
         for heading, new_content in revised_sections.items():
+            # Recalculate body_start each iteration because prior replacements
+            # shift all character offsets in `result`
+            body_start = result.find(body_marker)
+            if body_start >= 0:
+                body_start += len(body_marker)
+            else:
+                body_start = 0
+
             # Determine the level of the section being revised
             # by finding its command in the document
             esc_heading = re.escape(heading)
