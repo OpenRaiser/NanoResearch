@@ -107,8 +107,8 @@ class ModelDispatcher:
                     content=content, usage=usage,
                     model=model, latency_ms=round(latency_ms, 1),
                 ))
-            except Exception:
-                pass  # cost tracking must never break the pipeline
+            except Exception as exc:
+                logger.debug("Usage callback error (non-fatal): %s", exc)
 
     async def generate(
         self,
@@ -118,77 +118,8 @@ class ModelDispatcher:
         json_mode: bool = False,
     ) -> str:
         """Generate a completion using the configured model."""
-        timeout = config.timeout or self._config.timeout
-        client = self._get_client(timeout, config.base_url, config.api_key)
-
-        _m = config.model.lower()
-        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
-
-        kwargs: dict[str, Any] = {
-            "model": config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        if is_thinking:
-            # Thinking models: use max_completion_tokens so thinking budget
-            # is separate from visible output (supported by most proxies)
-            kwargs["max_completion_tokens"] = config.max_tokens
-        else:
-            kwargs["max_tokens"] = config.max_tokens
-        # Some models (Codex, o-series, thinking) don't support temperature
-        if config.temperature is not None and not is_thinking:
-            kwargs["temperature"] = config.temperature
-        if json_mode:
-            kwargs["response_format"] = {"type": "json_object"}
-
-        logger.debug("Calling model=%s temp=%s timeout=%ss", config.model, config.temperature, timeout)
-
-        # Run synchronous OpenAI call in a thread with retry
-        loop = asyncio.get_running_loop()
-        last_exc: Exception | None = None
-        for attempt in range(MAX_API_RETRIES + 1):
-            t0 = time.monotonic()
-            try:
-                response = await loop.run_in_executor(
-                    None,
-                    partial(client.chat.completions.create, **kwargs),
-                )
-                latency = (time.monotonic() - t0) * 1000
-                if not response.choices:
-                    raise RuntimeError(
-                        f"LLM returned empty choices (model={config.model})"
-                    )
-                content = response.choices[0].message.content or ""
-                logger.debug("Response length: %d chars", len(content))
-                self._notify_usage(content, self._extract_usage(response),
-                                   config.model, latency)
-                return content
-            except Exception as exc:
-                last_exc = exc
-                # Fallback: if proxy rejects max_completion_tokens, switch to max_tokens
-                if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
-                    logger.info("Proxy doesn't support max_completion_tokens, falling back to max_tokens")
-                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
-                    continue
-                if attempt < MAX_API_RETRIES and self._is_retryable(exc):
-                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
-                    # Connection errors get extra delay (proxy/network recovery)
-                    if "connection" in str(exc).lower():
-                        delay = max(delay, 10.0)
-                    logger.warning(
-                        "LLM call failed (model=%s, attempt %d/%d): %s. Retrying in %.1fs...",
-                        config.model, attempt + 1, MAX_API_RETRIES + 1, exc, delay,
-                    )
-                    await asyncio.sleep(delay)
-                else:
-                    break
-
-        logger.error("LLM call failed (model=%s): %s", config.model, last_exc)
-        raise RuntimeError(
-            f"LLM call to model {config.model!r} failed after {MAX_API_RETRIES + 1} attempts: {last_exc}"
-        ) from last_exc
+        result = await self.generate_with_usage(config, system_prompt, user_prompt, json_mode)
+        return result.content
 
     async def generate_with_usage(
         self,

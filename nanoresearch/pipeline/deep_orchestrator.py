@@ -1,11 +1,9 @@
-"""Deep pipeline orchestrator — runs the full experiment-backed research flow."""
+"""Deep 9-stage pipeline orchestrator."""
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import time
-import traceback
+import shutil
 from typing import Any
 
 from nanoresearch.agents.analysis import AnalysisAgent
@@ -18,22 +16,15 @@ from nanoresearch.agents.planning import PlanningAgent
 from nanoresearch.agents.review import ReviewAgent
 from nanoresearch.agents.setup import SetupAgent
 from nanoresearch.agents.writing import WritingAgent
-from nanoresearch.config import ResearchConfig
-from nanoresearch.pipeline.blueprint_validator import validate_blueprint
-from nanoresearch.pipeline.cost_tracker import CostTracker
-from nanoresearch.pipeline.progress import ProgressEmitter
+from nanoresearch.pipeline.base_orchestrator import BaseOrchestrator
 from nanoresearch.pipeline.state import PipelineStateMachine
-from nanoresearch.pipeline.workspace import Workspace
 from nanoresearch.schemas.manifest import PipelineMode, PipelineStage
 
 logger = logging.getLogger(__name__)
 
 
-DEEP_PROCESSING_STAGES = PipelineStateMachine.processing_stages(PipelineMode.DEEP)
-
-
-class DeepPipelineOrchestrator:
-    """Runs the deep research pipeline with real setup, execution, and analysis."""
+class DeepPipelineOrchestrator(BaseOrchestrator):
+    """Runs the deep 9-stage research pipeline with real experiments."""
 
     _STAGE_KEY_MAP: dict[PipelineStage, str] = {
         PipelineStage.IDEATION: "ideation_output",
@@ -59,140 +50,32 @@ class DeepPipelineOrchestrator:
         PipelineStage.REVIEW: "drafts/review_output.json",
     }
 
-    def __init__(self, workspace: Workspace, config: ResearchConfig) -> None:
-        self.workspace = workspace
-        self.config = config
-        self.cost_tracker = CostTracker()
-        self.progress_emitter = ProgressEmitter(workspace.path / "progress.json")
-        self.state_machine = PipelineStateMachine(
-            workspace.manifest.current_stage,
-            mode=PipelineMode.DEEP,
-        )
-        self._agents: dict[PipelineStage, BaseResearchAgent] = {
-            PipelineStage.IDEATION: IdeationAgent(workspace, config),
-            PipelineStage.PLANNING: PlanningAgent(workspace, config),
-            PipelineStage.SETUP: SetupAgent(workspace, config),
-            PipelineStage.CODING: CodingAgent(workspace, config),
-            PipelineStage.EXECUTION: ExecutionAgent(workspace, config),
-            PipelineStage.ANALYSIS: AnalysisAgent(workspace, config),
-            PipelineStage.FIGURE_GEN: FigureAgent(workspace, config),
-            PipelineStage.WRITING: WritingAgent(workspace, config),
-            PipelineStage.REVIEW: ReviewAgent(workspace, config),
+    _PIPELINE_MODE = PipelineMode.DEEP
+
+    def _build_agents(self) -> dict[PipelineStage, BaseResearchAgent]:
+        return {
+            PipelineStage.IDEATION: IdeationAgent(self.workspace, self.config),
+            PipelineStage.PLANNING: PlanningAgent(self.workspace, self.config),
+            PipelineStage.SETUP: SetupAgent(self.workspace, self.config),
+            PipelineStage.CODING: CodingAgent(self.workspace, self.config),
+            PipelineStage.EXECUTION: ExecutionAgent(self.workspace, self.config),
+            PipelineStage.ANALYSIS: AnalysisAgent(self.workspace, self.config),
+            PipelineStage.FIGURE_GEN: FigureAgent(self.workspace, self.config),
+            PipelineStage.WRITING: WritingAgent(self.workspace, self.config),
+            PipelineStage.REVIEW: ReviewAgent(self.workspace, self.config),
         }
-        # Wire each agent's dispatcher to feed the cost tracker
-        for agent in self._agents.values():
-            agent._dispatcher._usage_callback = self.cost_tracker.record
 
-    async def close(self) -> None:
-        for agent in self._agents.values():
-            await agent.close()
+    def _get_processing_stages(self) -> list[PipelineStage]:
+        return PipelineStateMachine.processing_stages(PipelineMode.DEEP)
 
-    async def run(self, topic: str) -> dict[str, Any]:
-        """Run the full deep pipeline."""
-
-        if self.workspace.manifest.pipeline_mode != PipelineMode.DEEP:
-            self.workspace.update_manifest(pipeline_mode=PipelineMode.DEEP)
-
-        logger.info("Starting DEEP pipeline for topic: %s", topic)
-        logger.info("Current stage: %s", self.state_machine.current.value)
-
-        self._reset_stale_running_stages()
-
-        results: dict[str, Any] = {
+    def _get_initial_results(self, topic: str) -> dict[str, Any]:
+        return {
             "topic": topic,
             "pipeline_mode": PipelineMode.DEEP.value,
         }
 
-        try:
-            return await self._run_all_stages(topic, results)
-        except Exception:
-            self.progress_emitter.pipeline_complete(False, "Deep pipeline failed")
-            raise
-
-    async def _run_all_stages(
-        self, topic: str, results: dict[str, Any]
-    ) -> dict[str, Any]:
-        """Execute all deep pipeline stages sequentially."""
-        total_stages = len(DEEP_PROCESSING_STAGES)
-        for stage_idx, stage in enumerate(DEEP_PROCESSING_STAGES):
-            stage_record = self.workspace.manifest.stages.get(stage.value)
-            if stage_record and stage_record.status == "completed":
-                logger.info("Skipping completed stage: %s", stage.value)
-                results.update(self._load_stage_output(stage, require=True))
-                # Advance state machine so subsequent stages can transition.
-                # Use _current directly: transition() would reject if the
-                # manifest's current_stage put us out-of-order after a crash.
-                self.state_machine._current = stage
-                continue
-
-            if not self.state_machine.can_transition(stage):
-                if self.state_machine.current == stage:
-                    pass
-                else:
-                    prior = self._load_stage_output(stage)
-                    if prior:
-                        results.update(prior)
-                        logger.info(
-                            "Loaded prior output for skipped deep stage %s",
-                            stage.value,
-                        )
-                    else:
-                        logger.warning(
-                            "Skipping deep stage %s (no transition from %s) and no prior output found",
-                            stage.value,
-                            self.state_machine.current.value,
-                        )
-                    continue
-
-            if self.state_machine.current != stage:
-                self.state_machine.transition(stage)
-
-            self.progress_emitter.stage_start(
-                stage.value, total_stages, stage_idx,
-                f"[{stage_idx+1}/{total_stages}] Running {stage.value}...",
-            )
-            self.cost_tracker.set_stage(stage.value)
-
-            t0 = time.monotonic()
-            stage_result = await self._run_stage_with_retry(stage, topic, results)
-            duration = time.monotonic() - t0
-            results.update(stage_result)
-
-            # Blueprint semantic validation after PLANNING
-            if stage == PipelineStage.PLANNING:
-                bp = results.get("experiment_blueprint", {})
-                issues = validate_blueprint(bp)
-                if issues:
-                    for issue in issues:
-                        logger.warning("Blueprint issue: %s", issue)
-                    self.progress_emitter.substep(
-                        stage.value,
-                        f"Blueprint validation: {len(issues)} issue(s) found",
-                    )
-
-            self.progress_emitter.stage_complete(
-                stage.value, total_stages, stage_idx,
-                f"[{stage_idx+1}/{total_stages}] {stage.value} completed in {duration:.1f}s",
-            )
-
-        self.state_machine.transition(PipelineStage.DONE)
-        self.workspace.update_manifest(current_stage=PipelineStage.DONE)
-
-        # Save cost summary
-        cost_summary = self.cost_tracker.summary()
-        self.workspace.write_json("logs/cost_summary.json", cost_summary)
-        results["cost_summary"] = cost_summary
-        if cost_summary["total_tokens"] > 0:
-            logger.info(
-                "Cost summary: %d total tokens, %d calls, %.1fs total latency",
-                cost_summary["total_tokens"],
-                cost_summary["total_calls"],
-                cost_summary["total_latency_ms"] / 1000,
-            )
-
-        self.progress_emitter.pipeline_complete(True, "Deep pipeline completed")
-        logger.info("Deep pipeline completed!")
-
+    def _post_pipeline(self, results: dict[str, Any]) -> None:
+        """Export project and copy experiment code after successful completion."""
         try:
             export_path = self.workspace.export()
             logger.info("Exported project to: %s", export_path)
@@ -200,8 +83,6 @@ class DeepPipelineOrchestrator:
 
             exp_dir = self.workspace.path / "experiment"
             if exp_dir.exists():
-                import shutil
-
                 code_dest = export_path / "code"
                 code_dest.mkdir(exist_ok=True)
                 for file_path in (
@@ -217,70 +98,11 @@ class DeepPipelineOrchestrator:
                     results_dest.mkdir(exist_ok=True)
                     for file_path in results_src.iterdir():
                         if file_path.is_file() and file_path.suffix in (
-                            ".json",
-                            ".csv",
-                            ".log",
+                            ".json", ".csv", ".log",
                         ):
                             shutil.copy2(file_path, results_dest / file_path.name)
         except Exception as exc:
             logger.warning("Export failed (non-fatal): %s", exc)
-
-        return results
-
-    async def _run_stage_with_retry(
-        self,
-        stage: PipelineStage,
-        topic: str,
-        accumulated: dict,
-    ) -> dict[str, Any]:
-        """Run one deep stage with retry logic."""
-
-        max_retries = self.config.max_retries
-        last_error = ""
-
-        for attempt in range(max_retries + 1):
-            try:
-                self.workspace.mark_stage_running(stage)
-                logger.info(
-                    "Running %s (attempt %d/%d)",
-                    stage.value,
-                    attempt + 1,
-                    max_retries + 1,
-                )
-
-                agent = self._agents[stage]
-                inputs = self._prepare_inputs(stage, topic, accumulated, last_error)
-                result = await agent.run(**inputs)
-
-                self.workspace.mark_stage_completed(
-                    stage,
-                    self._OUTPUT_FILE_MAP.get(stage, ""),
-                )
-                logger.info("Stage %s completed", stage.value)
-                return self._wrap_stage_output(stage, result)
-
-            except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                tb = traceback.format_exc()
-                logger.error("Stage %s failed: %s", stage.value, last_error)
-
-                self.workspace.write_text(
-                    f"logs/{stage.value.lower()}_error_{attempt}.txt",
-                    f"Error: {last_error}\n\nTraceback:\n{tb}",
-                )
-
-                if attempt < max_retries:
-                    self.workspace.increment_retry(stage)
-                    delay = 3.0 * (2.0 ** attempt)  # exponential backoff
-                    logger.info("Retrying %s in %.0fs...", stage.value, delay)
-                    await asyncio.sleep(delay)
-                else:
-                    self.workspace.mark_stage_failed(stage, last_error)
-                    raise RuntimeError(
-                        f"Stage {stage.value} failed after {max_retries + 1} attempts: {last_error}"
-                    ) from exc
-
-        raise RuntimeError("Unreachable")
 
     def _prepare_inputs(
         self,
@@ -289,8 +111,6 @@ class DeepPipelineOrchestrator:
         accumulated: dict,
         last_error: str,
     ) -> dict[str, Any]:
-        """Prepare inputs for each deep stage."""
-
         inputs: dict[str, Any] = {}
 
         if stage == PipelineStage.IDEATION:
@@ -302,41 +122,26 @@ class DeepPipelineOrchestrator:
         elif stage == PipelineStage.SETUP:
             inputs["topic"] = topic
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
 
         elif stage == PipelineStage.CODING:
             inputs["topic"] = topic
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
             inputs["setup_output"] = accumulated.get("setup_output", {})
 
         elif stage == PipelineStage.EXECUTION:
             inputs["topic"] = topic
             inputs["coding_output"] = accumulated.get("coding_output", {})
             inputs["setup_output"] = accumulated.get("setup_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
 
         elif stage == PipelineStage.ANALYSIS:
             inputs["execution_output"] = accumulated.get("execution_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
 
         elif stage == PipelineStage.FIGURE_GEN:
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
             exec_output = accumulated.get("execution_output", {})
             analysis_output = accumulated.get("analysis_output", {})
             inputs["experiment_results"] = (
@@ -356,10 +161,7 @@ class DeepPipelineOrchestrator:
 
         elif stage == PipelineStage.WRITING:
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
             fig_output = accumulated.get("figure_gen_output", {})
             if not fig_output or not fig_output.get("figures"):
                 analysis_figures = accumulated.get("analysis_output", {}).get("figures", {})
@@ -393,11 +195,7 @@ class DeepPipelineOrchestrator:
                     paper_tex = tex_path.read_text(errors="replace")
             inputs["paper_tex"] = paper_tex
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
-            inputs["experiment_blueprint"] = accumulated.get(
-                "experiment_blueprint",
-                {},
-            )
-            # Pass grounding metadata so review can protect real results
+            inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
             exec_output = accumulated.get("execution_output", {})
             analysis_output = accumulated.get("analysis_output", {})
             inputs["experiment_results"] = (
@@ -416,51 +214,3 @@ class DeepPipelineOrchestrator:
             inputs["_retry_error"] = last_error
 
         return inputs
-
-    def _wrap_stage_output(
-        self,
-        stage: PipelineStage,
-        result: dict,
-    ) -> dict[str, Any]:
-        """Wrap agent output with a stage-specific key."""
-
-        key = self._STAGE_KEY_MAP.get(stage, stage.value.lower())
-        return {key: result}
-
-    def _load_stage_output(
-        self,
-        stage: PipelineStage,
-        *,
-        require: bool = False,
-    ) -> dict[str, Any]:
-        """Load previously saved output for resume."""
-
-        path = self._OUTPUT_FILE_MAP.get(stage)
-        if path:
-            try:
-                data = self.workspace.read_json(path)
-                key = self._STAGE_KEY_MAP.get(stage, stage.value.lower())
-                return {key: data}
-            except FileNotFoundError:
-                if require:
-                    raise RuntimeError(
-                        f"Stage {stage.value} is marked completed but output file '{path}' is missing."
-                    )
-        return {}
-
-    def _reset_stale_running_stages(self) -> None:
-        """Reset stages left in running status by a previous crash."""
-
-        manifest = self.workspace.manifest
-        changed = False
-        for stage_key, record in manifest.stages.items():
-            if record.status == "running":
-                logger.warning(
-                    "Stage %s was left in 'running' status (likely from a crash). Resetting to 'pending'.",
-                    stage_key,
-                )
-                record.status = "pending"
-                record.error_message = ""
-                changed = True
-        if changed:
-            self.workspace._write_manifest(manifest)
