@@ -10,6 +10,7 @@ from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
 from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
+from nanoresearch.latex import fixer as latex_fixer
 from nanoresearch.schemas.manifest import PipelineStage
 from nanoresearch.schemas.review import (
     ConsistencyIssue,
@@ -57,8 +58,16 @@ class ReviewAgent(BaseResearchAgent):
 
         self.log("Starting automated review")
 
-        # Step 1: LLM review — score each section (split-based for full coverage)
-        review = await self._review_paper(paper_tex, ideation_output, experiment_blueprint)
+        # Step 1: LLM review — multi-model if committee configured, else single
+        committee = getattr(self.config, "review_committee", [])
+        if isinstance(committee, list) and len(committee) >= 2:
+            review = await self._multi_reviewer_assessment(
+                paper_tex, ideation_output, experiment_blueprint, committee
+            )
+        else:
+            review = await self._review_paper(
+                paper_tex, ideation_output, experiment_blueprint
+            )
         self.log(
             f"Initial review: overall score {review.overall_score:.1f}, "
             f"{len(review.section_reviews)} sections reviewed"
@@ -88,6 +97,45 @@ class ReviewAgent(BaseResearchAgent):
         review.consistency_issues.extend(citation_issues)
         if citation_issues:
             self.log(f"Found {len(citation_issues)} citation coverage issues")
+
+        # Step 2e: Citation fact-checking (LLM-based)
+        try:
+            from nanoresearch.agents.review_citation_checker import (
+                verify_citation_claims,
+            )
+
+            bibtex_map = self._build_bibtex_key_to_paper_map(
+                paper_tex, ideation_output.get("papers", [])
+            )
+            if bibtex_map:
+                cite_verifications = await verify_citation_claims(
+                    self, paper_tex, bibtex_map
+                )
+                inaccurate = [v for v in cite_verifications if not v["accurate"]]
+                if inaccurate:
+                    self.log(
+                        f"Citation fact-check: {len(inaccurate)} "
+                        f"potentially inaccurate claims"
+                    )
+                    for v in inaccurate:
+                        review.consistency_issues.append(
+                            ConsistencyIssue(
+                                issue_type="citation_inaccuracy",
+                                description=(
+                                    f"Claim about [{v['cite_key']}] may be "
+                                    f"inaccurate: {v.get('issue', 'unspecified')}"
+                                ),
+                                locations=[],
+                                severity="medium",
+                            )
+                        )
+                else:
+                    self.log(
+                        f"Citation fact-check: {len(cite_verifications)} "
+                        f"claims verified, all accurate"
+                    )
+        except Exception as exc:
+            logger.warning("Citation fact-checking failed: %s", exc)
 
         # Step 2b: Fix incoherent reviews (low score but no issues)
         for sr in review.section_reviews:
@@ -621,6 +669,334 @@ class ReviewAgent(BaseResearchAgent):
             }
         return None
 
+    # ── Multi-model review committee ──────────────────────────────────
+
+    async def _multi_reviewer_assessment(
+        self,
+        paper_tex: str,
+        ideation_output: dict,
+        experiment_blueprint: dict,
+        committee: list[dict],
+    ) -> ReviewOutput:
+        """Run parallel reviews from multiple model personas, merge results.
+
+        Falls back to single-model review if all reviewers fail.
+        """
+        import asyncio as _aio
+
+        tasks = []
+        for reviewer in committee:
+            tasks.append(
+                self._review_as_role(
+                    paper_tex, ideation_output, experiment_blueprint, reviewer
+                )
+            )
+        results = await _aio.gather(*tasks, return_exceptions=True)
+
+        valid_reviews: list[ReviewOutput] = []
+        weights: list[float] = []
+        for review_result, reviewer in zip(results, committee):
+            if isinstance(review_result, Exception):
+                self.log(
+                    f"Reviewer '{reviewer.get('role', '?')}' failed: "
+                    f"{review_result}"
+                )
+                continue
+            valid_reviews.append(review_result)
+            weights.append(reviewer.get("weight", 1.0 / len(committee)))
+
+        if not valid_reviews:
+            self.log("All reviewers failed, falling back to single-model")
+            return await self._review_paper(
+                paper_tex, ideation_output, experiment_blueprint
+            )
+
+        # Normalize weights (fallback to equal weights if all zero)
+        total_w = sum(weights)
+        if total_w > 0:
+            weights = [w / total_w for w in weights]
+        else:
+            weights = [1.0 / len(weights)] * len(weights)
+
+        # Weighted overall score
+        overall = sum(
+            r.overall_score * w for r, w in zip(valid_reviews, weights)
+        )
+
+        # Merge section reviews: per-section min score + union issues
+        merged_sections = self._merge_section_reviews(valid_reviews)
+
+        # Union major/minor revisions (dedup by first 80 chars)
+        major: list[str] = []
+        minor: list[str] = []
+        seen_major: set[str] = set()
+        seen_minor: set[str] = set()
+        for r in valid_reviews:
+            for issue in r.major_revisions:
+                key = issue[:80].lower()
+                if key not in seen_major:
+                    major.append(issue)
+                    seen_major.add(key)
+            for sug in r.minor_revisions:
+                key = sug[:80].lower()
+                if key not in seen_minor:
+                    minor.append(sug)
+                    seen_minor.add(key)
+
+        self.log(
+            f"Multi-reviewer assessment: {len(valid_reviews)} reviewers, "
+            f"weighted score {overall:.1f}"
+        )
+
+        return ReviewOutput(
+            overall_score=round(overall, 2),
+            section_reviews=merged_sections,
+            major_revisions=major,
+            minor_revisions=minor,
+        )
+
+    async def _review_as_role(
+        self,
+        paper_tex: str,
+        ideation_output: dict,
+        experiment_blueprint: dict,
+        reviewer: dict,
+    ) -> ReviewOutput:
+        """Run a full review using a specific reviewer persona and model."""
+        from nanoresearch.config import StageModelConfig
+
+        role = reviewer.get("role", "Reviewer")
+        focus = reviewer.get("focus", "overall paper quality")
+
+        reviewer_config = StageModelConfig(
+            model=reviewer.get("model", self.config.for_stage("review").model),
+            base_url=reviewer.get("base_url"),
+            api_key=reviewer.get("api_key"),
+            temperature=reviewer.get("temperature", 0.3),
+            max_tokens=reviewer.get("max_tokens", 16384),
+            timeout=reviewer.get("timeout", 300.0),
+        )
+
+        # Extract sections (same logic as _review_paper)
+        sections = self._extract_sections(paper_tex)
+        main_sections: list[tuple[str, str]] = []
+        for h, _c, level in sections:
+            if level == 0:
+                merged = self._get_full_section_content(sections, h)
+                main_sections.append((h, merged))
+        if not main_sections:
+            main_sections = [(h, c) for h, c, _lvl in sections[:10]]
+
+        section_reviews: list[SectionReview] = []
+        for heading, content in main_sections:
+            try:
+                sr = await self._review_single_section_as_role(
+                    heading, content, ideation_output, experiment_blueprint,
+                    reviewer_config, role, focus,
+                )
+                section_reviews.append(sr)
+            except Exception as e:
+                logger.warning(
+                    "Reviewer %s failed on section '%s': %s", role, heading, e
+                )
+                section_reviews.append(
+                    SectionReview(section=heading, score=5, issues=[str(e)])
+                )
+
+        overall_score = (
+            sum(sr.score for sr in section_reviews) / len(section_reviews)
+            if section_reviews else 5.0
+        )
+        major = []
+        minor = []
+        for sr in section_reviews:
+            if sr.score < 5:
+                major.extend(sr.issues[:2])
+            elif sr.score < 7:
+                minor.extend(sr.suggestions[:2])
+
+        return ReviewOutput(
+            overall_score=overall_score,
+            section_reviews=section_reviews,
+            major_revisions=major,
+            minor_revisions=minor,
+        )
+
+    async def _review_single_section_as_role(
+        self,
+        heading: str,
+        content: str,
+        ideation_output: dict,
+        experiment_blueprint: dict,
+        reviewer_config,
+        role: str,
+        focus: str,
+    ) -> SectionReview:
+        """Review a section using a specific reviewer persona."""
+        system_prompt = (
+            f"You are a top-tier {role} at a major ML conference "
+            f"(NeurIPS/ICML/ICLR). Your primary focus: {focus}.\n"
+            f"Review the paper section and provide structured feedback. "
+            f"Be rigorous but constructive."
+        )
+
+        prompt = f"""Review the following section of an academic paper.
+
+Section: {heading}
+
+```latex
+{content[:12000]}
+```
+
+Research context:
+- Topic: {str(ideation_output.get('topic', 'Unknown'))[:500]}
+- Method: {str((experiment_blueprint.get('proposed_method') or {}).get('name', 'Unknown'))[:500]}
+
+Focus on: {focus}
+
+Return JSON:
+{{
+    "section": "{heading}",
+    "score": 7,
+    "issues": ["Issue 1: specific problem and how to fix it"],
+    "suggestions": ["Suggestion 1"]
+}}
+
+Score rubric: 9-10 publication-ready, 7-8 solid with minor issues, 5-6 significant problems, 3-4 major rewrite, 1-2 fundamentally flawed."""
+
+        try:
+            result = await self.generate_json(
+                system_prompt, prompt, stage_override=reviewer_config
+            )
+        except Exception:
+            raw = await self.generate(
+                system_prompt, prompt, json_mode=True,
+                stage_override=reviewer_config,
+            )
+            result = self._repair_truncated_json(raw or "")
+            if result is None or isinstance(result, list):
+                result = {"section": heading, "score": 5, "issues": [], "suggestions": []}
+
+        raw_score = result.get("score", 5)
+        try:
+            score = max(1, min(10, int(float(raw_score))))
+        except (TypeError, ValueError):
+            score = 5
+
+        issues = [
+            str(i) for i in result.get("issues", [])[:5]
+            if i
+        ]
+        suggestions = [
+            str(s) for s in result.get("suggestions", [])[:3]
+            if s
+        ]
+
+        if not issues and score < 7:
+            score = 7
+
+        return SectionReview(
+            section=result.get("section", heading),
+            score=score,
+            issues=issues,
+            suggestions=suggestions,
+        )
+
+    @staticmethod
+    def _merge_section_reviews(reviews: list[ReviewOutput]) -> list[SectionReview]:
+        """Merge section reviews from multiple reviewers.
+
+        Strategy: per-section min score (strictest reviewer wins),
+        union all issues/suggestions with dedup.
+        """
+        section_map: dict[str, dict] = {}
+        for review in reviews:
+            for sr in review.section_reviews:
+                name = sr.section.lower().strip()
+                if name not in section_map:
+                    section_map[name] = {
+                        "section": sr.section,
+                        "score": sr.score,
+                        "issues": list(sr.issues),
+                        "suggestions": list(sr.suggestions),
+                    }
+                else:
+                    existing = section_map[name]
+                    existing["score"] = min(existing["score"], sr.score)
+                    seen_i = {i[:80].lower() for i in existing["issues"]}
+                    for issue in sr.issues:
+                        if issue[:80].lower() not in seen_i:
+                            existing["issues"].append(issue)
+                            seen_i.add(issue[:80].lower())
+                    seen_s = {s[:80].lower() for s in existing["suggestions"]}
+                    for sug in sr.suggestions:
+                        if sug[:80].lower() not in seen_s:
+                            existing["suggestions"].append(sug)
+                            seen_s.add(sug[:80].lower())
+
+        return [
+            SectionReview(
+                section=d["section"],
+                score=max(1, min(10, d["score"])),
+                issues=d["issues"],
+                suggestions=d["suggestions"],
+            )
+            for d in section_map.values()
+        ]
+
+    # ── Citation fact-checking helpers ────────────────────────────────
+
+    @staticmethod
+    def _build_bibtex_key_to_paper_map(
+        paper_tex: str, papers: list,
+    ) -> dict[str, dict]:
+        """Build mapping from BibTeX cite key → paper dict (with title/abstract).
+
+        Matches BibTeX entries in the paper to papers from ideation
+        by title similarity.
+        """
+        if not isinstance(papers, list) or not papers:
+            return {}
+
+        # Extract bibtex entries: key → title
+        # Regex handles one level of nested braces: title = {{Nested}} or {A {B} C}
+        bib_entries: dict[str, str] = {}
+        for m in re.finditer(
+            r'@\w+\s*\{\s*([^,\s]+)\s*,.*?title\s*=\s*\{((?:[^{}]|\{[^{}]*\})*)\}',
+            paper_tex, re.DOTALL | re.IGNORECASE,
+        ):
+            title = m.group(2).strip().lower()
+            # Strip outer braces from BibTeX-style {{Title}}
+            if title.startswith("{") and title.endswith("}"):
+                title = title[1:-1].strip()
+            bib_entries[m.group(1).strip()] = title
+
+        if not bib_entries:
+            return {}
+
+        # Build title → paper dict index from ideation papers
+        title_to_paper: dict[str, dict] = {}
+        for p in papers:
+            if isinstance(p, dict) and p.get("title"):
+                title_to_paper[p["title"].lower().strip()] = p
+
+        # Match bibtex entries to papers by title
+        result: dict[str, dict] = {}
+        for key, bib_title in bib_entries.items():
+            # Exact match first
+            if bib_title in title_to_paper:
+                result[key] = title_to_paper[bib_title]
+                continue
+            # Fuzzy: check if bib_title is a significant substring
+            for ptitle, paper in title_to_paper.items():
+                if len(bib_title) > 10 and (
+                    bib_title in ptitle or ptitle in bib_title
+                ):
+                    result[key] = paper
+                    break
+
+        return result
+
     async def _review_single_section(
         self,
         heading: str,
@@ -851,11 +1227,8 @@ Return JSON:
             keys = [m[0] or m[1] for m in bib_match[:50]]
             bib_keys = f"\n\nAvailable citation keys: {', '.join(keys)}"
 
-        # Smart truncation: preserve both content and bibliography
-        tex_for_prompt = paper_tex
-        if len(paper_tex) > 20000:
-            # Keep first 12000 chars (content) + last 8000 chars (bibliography)
-            tex_for_prompt = paper_tex[:12000] + "\n...[middle truncated]...\n" + paper_tex[-8000:]
+        # Smart truncation: section-boundary-aware to avoid losing Method/Experiment
+        tex_for_prompt = self._smart_truncate(paper_tex, max_chars=20000)
 
         prompt = f"""Revise the "{section_review.section}" section of this paper.
 
@@ -1035,6 +1408,62 @@ Return JSON:
         except Exception as exc:
             logger.warning("Meta-refine retry failed for '%s': %s", section_name, exc)
             return None
+
+    @staticmethod
+    def _smart_truncate(text: str, max_chars: int = 20000) -> str:
+        """Truncate paper text preserving high-priority sections.
+
+        Instead of naive head/tail split (which often drops Method/Experiment),
+        keep preamble + sections by priority order.
+        """
+        if len(text) <= max_chars:
+            return text
+
+        # Find section boundaries
+        section_starts = [
+            (m.start(), m.group(1))
+            for m in re.finditer(r'\\section\{([^}]+)\}', text)
+        ]
+        if not section_starts:
+            # No sections found, fall back to head/tail
+            return text[:12000] + "\n\n[...truncated...]\n\n" + text[-8000:]
+
+        # Always keep preamble (title, abstract, etc.) up to first \section
+        preamble = text[:section_starts[0][0]]
+        remaining = max_chars - len(preamble)
+        if remaining <= 0:
+            return preamble[:max_chars]
+
+        # Collect sections by priority, record their original position for ordering
+        priority = ["introduction", "method", "experiment",
+                     "result", "conclusion", "related"]
+        # (original_start_pos, section_text) — for document-order output
+        kept: list[tuple[int, str]] = []
+
+        for pname in priority:
+            if remaining <= 0:
+                break
+            for i, (start, title) in enumerate(section_starts):
+                if pname in title.lower():
+                    end = (section_starts[i + 1][0]
+                           if i + 1 < len(section_starts)
+                           else len(text))
+                    content = text[start:end]
+                    if len(content) <= remaining:
+                        kept.append((start, content))
+                        remaining -= len(content)
+                    elif remaining > 500:
+                        kept.append((start,
+                                     content[:remaining] + "\n[...truncated...]"))
+                        remaining = 0
+                    break
+
+        if not kept:
+            return text[:max_chars]
+
+        # Sort by original document position so LLM sees correct order
+        kept.sort(key=lambda x: x[0])
+        return preamble + "\n\n".join(s for _, s in kept)
 
     @staticmethod
     def _get_section_revision_guidance(section_name: str) -> str:
@@ -1441,7 +1870,9 @@ Return JSON:
         except OSError:
             pass  # non-fatal
 
+        import hashlib
         result: dict = {}
+        seen_error_sigs: set[str] = set()
         for attempt in range(MAX_LATEX_FIX_ATTEMPTS + 1):
             try:
                 result = await compile_pdf(str(tex_path))
@@ -1456,6 +1887,13 @@ Return JSON:
                 return result
 
             error_msg = result.get("error", "Unknown compilation error")
+
+            # Detect repeated identical errors to avoid infinite loops
+            error_sig = hashlib.md5(error_msg[-500:].encode()).hexdigest()[:8]
+            if error_sig in seen_error_sigs:
+                self.log("LaTeX fix loop: same error repeated, stopping")
+                return result
+            seen_error_sigs.add(error_sig)
 
             # Don't retry if the problem isn't fixable via LaTeX edits
             if "not found" in error_msg.lower() or "not available" in error_msg.lower():
@@ -1530,55 +1968,32 @@ Return JSON:
     async def _fix_latex_errors(self, tex_source: str, error_log: str) -> str | None:
         """Fix LaTeX compilation errors using a 2-level strategy.
 
-        Level 1: Deterministic fixes (no LLM) — Unicode, missing packages, preamble junk
-        Level 2: Search-replace LLM fix — LLM outputs {"old":"...","new":"..."} pairs,
-                 applied via str.replace(). Safe: no match = no change.
+        Level 1: Deterministic fixes (no LLM) — via shared latex.fixer module.
+        Level 2: Search-replace LLM fix — LLM outputs {"old":"...","new":"..."} pairs.
 
         Inspired by OpenClaw's edit tool: minimal LLM output, exact text matching.
         NEVER sends the full document to the LLM for rewriting.
         """
-        if len(error_log) > 3000:
-            error_log = error_log[:1500] + "\n...[truncated]...\n" + error_log[-1500:]
+        error_log = latex_fixer.truncate_error_log(error_log)
 
-        # Extract error line number(s) — prioritize actual error lines over warnings
-        error_lines: list[int] = []
-        for log_line in error_log.split('\n'):
-            if 'error:' in log_line.lower():
-                for m in re.finditer(r'\.tex:(\d+):', log_line):
-                    ln = int(m.group(1))
-                    if ln not in error_lines:
-                        error_lines.append(ln)
-                for m in re.finditer(r'(?:input line\s+|line\s+|l\.)(\d+)', log_line):
-                    ln = int(m.group(1))
-                    if ln not in error_lines:
-                        error_lines.append(ln)
-        # Fallback: any line number in the full error log
-        if not error_lines:
-            for m in re.finditer(r'(?:\.tex:(\d+):)', error_log):
-                ln = int(m.group(1))
-                if ln not in error_lines:
-                    error_lines.append(ln)
-            for m in re.finditer(r'(?:line\s+|l\.)(\d+)', error_log):
-                ln = int(m.group(1))
-                if ln not in error_lines:
-                    error_lines.append(ln)
+        error_lines = latex_fixer.extract_error_lines(error_log)
         error_line = error_lines[0] if error_lines else None
 
         tex_lines = tex_source.split('\n')
         error_lower = error_log.lower()
 
         # ──────────── Level 1: Deterministic fixes ────────────
-        fixed_deterministic = self._try_deterministic_fix(tex_source, tex_lines, error_log, error_lower, error_line)
-        if fixed_deterministic and fixed_deterministic != tex_source:
+        fixed = latex_fixer.deterministic_fix(
+            tex_source, error_log, error_line, log_fn=self.log,
+        )
+        if fixed and fixed != tex_source:
             self.log("  Level 1: deterministic fix applied")
-            return fixed_deterministic
+            return fixed
 
         # Classify error for LLM hint
-        targeted_hint = self._classify_error(error_lower)
+        targeted_hint = latex_fixer.classify_error(error_lower)
 
         # ──────────── Level 2: Search-replace LLM fix ────────────
-        # LLM outputs {"old": "...", "new": "..."} pairs, we apply with str.replace().
-        # Safe: if old text not found, nothing changes.
         result = await self._search_replace_llm_fix(
             tex_source, tex_lines, error_line, error_log, targeted_hint
         )
@@ -1596,137 +2011,15 @@ Return JSON:
         error_lower: str,
         error_line: int | None,
     ) -> str | None:
-        """Level 1: Apply deterministic fixes that don't need LLM."""
-        modified = tex_source
-
-        # 1. Garbage before \documentclass
-        dc_match = re.search(r'\\documentclass[\[{]', modified)
-        if dc_match and dc_match.start() > 0:
-            # Check if there's real content before \documentclass (not just comments)
-            prefix = modified[:dc_match.start()]
-            if re.search(r'[a-zA-Z]', prefix.replace('%', '')):
-                modified = modified[dc_match.start():]
-                self.log("  Deterministic: removed junk before \\documentclass")
-
-        # 2. Missing \end{document}
-        if "\\begin{document}" in modified and "\\end{document}" not in modified:
-            modified += "\n\\end{document}\n"
-            self.log("  Deterministic: added missing \\end{document}")
-
-        # 3. Unicode replacements (common compilation killers)
-        unicode_map = {
-            "\u2018": "`", "\u2019": "'", "\u201c": "``", "\u201d": "''",
-            "\u2014": "---", "\u2013": "--", "\u2026": "\\ldots{}",
-            "\u00d7": "$\\times$", "\u2264": "$\\leq$", "\u2265": "$\\geq$",
-            "\u2260": "$\\neq$", "\u221e": "$\\infty$", "\u03b1": "$\\alpha$",
-            "\u03b2": "$\\beta$", "\u03b3": "$\\gamma$", "\u03b4": "$\\delta$",
-            "\u03bb": "$\\lambda$", "\u03c0": "$\\pi$", "\u03c3": "$\\sigma$",
-            "\u2192": "$\\rightarrow$", "\u2190": "$\\leftarrow$",
-            "\u00b1": "$\\pm$", "\u2248": "$\\approx$",
-            "\u00e9": "{\\'e}",
-        }
-        if "invalid" in error_lower or "character" in error_lower or "unicode" in error_lower:
-            for char, repl in unicode_map.items():
-                if char in modified:
-                    modified = modified.replace(char, repl)
-                    self.log(f"  Deterministic: replaced U+{ord(char):04X}")
-
-            # Control characters (0x00-0x1F except \t \n \r)
-            control_map = {
-                '\x00': '', '\x01': '', '\x02': '', '\x03': '', '\x04': '',
-                '\x05': '', '\x06': '', '\x07': '', '\x08': '',
-                '\x0B': '', '\x0C': '', '\x0E': '', '\x0F': '',
-                '\x10': '', '\x11': '', '\x12': '', '\x13': '', '\x14': '',
-                '\x15': '', '\x16': '', '\x17': '', '\x18': '', '\x19': '',
-                '\x1A': '', '\x1B': '', '\x1C': '', '\x1D': '', '\x1E': '', '\x1F': '',
-            }
-            for char, repl in control_map.items():
-                if char in modified:
-                    modified = modified.replace(char, repl)
-                    self.log(f"  Deterministic: removed control char 0x{ord(char):02X}")
-
-        # 4. Missing packages — check for known undefined control sequences
-        preamble_end = modified.find("\\begin{document}")
-        if preamble_end > 0:
-            preamble = modified[:preamble_end]
-            package_fixes = {
-                "\\multirow": ("multirow", "\\usepackage{multirow}"),
-                # \multicolumn is a core LaTeX command — no package needed; omitted
-                "\\toprule": ("booktabs", "\\usepackage{booktabs}"),
-                "\\midrule": ("booktabs", "\\usepackage{booktabs}"),
-                "\\bottomrule": ("booktabs", "\\usepackage{booktabs}"),
-                "\\FloatBarrier": ("placeins", "\\usepackage{placeins}"),
-                "\\url{": ("url", "\\usepackage{url}"),
-                "\\href{": ("hyperref", "\\usepackage{hyperref}"),
-                "\\textcolor": ("xcolor", "\\usepackage{xcolor}"),
-                "\\cellcolor": ("xcolor", "\\usepackage[table]{xcolor}"),
-            }
-            if "undefined control sequence" in error_lower:
-                for cmd, (pkg, use_line) in package_fixes.items():
-                    if cmd in modified and pkg not in preamble:
-                        # Insert before \begin{document}
-                        modified = modified[:preamble_end] + use_line + "\n" + modified[preamble_end:]
-                        preamble_end += len(use_line) + 1
-                        preamble = modified[:preamble_end]
-                        self.log(f"  Deterministic: added {use_line}")
-
-        # 5. Mismatched environments at the error line
-        # Use modified (not original tex_lines) since prior steps may have changed line counts
-        modified_lines = modified.split('\n')
-        if error_line and error_line <= len(modified_lines):
-            err_line_text = modified_lines[error_line - 1]
-            # Common: \begin{figure} without matching \end{figure}
-            for env in ("figure", "figure*", "table", "table*", "align", "equation"):
-                begin_tag = f"\\begin{{{env}}}"
-                end_tag = f"\\end{{{env}}}"
-                if begin_tag in err_line_text or end_tag in err_line_text:
-                    begin_count = modified.count(begin_tag)
-                    end_count = modified.count(end_tag)
-                    if begin_count > end_count:
-                        # Missing \end — insert before \end{document}
-                        end_doc = modified.rfind("\\end{document}")
-                        if end_doc > 0:
-                            modified = modified[:end_doc] + end_tag + "\n\n" + modified[end_doc:]
-                            self.log(f"  Deterministic: added missing {end_tag}")
-                    elif end_count > begin_count:
-                        # Extra \end — remove the one at error line
-                        if error_line - 1 < len(modified_lines) and end_tag in modified_lines[error_line - 1]:
-                            modified_lines[error_line - 1] = modified_lines[error_line - 1].replace(end_tag, '', 1)
-                            modified = '\n'.join(modified_lines)
-                            self.log(f"  Deterministic: removed extra {end_tag} at line {error_line}")
-
-        return modified if modified != tex_source else None
+        """Level 1: Delegate to shared latex_fixer.deterministic_fix()."""
+        return latex_fixer.deterministic_fix(
+            tex_source, error_log, error_line, log_fn=self.log,
+        )
 
     @staticmethod
     def _classify_error(error_lower: str) -> str:
-        """Classify LaTeX error for targeted LLM guidance."""
-        if "invalid character" in error_lower or "unicode" in error_lower or "character" in error_lower:
-            return (
-                "Likely cause: Unicode characters (em-dash, en-dash, smart quotes, "
-                "non-ASCII). Replace with LaTeX equivalents: --- for em-dash, -- for "
-                "en-dash, standard quotes, \\alpha etc."
-            )
-        if "undefined control sequence" in error_lower:
-            return "Likely cause: Typo in command name or missing \\usepackage."
-        if "ended by" in error_lower:
-            return (
-                "Likely cause: \\begin{X} ended by \\end{Y} — typo in environment name. "
-                "Check for misspelled environment names like 'equaton' vs 'equation'."
-            )
-        if "missing" in error_lower and ("begin" in error_lower or "end" in error_lower):
-            return "Likely cause: Mismatched \\begin/\\end environments."
-        if "missing \\begin{document}" in error_lower:
-            return "Likely cause: Non-LaTeX content before \\begin{document}."
-        if "missing $" in error_lower:
-            return "Likely cause: Math symbols used outside math mode. Wrap with $...$."
-        if "extra }" in error_lower or "missing {" in error_lower or "missing }" in error_lower:
-            return (
-                "Likely cause: Mismatched braces { }. Look for an extra } or missing { "
-                "near the error line. Count braces carefully in math formulas like \\frac{}{}."
-            )
-        if "extra alignment" in error_lower or "misplaced" in error_lower:
-            return "Likely cause: & used outside tabular, or wrong number of columns in table."
-        return ""
+        """Delegate to shared latex_fixer.classify_error()."""
+        return latex_fixer.classify_error(error_lower)
 
     async def _search_replace_llm_fix(
         self,
@@ -1736,117 +2029,28 @@ Return JSON:
         error_log: str,
         targeted_hint: str,
     ) -> str | None:
-        """Level 2: Search-replace fix — LLM outputs exact old/new text pairs.
-
-        Inspired by OpenClaw's edit tool: the LLM identifies the broken text
-        and provides a replacement. We apply it with str.replace().
-        If the old text isn't found, nothing is changed (safe by design).
-        """
-        # Build context snippet around error for LLM to see
-        if error_line and error_line <= len(tex_lines):
-            err_idx = error_line - 1
-            win_start = max(0, err_idx - 20)
-            win_end = min(len(tex_lines), err_idx + 20 + 1)
-
-            # Expand to environment boundaries
-            env_stack: list[int] = []
-            for i in range(win_start, win_end):
-                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
-                    env_stack.append(i)
-                if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
-                    if env_stack:
-                        env_stack.pop()
-            if env_stack:
-                for i in range(win_end, min(len(tex_lines), win_end + 30)):
-                    if re.search(r'\\end\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
-                        win_end = i + 1
-                        env_stack.pop()
-                        if not env_stack:
-                            break
-            for i in range(win_start - 1, max(-1, win_start - 30), -1):
-                if i < 0:
-                    break
-                if re.search(r'\\begin\{(?:figure|table|align|equation|tabular)', tex_lines[i]):
-                    win_start = i
-                    break
-        else:
-            # No line number — show preamble + first 40 lines
-            win_start = 0
-            win_end = min(len(tex_lines), 40)
-
-        snippet_lines = tex_lines[win_start:win_end]
-        numbered = "\n".join(
-            f"{win_start + i + 1:>5}: {line}"
-            for i, line in enumerate(snippet_lines)
+        """Level 2: Search-replace fix via shared latex_fixer module."""
+        win_start, win_end, numbered = latex_fixer.build_error_snippet(
+            tex_lines, error_line,
         )
-
-        system = (
-            "You are a LaTeX error fixer. You will see a code snippet with an error.\n\n"
-            "Your job: identify the EXACT broken text and provide a replacement.\n\n"
-            "Reply with ONLY a JSON array of edit operations:\n"
-            '[\n'
-            '  {"old": "exact broken text from the snippet", "new": "fixed replacement text"}\n'
-            ']\n\n'
-            "Rules:\n"
-            "- old MUST be an EXACT substring copied from the snippet (including whitespace)\n"
-            "- old should be as SHORT as possible — just the broken part + enough context to be unique\n"
-            "- new is the corrected version of old\n"
-            "- You may include multiple edits if there are multiple errors\n"
-            "- Output ONLY the JSON array, nothing else\n"
-            "- Do NOT wrap in markdown fences"
-        )
-
-        line_ref = f" at line {error_line}" if error_line else ""
-        prompt = (
-            f"LaTeX compilation error{line_ref}:\n"
-            f"{error_log}\n\n"
-            f"{targeted_hint}\n\n"
-            f"Code snippet (lines {win_start + 1}-{win_end}):\n"
-            f"{numbered}\n\n"
-            f"Provide the search-replace edits as a JSON array."
+        prompt = latex_fixer.build_search_replace_prompt(
+            error_log, error_line, targeted_hint,
+            win_start, win_end, numbered,
         )
 
         revision_config = self.config.for_stage("revision")
         try:
-            raw = await self.generate(system, prompt, stage_override=revision_config)
-            edits = self._parse_edit_json(raw)
-
+            raw = await self.generate(
+                latex_fixer.SEARCH_REPLACE_SYSTEM_PROMPT, prompt,
+                stage_override=revision_config,
+            )
+            edits = latex_fixer.parse_edit_json(raw)
             if not edits:
                 self.log("  Level 2: LLM returned no valid edits")
                 return None
-
-            result = tex_source
-            applied = 0
-            for edit in edits:
-                old = edit.get("old", "")
-                new = edit.get("new", "")
-                if not old or old == new:
-                    continue
-                if old in result:
-                    result = result.replace(old, new, 1)
-                    applied += 1
-                    self.log(f"  Level 2: applied edit ({len(old)} chars → {len(new)} chars)")
-                else:
-                    # Try with normalized whitespace as fallback:
-                    # Build a regex from `old` where each whitespace run matches \s+,
-                    # then apply re.sub on the original text to preserve formatting.
-                    old_tokens = old.split()
-                    if old_tokens:
-                        ws_pattern = r'\s+'.join(re.escape(t) for t in old_tokens)
-                        ws_match = re.search(ws_pattern, result)
-                        if ws_match:
-                            result = result[:ws_match.start()] + new + result[ws_match.end():]
-                            applied += 1
-                            self.log(f"  Level 2: applied edit with whitespace normalization")
-                        else:
-                            self.log(f"  Level 2: old text not found, skipping edit")
-                    else:
-                        self.log(f"  Level 2: old text empty after split, skipping edit")
-
-            if applied > 0 and result != tex_source:
-                self.log(f"  Level 2: {applied} edit(s) applied successfully")
-                return result
-
+            return latex_fixer.apply_edits(
+                tex_source, edits, log_fn=self.log,
+            )
         except Exception as exc:
             self.log(f"  Level 2 search-replace fix failed: {exc}")
 
@@ -1854,39 +2058,8 @@ Return JSON:
 
     @staticmethod
     def _parse_edit_json(raw: str) -> list[dict]:
-        """Parse LLM output as JSON array of {"old": ..., "new": ...} edits."""
-        import json
-
-        raw = raw.strip()
-        # Strip markdown fences
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            lines = lines[1:]
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            raw = "\n".join(lines).strip()
-
-        # Try direct JSON parse
-        try:
-            data = json.loads(raw)
-            if isinstance(data, list):
-                return [e for e in data if isinstance(e, dict) and "old" in e and "new" in e]
-            if isinstance(data, dict) and "old" in data and "new" in data:
-                return [data]
-        except json.JSONDecodeError:
-            pass
-
-        # Try to extract JSON array from surrounding text
-        arr_match = re.search(r'\[.*\]', raw, re.DOTALL)
-        if arr_match:
-            try:
-                data = json.loads(arr_match.group(0))
-                if isinstance(data, list):
-                    return [e for e in data if isinstance(e, dict) and "old" in e and "new" in e]
-            except json.JSONDecodeError:
-                pass
-
-        return []
+        """Delegate to shared latex_fixer.parse_edit_json()."""
+        return latex_fixer.parse_edit_json(raw)
 
     @staticmethod
     def _apply_revisions(paper_tex: str, revised_sections: dict[str, str]) -> str:

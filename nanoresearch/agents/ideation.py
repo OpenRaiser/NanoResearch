@@ -107,9 +107,11 @@ class IdeationAgent(BaseResearchAgent):
         if cache_path.is_file():
             try:
                 cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                if not isinstance(cached, dict) or "papers" not in cached:
+                    raise ValueError("invalid cache structure")
                 self.log("Found cached search results from previous attempt, skipping search")
-            except Exception as e:
-                logger.warning("Failed to load ideation cache: %s", e)
+            except (json.JSONDecodeError, ValueError, OSError) as e:
+                self.log(f"Search cache invalid ({e}), starting fresh")
                 cached = None
 
         if (cached is not None

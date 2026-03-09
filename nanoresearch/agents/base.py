@@ -20,6 +20,15 @@ logger = logging.getLogger(__name__)
 # JSON valid escape characters (after the backslash)
 _VALID_JSON_ESCAPES = frozenset('"\\/bfnrtu')
 
+# Known LaTeX command prefixes — used to distinguish \textbf from JSON \t escape
+_LATEX_CMD_PREFIXES = frozenset([
+    "cite", "textbf", "textit", "frac", "ref", "label", "sqrt", "sum",
+    "int", "alpha", "beta", "gamma", "delta", "epsilon", "theta", "lambda",
+    "sigma", "omega", "text", "math", "begin", "end", "item", "section",
+    "subsection", "paragraph", "emph", "url", "href", "footnote",
+    "caption", "includegraphics", "usepackage", "newcommand",
+])
+
 # ---- Tool result management (OpenClaw-inspired patterns) ----
 
 _MAX_TOOL_RESULT_CHARS = 6000
@@ -91,8 +100,12 @@ def _fix_json_escapes(text: str) -> str:
             if next_char in _VALID_JSON_ESCAPES:
                 # Check if this is actually a LaTeX command (e.g. \textbf, \boldsymbol)
                 # rather than a JSON escape (\t, \n, \b, \f, \r, \u)
-                if next_char.isalpha() and i + 2 < len(text) and text[i + 2].isalpha():
-                    # Looks like LaTeX command — double-escape
+                cmd_match = re.match(r'([a-zA-Z]+)', text[i + 1:])
+                if cmd_match and (
+                    cmd_match.group(1) in _LATEX_CMD_PREFIXES
+                    or len(cmd_match.group(1)) > 1
+                ):
+                    # LaTeX command (known set, or 2+ alpha chars) — double-escape
                     result.append('\\\\')
                     i += 1  # re-process next_char as normal
                 else:
@@ -424,9 +437,9 @@ class BaseResearchAgent(ABC):
                     # but repeated identical failures get tagged [NON-RETRYABLE]
                     error_sig = type(e).__name__
                     try:
-                        args_hash = hash(frozenset(args.items())) if isinstance(args, dict) else hash(str(args))
-                    except TypeError:
-                        args_hash = hash(str(args))
+                        args_hash = hash(json.dumps(args, sort_keys=True, default=str))
+                    except (TypeError, ValueError):
+                        args_hash = hash(str(sorted(args.items())) if isinstance(args, dict) else str(args))
                     fail_key = f"{name}|{args_hash}|{error_sig}"
                     _failure_counts[fail_key] = _failure_counts.get(fail_key, 0) + 1
                     if _failure_counts[fail_key] >= _MAX_IDENTICAL_FAILURES:
@@ -481,6 +494,9 @@ class BaseResearchAgent(ABC):
         # Exceeded max rounds — do a final summary call without tools
         self.log(f"Exceeded {max_tool_rounds} tool rounds, forcing final answer")
         final_msg = await self._dispatcher.generate_with_tools(cfg, messages, tools=None)
+        # Guard: if LLM still returns tool_calls in summary round, force text extraction
+        if hasattr(final_msg, 'tool_calls') and final_msg.tool_calls:
+            return final_msg.content or "Agent completed but produced no text summary."
         return final_msg.content or ""
 
     @abstractmethod

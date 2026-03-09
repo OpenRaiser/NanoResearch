@@ -146,6 +146,12 @@ class ResearchConfig(BaseModel):
     # When set, experiment agent skips venv creation and uses this env's Python.
     experiment_conda_env: str = ""  # e.g., "shixun"
 
+    # Multi-model review committee (optional).
+    # Each entry: {"role": str, "focus": str, "model": str,
+    #              "base_url": str|None, "api_key": str|None, "weight": float}
+    # Empty list → single-model review (backward compatible).
+    review_committee: list[dict] = Field(default_factory=list)
+
     # Cluster execution settings (optional — set in config.json under "research.cluster")
     cluster: dict = Field(default_factory=dict)  # {"enabled":true, "host":..., "user":..., ...}
 
@@ -271,4 +277,8 @@ class ResearchConfig(BaseModel):
         for key, val in d.items():
             if isinstance(val, dict) and "api_key" in val:
                 val.pop("api_key", None)
+        # Strip api_key from review_committee entries
+        for entry in d.get("review_committee", []):
+            if isinstance(entry, dict):
+                entry.pop("api_key", None)
         return d

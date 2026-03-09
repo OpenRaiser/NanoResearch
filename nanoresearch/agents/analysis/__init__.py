@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import sys
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,28 @@ from nanoresearch.agents.base import BaseResearchAgent
 from nanoresearch.schemas.manifest import PipelineStage
 
 logger = logging.getLogger(__name__)
+
+
+def _flatten_metric_list(metrics) -> dict[str, float]:
+    """Convert [{metric_name: str, value: float}, ...] to {name: value}.
+
+    Filters out NaN/Inf values.
+    """
+    if isinstance(metrics, dict):
+        return {
+            k: v for k, v in metrics.items()
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        }
+    if not isinstance(metrics, list):
+        return {}
+    flat: dict[str, float] = {}
+    for m in metrics:
+        if isinstance(m, dict):
+            name = m.get("metric_name") or m.get("name")
+            val = m.get("value")
+            if name and isinstance(val, (int, float)) and math.isfinite(val):
+                flat[name] = val
+    return flat
 
 
 class AnalysisAgent(BaseResearchAgent):
@@ -31,12 +54,19 @@ class AnalysisAgent(BaseResearchAgent):
 
         self.log("Starting analysis of real experiment results")
 
-        # Step 1: Analyze results
+        # Step 1: Analyze results (LLM)
         analysis = await self._analyze_results(execution_output, experiment_blueprint)
         if not isinstance(analysis, dict):
             analysis = {}
         analysis.setdefault("execution_output", execution_output)
         self.log(f"Analysis complete: {list(analysis.keys())}")
+
+        # Step 1.5: Computational analysis (deterministic, no LLM)
+        computational = self._compute_analysis(
+            execution_output, experiment_blueprint, analysis
+        )
+        if computational:
+            self.log(f"Computational analysis: {list(computational.keys())}")
 
         # Step 2: Generate figures from real data
         figures = await self._generate_figures(analysis, experiment_blueprint)
@@ -47,6 +77,7 @@ class AnalysisAgent(BaseResearchAgent):
             analysis,
             execution_output,
             experiment_blueprint,
+            computational,
         )
         summary_path = self.workspace.write_text(
             "drafts/experiment_summary.md",
@@ -55,6 +86,7 @@ class AnalysisAgent(BaseResearchAgent):
 
         result = {
             "analysis": analysis,
+            "computational_analysis": computational,
             "figures": figures,
             "execution_output": execution_output,
             "experiment_summary": summary_markdown,
@@ -157,13 +189,222 @@ IMPORTANT:
         result = await self.generate_json(system_prompt, user_prompt)
         return result if isinstance(result, dict) else {}
 
+    # ── Computational analysis (deterministic, no LLM) ──────────────────
+
+    def _compute_analysis(
+        self,
+        execution_output: dict,
+        blueprint: dict,
+        llm_analysis: dict,
+    ) -> dict:
+        """Run deterministic computational analysis alongside LLM analysis."""
+        from nanoresearch.agents.analysis.training_dynamics import (
+            analyze_training_dynamics,
+        )
+        from nanoresearch.agents.analysis.ablation_analysis import (
+            quantify_ablation_contributions,
+        )
+        from nanoresearch.agents.analysis.comparison_matrix import (
+            build_comparison_matrix,
+            comparison_matrix_to_latex,
+        )
+
+        result: dict = {}
+        raw_metrics = execution_output.get("metrics", {})
+        if not isinstance(raw_metrics, dict):
+            raw_metrics = {}
+
+        bp_metrics = blueprint.get("metrics", [])
+        if not isinstance(bp_metrics, list):
+            bp_metrics = []
+
+        # 1. Training dynamics
+        training_log = raw_metrics.get("training_log", [])
+        if isinstance(training_log, list) and len(training_log) >= 3:
+            dynamics = analyze_training_dynamics(training_log)
+            result["training_dynamics"] = dynamics
+
+        # 2. Comparison matrix
+        main_results = raw_metrics.get("main_results", [])
+        bp_baselines = blueprint.get("baselines", [])
+        matrix_inputs = self._build_matrix_inputs(
+            main_results, bp_baselines, bp_metrics
+        )
+        if matrix_inputs:
+            baselines_list, proposed, metrics_list = matrix_inputs
+            matrix = build_comparison_matrix(baselines_list, proposed, metrics_list)
+            result["comparison_matrix"] = matrix
+            result["comparison_latex"] = comparison_matrix_to_latex(matrix)
+
+        # 3. Ablation contributions
+        ablation_raw = raw_metrics.get("ablation_results", [])
+        if not isinstance(ablation_raw, list) or not ablation_raw:
+            ablation_raw = llm_analysis.get("ablation_results", [])
+        if isinstance(ablation_raw, list) and len(ablation_raw) >= 2:
+            primary_metric = self._find_primary_metric(bp_metrics)
+            higher = self._metric_higher_is_better(primary_metric, bp_metrics)
+            full_result, ablation_variants = self._split_ablation(
+                ablation_raw, primary_metric
+            )
+            if full_result and ablation_variants:
+                contributions = quantify_ablation_contributions(
+                    full_result, ablation_variants, primary_metric, higher
+                )
+                result["ablation_contributions"] = contributions
+
+        return result
+
+    @staticmethod
+    def _build_matrix_inputs(
+        main_results: list,
+        bp_baselines: list,
+        bp_metrics: list,
+    ):
+        """Convert pipeline data into (baselines, proposed, metrics) for comparison_matrix.
+
+        Returns None if insufficient data.
+        """
+        if not isinstance(main_results, list):
+            return None
+
+        # Flatten main_results into {name, metrics: {metric: value}}
+        proposed = None
+        baselines = []
+        for entry in main_results:
+            if not isinstance(entry, dict):
+                continue
+            flat = _flatten_metric_list(entry.get("metrics", []))
+            item = {"name": entry.get("method_name", "Unknown"), "metrics": flat}
+            if entry.get("is_proposed"):
+                proposed = item
+            else:
+                baselines.append(item)
+
+        # Supplement baselines from blueprint expected_performance
+        seen = {b["name"] for b in baselines}
+        for bp_bl in bp_baselines:
+            if not isinstance(bp_bl, dict):
+                continue
+            name = bp_bl.get("name", "")
+            if name in seen:
+                continue
+            perf = bp_bl.get("expected_performance", {})
+            if isinstance(perf, dict) and perf:
+                # Filter out non-numeric and "N/A"
+                clean = {
+                    k: v for k, v in perf.items()
+                    if isinstance(v, (int, float))
+                }
+                if clean:
+                    baselines.append({"name": name, "metrics": clean})
+                    seen.add(name)
+
+        if proposed is None or not proposed.get("metrics"):
+            return None
+        if not baselines:
+            return None
+
+        # Build metrics list
+        metrics_list = []
+        seen_m: set[str] = set()
+        for m in bp_metrics:
+            if isinstance(m, dict) and m.get("name"):
+                metrics_list.append({
+                    "name": m["name"],
+                    "higher_is_better": m.get("higher_is_better", True),
+                })
+                seen_m.add(m["name"])
+        # Add any metric from proposed that's not in blueprint
+        for mname in proposed.get("metrics", {}):
+            if mname not in seen_m:
+                metrics_list.append({"name": mname, "higher_is_better": True})
+                seen_m.add(mname)
+
+        if not metrics_list:
+            return None
+        return baselines, proposed, metrics_list
+
+    @staticmethod
+    def _find_primary_metric(bp_metrics: list) -> str:
+        """Return the primary metric name from blueprint, or first available."""
+        for m in bp_metrics:
+            if isinstance(m, dict) and m.get("primary"):
+                return m.get("name", "accuracy")
+        if bp_metrics and isinstance(bp_metrics[0], dict):
+            return bp_metrics[0].get("name", "accuracy")
+        return "accuracy"
+
+    @staticmethod
+    def _metric_higher_is_better(metric_name: str, bp_metrics: list) -> bool:
+        for m in bp_metrics:
+            if isinstance(m, dict) and m.get("name") == metric_name:
+                return m.get("higher_is_better", True)
+        return True
+
+    _FULL_MODEL_NAMES = frozenset({
+        "full", "full model", "full_model", "ours", "proposed", "complete",
+    })
+
+    @staticmethod
+    def _split_ablation(
+        ablation_raw: list, primary_metric: str
+    ) -> tuple:
+        """Split ablation entries into (full_result_dict, variants_list).
+
+        Identifies the full model by name first; falls back to highest score.
+        Returns ({metric: value}, [{variant_name, metrics: {metric: value}}]).
+        """
+        entries = []
+        for entry in ablation_raw:
+            if not isinstance(entry, dict):
+                continue
+            flat = _flatten_metric_list(entry.get("metrics", []))
+            if not flat:
+                # metrics might already be a dict
+                raw_m = entry.get("metrics", {})
+                if isinstance(raw_m, dict):
+                    flat = {
+                        k: v for k, v in raw_m.items()
+                        if isinstance(v, (int, float)) and math.isfinite(v)
+                    }
+            entries.append({
+                "variant_name": entry.get("variant_name", "unknown"),
+                "metrics": flat,
+                "score": flat.get(primary_metric),
+            })
+
+        scored = [e for e in entries if isinstance(e["score"], (int, float))]
+        if len(scored) < 2:
+            return None, None
+
+        # Find full model: prefer name match, fall back to highest score
+        full_entry = None
+        for e in scored:
+            vn = e["variant_name"].lower().strip()
+            if vn in AnalysisAgent._FULL_MODEL_NAMES or "full" in vn:
+                full_entry = e
+                break
+        if full_entry is None:
+            scored.sort(key=lambda e: e["score"], reverse=True)
+            full_entry = scored[0]
+
+        full = full_entry["metrics"]
+        variants = [
+            {"variant_name": e["variant_name"], "metrics": e["metrics"]}
+            for e in scored if e is not full_entry
+        ]
+        return full, variants
+
     @staticmethod
     def _render_experiment_summary_markdown(
         analysis: dict,
         execution_output: dict,
         blueprint: dict,
+        computational: dict | None = None,
     ) -> str:
         """Render a compact markdown summary of the executed experiment."""
+        if computational is None:
+            computational = {}
         lines = [
             "# Experiment Summary",
             "",
@@ -243,6 +484,50 @@ IMPORTANT:
                 lines.append(f"- {variant}: {', '.join(metric_strs)}")
             lines.append("")
 
+        # ── Computational analysis sections ──
+        comp_dynamics = computational.get("training_dynamics")
+        if isinstance(comp_dynamics, dict):
+            lines.append("## Training Dynamics (Computed)")
+            lines.append(
+                f"- Convergence epoch: {comp_dynamics.get('convergence_epoch', '?')} "
+                f"/ {comp_dynamics.get('total_epochs', '?')}"
+            )
+            lines.append(f"- Best epoch: {comp_dynamics.get('best_epoch', '?')}")
+            lines.append(
+                f"- Best val loss: {comp_dynamics.get('best_val_loss', '?')}"
+            )
+            if comp_dynamics.get("overfitting_detected") is not None:
+                lines.append(
+                    f"- Overfitting detected: {comp_dynamics['overfitting_detected']}"
+                )
+            if comp_dynamics.get("loss_stability"):
+                lines.append(
+                    f"- Stability: {comp_dynamics['loss_stability']}"
+                )
+            if comp_dynamics.get("early_stopping_recommended"):
+                lines.append("- Early stopping recommended")
+            lines.append("")
+
+        comp_contributions = computational.get("ablation_contributions")
+        if isinstance(comp_contributions, list) and comp_contributions:
+            lines.append("## Ablation Contributions (Computed)")
+            for c in comp_contributions:
+                flag = " **[CRITICAL]**" if c.get("is_critical") else ""
+                lines.append(
+                    f"- {c.get('component', '?')}: "
+                    f"drop={c.get('absolute_drop', '?')} "
+                    f"({c.get('relative_contribution_pct', '?')}%){flag}"
+                )
+            lines.append("")
+
+        comp_latex = computational.get("comparison_latex")
+        if comp_latex:
+            lines.append("## Comparison Table (LaTeX)")
+            lines.append("```latex")
+            lines.append(comp_latex)
+            lines.append("```")
+            lines.append("")
+
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
@@ -284,7 +569,12 @@ IMPORTANT:
                 {"figure_id": "fig_results", "title": "Results", "type": "bar"},
             ]
 
-        for fig_spec in figure_specs[:3]:
+        max_figs = 5
+        if len(figure_specs) > max_figs:
+            self.log(f"Capping analysis figures from {len(figure_specs)} to {max_figs}")
+        figure_specs = figure_specs[:max_figs]
+
+        for fig_spec in figure_specs:
             fig_id = fig_spec.get("figure_id", "fig_unknown")
             fig_title = fig_spec.get("title", "Figure")
 

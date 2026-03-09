@@ -45,7 +45,7 @@ def test_build_context_includes_experiment_analysis_summary() -> None:
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         agent = WritingAgent(workspace, config)
 
-        context = agent._build_context(
+        context = agent._build_full_context(
             {"topic": "demo", "papers": [], "gaps": [], "hypotheses": []},
             {
                 "proposed_method": {"name": "DeepMethod", "key_components": ["Fusion"]},
@@ -86,7 +86,7 @@ def test_build_context_normalizes_flat_metrics_into_real_results() -> None:
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         agent = WritingAgent(workspace, config)
 
-        context = agent._build_context(
+        context = agent._build_full_context(
             {"topic": "demo", "papers": [], "gaps": [], "hypotheses": []},
             {
                 "proposed_method": {"name": "DeepMethod", "key_components": ["Fusion"]},

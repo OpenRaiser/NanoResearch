@@ -41,19 +41,32 @@ class ModelDispatcher:
 
     def __init__(self, config: ResearchConfig) -> None:
         self._config = config
-        self._clients: dict[float, OpenAI] = {}
+        self._clients: dict[tuple, OpenAI] = {}
 
-    def _get_client(self, timeout: float) -> OpenAI:
-        """Get or create an OpenAI client for the given timeout."""
-        # Round timeout to avoid float precision creating duplicate clients
+    def _get_client(
+        self,
+        timeout: float,
+        base_url: str | None = None,
+        api_key: str | None = None,
+    ) -> OpenAI:
+        """Get or create an OpenAI client for the given endpoint + timeout.
+
+        Args:
+            timeout: Request timeout in seconds.
+            base_url: Per-stage override (falls back to global config).
+            api_key: Per-stage override (falls back to global config).
+        """
+        resolved_url = base_url or self._config.base_url
+        resolved_key = api_key or self._config.api_key
         timeout = round(timeout, 1)
-        if timeout not in self._clients:
-            self._clients[timeout] = OpenAI(
-                base_url=self._config.base_url,
-                api_key=self._config.api_key,
+        cache_key = (resolved_url, resolved_key, timeout)
+        if cache_key not in self._clients:
+            self._clients[cache_key] = OpenAI(
+                base_url=resolved_url,
+                api_key=resolved_key,
                 timeout=timeout,
             )
-        return self._clients[timeout]
+        return self._clients[cache_key]
 
     async def close(self) -> None:
         for client in self._clients.values():
@@ -78,7 +91,7 @@ class ModelDispatcher:
     ) -> str:
         """Generate a completion using the configured model."""
         timeout = config.timeout or self._config.timeout
-        client = self._get_client(timeout)
+        client = self._get_client(timeout, config.base_url, config.api_key)
 
         _m = config.model.lower()
         is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
@@ -163,7 +176,7 @@ class ModelDispatcher:
             can inspect ``tool_calls`` and ``content``.
         """
         timeout = config.timeout or self._config.timeout
-        client = self._get_client(timeout)
+        client = self._get_client(timeout, config.base_url, config.api_key)
 
         _m = config.model.lower()
         is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
