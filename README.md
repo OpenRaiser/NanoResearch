@@ -1,3 +1,7 @@
+<div align="center">
+<img src="https://github.com/user-attachments/assets/b9a00889-8edf-4a76-a979-751cf1bcc89b" alt="Nano Research Logo" width="500"/>
+</div>
+
 # NanoResearch
 
 AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
