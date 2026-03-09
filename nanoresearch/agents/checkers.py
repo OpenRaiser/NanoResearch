@@ -448,23 +448,15 @@ _AI_PHRASES = [
     r"stand(?:s|ing)?\s+as\s+a\s+testament",
     r"serves?\s+as\s+a\s+cornerstone",
     r"a\s+myriad\s+of",
-    r"comprehensive\s+overview",
-    r"rapidly\s+evolving",
     r"in\s+(?:today's|an)\s+(?:rapidly\s+)?(?:evolving|changing)\s+(?:landscape|world)",
     r"rich\s+(?:tapestry|heritage)",
-    r"at\s+the\s+(?:forefront|intersection)\s+of",
     r"a\s+testament\s+to",
     r"navigat(?:e|ing)\s+the\s+(?:complexities|landscape|challenges)",
     r"embark(?:s|ing)?\s+on",
-    r"not\s+(?:just|merely|only)\s+[^,.]+,\s+(?:but\s+)?(?:also\s+)?(?:a|an|the)",  # "not just X, but also Y"
 ]
 
 # Words that are overused by AI but rare in human academic writing
 _AI_OVERUSED_WORDS = [
-    "additionally",
-    "furthermore",
-    "moreover",
-    "crucial",
     "utilize",
     "leverage",
     "facilitate",
@@ -472,14 +464,12 @@ _AI_OVERUSED_WORDS = [
     "encompasses",
     "groundbreaking",
     "transformative",
-    "paradigm",
     "synergy",
     "holistic",
-    "robust",  # when not in a technical/statistical context
     "seamless",
     "streamline",
     "cutting-edge",
-    "novel",  # overused in non-contribution contexts
+    "delve",
 ]
 
 _AI_PHRASE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in _AI_PHRASES]
@@ -529,10 +519,10 @@ def check_ai_writing_patterns(tex: str) -> list[dict]:
     lower_stripped = stripped.lower()
     for word in _AI_OVERUSED_WORDS:
         count = len(re.findall(r"\b" + word + r"\b", lower_stripped))
-        if count >= 2:
+        if count >= 3:
             word_counts[word] = count
 
-    if len(word_counts) >= 3:
+    if len(word_counts) >= 4:
         top_words = sorted(word_counts.items(), key=lambda x: -x[1])[:5]
         desc = ", ".join(f"'{w}' ({c}x)" for w, c in top_words)
         issues.append({

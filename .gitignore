@@ -46,3 +46,37 @@ Thumbs.db
 
 # Pipeline workspaces (test runs)
 nanoresearch_*/
+
+# Smoke test runs & temp directories
+smoke_runs/
+.tmp_pytest*/
+.tmp_resume_*.py
+.tmp_run_*.py
+tmp*/
+.test_experiment_*/
+.runner_quote_check_*/
+.smoke_contract_check/
+.nanobot_home/
+
+# Temp scripts
+*.tmp
+
+# Archives
+*.tar
+*.tar.gz
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Large data
+*.csv
+*.tsv
+*.h5
+*.hdf5
+
+# Markdown docs (auto-generated, not part of source)
+EXPERIMENT_AUTOMATION_ROADMAP.md
+PROJECT_OVERVIEW_AND_FIX_BACKLOG.md

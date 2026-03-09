@@ -133,7 +133,10 @@ WRITING_SYSTEM_PROMPTS: dict[str, str] = {
         "- EVERY non-trivial operation needs a numbered equation (\\begin{equation}).\n"
         "- Reference every equation in text: 'as shown in Eq.~\\eqref{eq:loss}'.\n"
         "- Explain design choices: WHY this architecture, not just what.\n"
-        "- Do NOT include \\begin{figure} — figures are auto-inserted near \\ref{fig:...}."
+        "- Do NOT include \\begin{figure} — figures are auto-inserted near \\ref{fig:...}.\n"
+        "- CRITICAL: Each component MUST be wrapped in \\subsection{Component Name}. "
+        "Do NOT write bare paragraphs without \\subsection{} — they will be merged into "
+        "the parent section during review and may lose their structure."
         + _SHARED_LATEX_RULES
     ),
 
@@ -393,7 +396,10 @@ RULES:
 - Use \citet{} for subject citations, \citep{} for parenthetical
 - Be specific and quantitative — no vague claims
 - Use ONLY citation keys from the paper's bibliography
-- PRESERVE all \begin{figure}...\end{figure} and \begin{table}...\end{table} blocks
+- PRESERVE all \begin{figure}...\end{figure} and \begin{table}...\end{table} blocks EXACTLY
+  CRITICAL: Every figure/table contains a \label{fig:X} or \label{tab:Y} that other
+  sections reference via \ref{fig:X}. Do NOT rename, remove, or modify any \label{} —
+  doing so breaks cross-references throughout the paper.
 - Keep the same overall length (±20%) — do not dramatically shorten or expand
 - Do NOT add placeholder text like "results pending", "to be updated", etc.
 

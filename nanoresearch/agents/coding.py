@@ -15,6 +15,7 @@ from nanoresearch.agents.project_runner import (
     RUNNER_SCRIPT_NAME,
     ensure_project_runner,
 )
+from nanoresearch.exceptions import LLMError
 from nanoresearch.schemas.manifest import PipelineStage
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,85 @@ class CodingAgent(BaseResearchAgent):
     def stage_config(self):
         """Use code_gen model config for writing code."""
         return self.config.for_stage("code_gen")
+
+    @staticmethod
+    def _default_code_plan_files() -> list[dict[str, Any]]:
+        return [
+            {
+                "path": "train.py",
+                "description": "Main training script with argparse, training loop, evaluation, and support for --dry-run / --quick-eval",
+                "is_entrypoint": True,
+            },
+            {"path": "model.py", "description": "Model architecture definition"},
+            {"path": "dataset.py", "description": "Dataset loading and preprocessing"},
+            {"path": "evaluate.py", "description": "Evaluation metrics and testing"},
+            {"path": "config.py", "description": "Default hyperparameters and configuration"},
+        ]
+
+    def _normalize_code_plan(self, code_plan: dict[str, Any] | None) -> dict[str, Any]:
+        plan = dict(code_plan) if isinstance(code_plan, dict) else {}
+
+        normalized_files: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        for raw_spec in plan.get("files", []):
+            if not isinstance(raw_spec, dict):
+                continue
+            path = str(raw_spec.get("path") or "").strip().replace("\\", "/")
+            if not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            normalized_files.append(
+                {
+                    "path": path,
+                    "description": str(raw_spec.get("description") or "").strip(),
+                    "is_entrypoint": bool(raw_spec.get("is_entrypoint", False)),
+                }
+            )
+
+        for default_spec in self._default_code_plan_files():
+            if default_spec["path"] in seen_paths:
+                continue
+            normalized_files.append(dict(default_spec))
+            seen_paths.add(default_spec["path"])
+
+        dependencies: list[str] = []
+        seen_dependencies: set[str] = set()
+        for raw_dependency in plan.get("dependencies", []):
+            dependency = str(raw_dependency or "").strip()
+            if not dependency or dependency in seen_dependencies:
+                continue
+            seen_dependencies.add(dependency)
+            dependencies.append(dependency)
+        if not dependencies:
+            dependencies = [
+                "torch>=2.0.0",
+                "numpy>=1.24.0",
+                "pandas>=1.5.0",
+                "scikit-learn>=1.2.0",
+            ]
+
+        expected_output_files = [
+            str(item).strip()
+            for item in plan.get("expected_output_files", [])
+            if str(item).strip()
+        ]
+        if not expected_output_files:
+            expected_output_files = [
+                "results/metrics.json",
+                "results/training_log.csv",
+                "checkpoints/best_model.pt",
+            ]
+
+        normalized = {
+            "project_name": str(plan.get("project_name") or "generated_experiment").strip(),
+            "description": str(plan.get("description") or "Runnable experiment project.").strip(),
+            "python_version": str(plan.get("python_version") or "3.10").strip(),
+            "dependencies": dependencies,
+            "files": normalized_files,
+            "train_command": str(plan.get("train_command") or "python train.py").strip(),
+            "expected_output_files": expected_output_files,
+        }
+        return normalized
 
     async def run(self, **inputs: Any) -> dict[str, Any]:
         topic: str = inputs["topic"]
@@ -59,7 +139,7 @@ class CodingAgent(BaseResearchAgent):
             filepath = spec["path"]
             full_path = code_dir / filepath
             full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(content)
+            full_path.write_text(content, encoding="utf-8")
             generated_files.append(str(filepath))
             self.log(f"Generated: {filepath}")
 
@@ -88,7 +168,7 @@ class CodingAgent(BaseResearchAgent):
                 content = await self._generate_file(
                     file_spec, code_plan, experiment_blueprint, setup_output
                 )
-                (code_dir / filename).write_text(content)
+                (code_dir / filename).write_text(content, encoding="utf-8")
                 self.log(f"Re-generated {filename} to fix invalid paths: {bad_paths}")
 
         original_train_command = code_plan.get("train_command", "python train.py")
@@ -104,18 +184,18 @@ class CodingAgent(BaseResearchAgent):
             runner_assets["runner_command"],
         )
         slurm_path = code_dir / "run_train.slurm"
-        slurm_path.write_text(slurm_script)
+        slurm_path.write_text(slurm_script, encoding="utf-8")
         generated_files.append("run_train.slurm")
         self.log("Generated SLURM script")
 
         # Step 4: Generate requirements.txt
         requirements = await self._generate_requirements(code_plan)
-        (code_dir / "requirements.txt").write_text(requirements)
+        (code_dir / "requirements.txt").write_text(requirements, encoding="utf-8")
         generated_files.append("requirements.txt")
 
         # Step 5: Generate environment.yml for optional conda-based execution
         environment_yaml = self._generate_environment_yaml(code_plan)
-        (code_dir / "environment.yml").write_text(environment_yaml)
+        (code_dir / "environment.yml").write_text(environment_yaml, encoding="utf-8")
         generated_files.append("environment.yml")
 
         result = {
@@ -227,10 +307,25 @@ Design a runnable project. Return JSON:
   "expected_output_files": ["results/metrics.json", "results/training_log.csv", "checkpoints/best_model.pt"]
 }}"""
 
-        result = await self.generate_json(system_prompt, user_prompt)
+        try:
+            result = await self.generate_json(system_prompt, user_prompt)
+        except LLMError as exc:
+            self.log(f"Code plan JSON parse failed, retrying with minimal schema: {exc}")
+            retry_prompt = (
+                user_prompt
+                + "\n\nPrevious attempt was not valid JSON."
+                + "\nRetry with a MINIMAL schema only."
+                + "\nRules:"
+                + "\n- Keep `files` to at most 5 entries."
+                + "\n- Each file entry may only contain `path`, `description`, `is_entrypoint`."
+                + "\n- Do NOT include file contents, interfaces, or long explanations."
+                + "\n- Output ONLY a single JSON object."
+            )
+            result = await self.generate_json(system_prompt, retry_prompt)
+
         if isinstance(result, list) and len(result) == 1 and isinstance(result[0], dict):
             result = result[0]
-        return result if isinstance(result, dict) else {}
+        return self._normalize_code_plan(result if isinstance(result, dict) else {})
 
     async def _generate_file(
         self,
@@ -709,7 +804,7 @@ Return JSON:
                 if filepath.exists() and old_text and new_text:
                     content = filepath.read_text(errors="replace")
                     if old_text in content:
-                        filepath.write_text(content.replace(old_text, new_text, 1))
+                        filepath.write_text(content.replace(old_text, new_text, 1), encoding="utf-8")
                         self.log(f"Fixed import mismatch in {patch['file']}: {patch.get('description', '')}")
 
         except Exception as e:

@@ -288,11 +288,24 @@ class ReviewAgent(BaseResearchAgent):
                 f"(delta: {improvement:+.1f})"
             )
             if improvement < CONVERGENCE_THRESHOLD:
-                self.log(
-                    f"  Convergence reached (improvement {improvement:.2f} < "
-                    f"{CONVERGENCE_THRESHOLD}), stopping revision loop"
-                )
-                break
+                # Check if there are still low-scoring sections before exiting
+                still_low = [
+                    sr for sr in review.section_reviews
+                    if sr.score < MIN_SECTION_SCORE
+                ]
+                if still_low and revision_round < MAX_REVISION_ROUNDS:
+                    self.log(
+                        f"  Improvement stalled ({improvement:.2f} < "
+                        f"{CONVERGENCE_THRESHOLD}), but {len(still_low)} section(s) "
+                        f"still below {MIN_SECTION_SCORE}: "
+                        f"{[sr.section for sr in still_low]}. Continuing."
+                    )
+                else:
+                    self.log(
+                        f"  Convergence reached (improvement {improvement:.2f} < "
+                        f"{CONVERGENCE_THRESHOLD}), stopping revision loop"
+                    )
+                    break
             prev_avg_score = new_avg
 
         review.revision_rounds = revision_round
@@ -343,6 +356,23 @@ class ReviewAgent(BaseResearchAgent):
                 r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}',
                 _dedup_fig, revised_tex, flags=re.DOTALL,
             )
+
+            # Deduplicate tables: same logic as figures
+            seen_tab_labels: set[str] = set()
+            def _dedup_tab(m: re.Match) -> str:
+                block = m.group(0)
+                label_m = re.search(r'\\label\{(tab:[^}]+)\}', block)
+                lbl = label_m.group(1) if label_m else None
+                if lbl and lbl in seen_tab_labels:
+                    return ""
+                if lbl:
+                    seen_tab_labels.add(lbl)
+                return block
+            revised_tex = re.sub(
+                r'\\begin\{table\*?\}.*?\\end\{table\*?\}',
+                _dedup_tab, revised_tex, flags=re.DOTALL,
+            )
+
             revised_tex = re.sub(r'\n{3,}', '\n\n', revised_tex)
 
             # Resolve any new citations introduced during revision

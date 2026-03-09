@@ -213,6 +213,14 @@ class BaseResearchAgent(ABC):
         self.config = config
         self._dispatcher = ModelDispatcher(config)
 
+    def _remember_mutation_snapshot_entry(self, entry: dict[str, Any] | None) -> None:
+        self._last_mutation_snapshot_entry = dict(entry) if isinstance(entry, dict) else None
+
+    def consume_last_mutation_snapshot_entry(self) -> dict[str, Any] | None:
+        entry = getattr(self, "_last_mutation_snapshot_entry", None)
+        self._last_mutation_snapshot_entry = None
+        return dict(entry) if isinstance(entry, dict) else None
+
     @property
     def stage_config(self) -> StageModelConfig:
         return self.config.for_stage(self.stage.value)

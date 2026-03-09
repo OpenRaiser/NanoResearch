@@ -300,7 +300,8 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                     key = self._dedup_key(p)
                     if key and key not in all_papers:
                         all_papers[key] = p
-                success_count += 1
+                if arxiv_results:
+                    success_count += 1
             except Exception as e:
                 logger.warning("[%s] arXiv search failed for '%s': %s",
                                self.stage.value, query, e)
@@ -312,7 +313,8 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                     key = self._dedup_key(p)
                     if key and key not in all_papers:
                         all_papers[key] = p
-                success_count += 1
+                if s2_results:
+                    success_count += 1
             except Exception as e:
                 logger.warning("[%s] S2 search failed for '%s': %s",
                                self.stage.value, query, e)

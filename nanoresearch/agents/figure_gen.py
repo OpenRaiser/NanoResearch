@@ -1445,8 +1445,15 @@ class FigureAgent(BaseResearchAgent):
         # Step 2: Generate image via Gemini with retry loop
         figure_gen_config = self.config.for_stage("figure_gen")
         last_error = ""
+        prev_error = ""
 
         for attempt in range(MAX_IMAGE_RETRIES + 1):
+            # Early-exit on repeated identical errors
+            if attempt >= 1 and last_error and last_error == prev_error:
+                self.log(f"  {fig_key} same image error repeated — skipping to diagnosis")
+                break
+            prev_error = last_error
+
             try:
                 b64_images = await self._dispatcher.generate_image(
                     figure_gen_config, prompt=image_prompt,
@@ -1573,8 +1580,15 @@ class FigureAgent(BaseResearchAgent):
         png_path = Path(output_path)
         png_path.parent.mkdir(parents=True, exist_ok=True)
         last_error = ""
+        prev_error = ""
 
         for attempt in range(MAX_CODE_CHART_RETRIES):
+            # Early-exit if the same error repeats (LLM can't fix it)
+            if attempt >= 2 and last_error and last_error == prev_error:
+                self.log(f"  {fig_key} same error repeated — stopping retry loop")
+                break
+            prev_error = last_error
+
             # Build prompt — on retry, include the error feedback
             current_prompt = user_prompt
             if last_error:

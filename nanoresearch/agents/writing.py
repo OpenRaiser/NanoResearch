@@ -82,6 +82,79 @@ class GroundingPacket:
             "evidence_gaps": self.evidence_gaps,
         }
 
+# ---------------------------------------------------------------------------
+# P0-B: Contribution Contract — structured claim-evidence mapping
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ContributionClaim:
+    """A single contribution claim extracted from the Introduction."""
+    text: str                # The claim text (e.g., "We propose X, a ... that ...")
+    claim_type: str          # "method" | "component" | "empirical"
+    key_terms: list[str]     # Key terms/names mentioned (e.g., method name, module name)
+
+
+@dataclass
+class ContributionContract:
+    """Structured claims extracted from Introduction, injected into later sections.
+
+    Ensures consistency: every claim in Introduction has matching content
+    in Method (technical detail), Experiments (evidence), and Conclusion (summary).
+    """
+    claims: list[ContributionClaim] = field(default_factory=list)
+    method_name: str = ""
+
+    def for_section(self, section_label: str) -> str:
+        """Build a contract guidance block for a specific section."""
+        if not self.claims:
+            return ""
+
+        lines = ["=== CONTRIBUTION CONTRACT ==="]
+        lines.append("The Introduction made the following contribution claims.")
+        lines.append("This section MUST be consistent with these claims.\n")
+
+        if section_label == "sec:method":
+            lines.append("For EACH claim below, provide full technical detail:")
+            for i, c in enumerate(self.claims, 1):
+                if c.claim_type in ("method", "component"):
+                    lines.append(f"  {i}. {c.text}")
+                    if c.key_terms:
+                        lines.append(f"     → Describe: {', '.join(c.key_terms)}")
+                else:
+                    lines.append(f"  {i}. [empirical — will be addressed in Experiments]")
+            lines.append("\nEvery method/component claim MUST have a corresponding "
+                         "\\subsection{} with equations and design rationale.")
+
+        elif section_label == "sec:experiments":
+            lines.append("For EACH claim below, provide experimental EVIDENCE:")
+            for i, c in enumerate(self.claims, 1):
+                lines.append(f"  {i}. {c.text}")
+                if c.claim_type == "empirical":
+                    lines.append("     → MUST show quantitative results supporting this claim")
+                elif c.claim_type == "component":
+                    lines.append("     → MUST have ablation row removing/replacing this component")
+                else:
+                    lines.append("     → MUST show overall method performance")
+            lines.append("\nEvery contribution MUST map to either main results or ablation results.")
+
+        elif section_label == "sec:conclusion":
+            lines.append("Summarize each contribution with evidence:")
+            for i, c in enumerate(self.claims, 1):
+                lines.append(f"  {i}. {c.text}")
+            lines.append("\nRestate each contribution with the supporting evidence found. "
+                         "Do NOT introduce new claims not in Introduction.")
+
+        elif section_label == "sec:related":
+            lines.append("Position this work relative to prior art for each claim:")
+            for i, c in enumerate(self.claims, 1):
+                if c.claim_type in ("method", "component"):
+                    lines.append(f"  {i}. {c.text}")
+                    lines.append("     → Discuss how prior methods address this differently")
+
+        lines.append("=== END CONTRIBUTION CONTRACT ===")
+        return "\n".join(lines)
+
+
 # Configurable limits
 MAX_PAPERS_FOR_CITATIONS = 50
 MAX_LATEX_FIX_ATTEMPTS = 3
@@ -264,24 +337,20 @@ class WritingAgent(BaseResearchAgent):
         cite_keys = self._build_cite_keys(papers)
         bibtex = self._build_bibtex(papers, cite_keys)
 
-        # Build shared context (with cite keys)
-        context = self._build_context(
-            ideation,
-            blueprint,
-            cite_keys,
-            experiment_results,
-            experiment_status,
-            experiment_analysis,
-            experiment_summary,
-            grounding,
+        # Build per-section context primitives (P0-A)
+        core_ctx = self._build_core_context(ideation, blueprint, cite_keys)
+
+        # Title & abstract need a broad context — use Introduction-like context
+        title_abstract_ctx = self._ctx_introduction(
+            core_ctx, grounding=grounding,
         )
 
         # Step 1: Generate title
-        title = await self._generate_title(context)
+        title = await self._generate_title(title_abstract_ctx)
         self.log(f"Title: {title}")
 
         # Step 2: Generate abstract (with result number binding)
-        abstract = await self._generate_abstract(context, grounding)
+        abstract = await self._generate_abstract(title_abstract_ctx, grounding)
         self.log("Abstract generated")
 
         # Step 3: Build figures & table data from blueprint
@@ -291,10 +360,31 @@ class WritingAgent(BaseResearchAgent):
         # Track which figure blocks have been placed
         placed_figures: set[str] = set()
 
+        # P0-B: Contribution contract — extracted after Introduction is written
+        contribution_contract: ContributionContract | None = None
+        method_name = (blueprint.get("proposed_method") or {}).get("name", "")
+
         sections = []
         prior_sections_summary: list[str] = []
         for heading, label, instructions, fig_keys in PAPER_SECTIONS:
             self.log(f"Writing section: {heading}")
+
+            # P0-A: Build tailored context for this section
+            section_ctx = self._build_section_context(
+                label,
+                core_ctx,
+                grounding=grounding,
+                experiment_results=experiment_results,
+                experiment_status=experiment_status,
+                experiment_analysis=experiment_analysis,
+                experiment_summary=experiment_summary,
+            )
+
+            # P0-B: Inject contribution contract for post-Introduction sections
+            if contribution_contract and label != "sec:intro":
+                contract_block = contribution_contract.for_section(label)
+                if contract_block:
+                    section_ctx = section_ctx + "\n\n" + contract_block
 
             # Build per-section figure context: only show UN-placed figures
             remaining_figs = [k for k in figure_blocks if k not in placed_figures]
@@ -348,7 +438,7 @@ class WritingAgent(BaseResearchAgent):
                     )
 
             context_with_figs = (
-                f"{context}\n\n"
+                f"{section_ctx}\n\n"
                 f"=== AVAILABLE FIGURES (use \\ref{{fig:NAME}} to reference) ===\n"
                 f"{fig_list_text}\n"
                 f"{placed_note}"
@@ -440,6 +530,19 @@ class WritingAgent(BaseResearchAgent):
             sections.append(Section(heading=heading, label=label, content=content))
             snippet = content[:200].replace("\n", " ").strip()
             prior_sections_summary.append(f"[{heading}]: {snippet}...")
+
+            # P0-B: Extract contribution contract after Introduction is written
+            if label == "sec:intro" and not contribution_contract:
+                contribution_contract = self._extract_contribution_contract(
+                    content, method_name,
+                )
+                if contribution_contract.claims:
+                    self.log(
+                        f"Contribution contract: {len(contribution_contract.claims)} claims "
+                        f"({', '.join(c.claim_type for c in contribution_contract.claims)})"
+                    )
+                else:
+                    self.log("No contribution claims extracted from Introduction")
 
         # Fallback: distribute remaining figures to appropriate sections
         remaining = [k for k in figure_blocks if k not in placed_figures]
@@ -686,7 +789,7 @@ class WritingAgent(BaseResearchAgent):
         # Remove non-alpha chars for BibTeX safety
         return re.sub(r'[^a-z]', '', surname) or "unknown"
 
-    def _build_context(
+    def _build_full_context(
         self,
         ideation: dict,
         blueprint: dict,
@@ -697,7 +800,7 @@ class WritingAgent(BaseResearchAgent):
         experiment_summary: str = "",
         grounding: GroundingPacket | None = None,
     ) -> str:
-        """Build shared context string with cite keys for all section prompts."""
+        """Build full context string (legacy, used as fallback). Prefer _build_section_context()."""
         topic = ideation.get("topic", "")
         survey = ideation.get("survey_summary", "")
         gaps = ideation.get("gaps", [])
@@ -842,7 +945,11 @@ Every component listed above should appear in the ablation table.
 
         # If no matches but we have titles, still list them
         if not must_cite_matches:
-            for title in must_cites[:15]:
+            for mc_entry in must_cites[:15]:
+                # must_cites can be list[str] or list[dict]
+                title = mc_entry.get("title", "") if isinstance(mc_entry, dict) else str(mc_entry)
+                if not title:
+                    continue
                 # Try to find by title in papers
                 for i, p in enumerate(papers):
                     if not isinstance(p, dict):
@@ -862,6 +969,464 @@ Every component listed above should appear in the ablation table.
 
         lines.append("\n=== END MUST-CITE ===")
         return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # P0-A: Per-section context builder
+    # ------------------------------------------------------------------
+    # Instead of sending the same ~30-40K context to every section, each
+    # section gets a tailored context containing only the blocks it needs.
+    # This reduces token waste and lets each section focus on relevant info.
+    # ------------------------------------------------------------------
+
+    def _build_core_context(
+        self,
+        ideation: dict,
+        blueprint: dict,
+        cite_keys: dict[int, str],
+    ) -> dict[str, Any]:
+        """Extract shared primitives once; return a dict consumed by section builders.
+
+        This is called ONCE in run(), and the resulting dict is passed to
+        _build_section_context() for each section.
+        """
+        topic = ideation.get("topic", "")
+
+        hypothesis = ""
+        for h in ideation.get("hypotheses", []):
+            if not isinstance(h, dict):
+                continue
+            if h.get("hypothesis_id") == ideation.get("selected_hypothesis"):
+                hypothesis = h.get("statement", "")
+                break
+
+        method = blueprint.get("proposed_method") or {}
+        if not isinstance(method, dict):
+            method = {}
+        datasets = blueprint.get("datasets", [])
+        metrics = blueprint.get("metrics", [])
+        baselines = blueprint.get("baselines", [])
+        ablations = blueprint.get("ablation_groups", [])
+
+        # Pre-build citation key reference lines
+        papers = ideation.get("papers", [])
+        ref_lines = []
+        for i, p in enumerate(papers[:MAX_PAPERS_FOR_CITATIONS]):
+            if i in cite_keys and isinstance(p, dict):
+                ref_lines.append(
+                    f"  [{cite_keys[i]}] {p.get('title', '')} ({p.get('year', '')})"
+                )
+
+        # Pre-build full-text excerpt lines
+        full_text_lines: list[str] = []
+        for i, p in enumerate(papers[:MAX_PAPERS_FOR_CITATIONS]):
+            if not isinstance(p, dict):
+                continue
+            mt = (p.get("method_text", "") or "").strip()
+            et = (p.get("experiment_text", "") or "").strip()
+            if mt or et:
+                full_text_lines.append(f"--- Paper: {p.get('title', 'Unknown')[:80]} ---")
+                if mt:
+                    full_text_lines.append(f"Method excerpt: {mt[:1500]}")
+                if et:
+                    full_text_lines.append(f"Experiment excerpt: {et[:1500]}")
+                full_text_lines.append("")
+
+        return {
+            "topic": topic,
+            "hypothesis": hypothesis,
+            "method": method,
+            "method_str": json.dumps(method, indent=2, ensure_ascii=False)[:8000],
+            "method_name": method.get("name", ""),
+            "method_brief": method.get("description", "")[:500],
+            "key_components": method.get("key_components", []),
+            "survey": ideation.get("survey_summary", ""),
+            "gaps": ideation.get("gaps", []),
+            "datasets": datasets,
+            "metrics": metrics,
+            "baselines": baselines,
+            "ablations": ablations,
+            "dataset_names": json.dumps(
+                [d.get("name", "") for d in datasets if isinstance(d, dict)],
+                ensure_ascii=False,
+            ),
+            "metric_names": json.dumps(
+                [m.get("name", "") for m in metrics if isinstance(m, dict)],
+                ensure_ascii=False,
+            ),
+            "baseline_names": json.dumps(
+                [b.get("name", "") for b in baselines if isinstance(b, dict)],
+                ensure_ascii=False,
+            ),
+            "ablation_names": json.dumps(
+                [a.get("group_name", "") for a in ablations if isinstance(a, dict)],
+                ensure_ascii=False,
+            ),
+            "ref_lines": ref_lines,
+            "full_text_lines": full_text_lines,
+            "ideation": ideation,
+            "blueprint": blueprint,
+            "cite_keys": cite_keys,
+        }
+
+    def _build_section_context(
+        self,
+        section_label: str,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        experiment_results: dict | None = None,
+        experiment_status: str = "pending",
+        experiment_analysis: dict | None = None,
+        experiment_summary: str = "",
+    ) -> str:
+        """Build a tailored context string for a specific section.
+
+        Each section gets only the context blocks it actually needs,
+        reducing prompt size from ~30-40K to ~8-15K per section.
+        """
+        dispatcher = {
+            "sec:intro": self._ctx_introduction,
+            "sec:related": self._ctx_related_work,
+            "sec:method": self._ctx_method,
+            "sec:experiments": self._ctx_experiments,
+            "sec:conclusion": self._ctx_conclusion,
+        }
+        builder = dispatcher.get(section_label, self._ctx_default)
+        return builder(
+            core,
+            grounding=grounding,
+            experiment_results=experiment_results,
+            experiment_status=experiment_status,
+            experiment_analysis=experiment_analysis,
+            experiment_summary=experiment_summary,
+        )
+
+    # --- Section-specific context builders ---
+
+    def _ctx_introduction(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        """Introduction: topic, gaps, hypothesis, method brief, cite keys."""
+        gaps_str = json.dumps(core["gaps"], indent=2, ensure_ascii=False)[:3000]
+        survey_brief = core["survey"][:2000] if core["survey"] else ""
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Literature Survey (brief):\n{survey_brief}" if survey_brief else "",
+            "",
+            f"Research Gaps:\n{gaps_str}",
+            "",
+            f"Main Hypothesis: {core['hypothesis']}",
+            "",
+            f"Proposed Method: {core['method_name']}",
+            f"Method Overview: {core['method_brief']}",
+            f"Key Components: {json.dumps(core['key_components'], ensure_ascii=False)}",
+            "",
+            f"Datasets: {core['dataset_names']}",
+            f"Metrics: {core['metric_names']}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_related_work(
+        self,
+        core: dict[str, Any],
+        **_kwargs: Any,
+    ) -> str:
+        """Related Work: full survey, gaps, evidence, cite keys, must-cites, full-text."""
+        survey_str = core["survey"][:6000] if core["survey"] else ""
+        gaps_str = json.dumps(core["gaps"], indent=2, ensure_ascii=False)[:5000]
+        evidence_lines = self._build_evidence_context(core["ideation"], core["blueprint"])
+
+        full_text_block = ""
+        if core["full_text_lines"]:
+            full_text_block = (
+                "\n\n=== FULL-TEXT EXCERPTS FROM KEY PAPERS ===\n"
+                + "\n".join(core["full_text_lines"])
+                + "\n=== END FULL-TEXT EXCERPTS ==="
+            )
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Literature Survey:\n{survey_str}",
+            "",
+            f"Research Gaps:\n{gaps_str}",
+            "",
+            f"Proposed Method: {core['method_name']}",
+            "",
+            evidence_lines,
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+            "",
+            self._build_must_cite_context(core["ideation"], core["cite_keys"]),
+            full_text_block,
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_method(
+        self,
+        core: dict[str, Any],
+        **_kwargs: Any,
+    ) -> str:
+        """Method: full method detail, hypothesis, ablations, cite keys, full-text."""
+        full_text_block = ""
+        if core["full_text_lines"]:
+            full_text_block = (
+                "\n\n=== FULL-TEXT EXCERPTS FROM KEY PAPERS ===\n"
+                + "\n".join(core["full_text_lines"])
+                + "\n=== END FULL-TEXT EXCERPTS ==="
+            )
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Main Hypothesis: {core['hypothesis']}",
+            "",
+            f"Proposed Method:\n{core['method_str']}",
+            "",
+            f"Datasets: {core['dataset_names']}",
+            f"Metrics: {core['metric_names']}",
+            f"Ablation Groups: {core['ablation_names']}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+            full_text_block,
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_experiments(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        experiment_results: dict | None = None,
+        experiment_status: str = "pending",
+        experiment_analysis: dict | None = None,
+        experiment_summary: str = "",
+        **_kwargs: Any,
+    ) -> str:
+        """Experiments: method brief, datasets/metrics/baselines full, results, analysis, grounding."""
+        normalized_results = self._normalize_experiment_results(
+            experiment_results or {},
+            core["blueprint"],
+            experiment_analysis or {},
+        )
+        evidence_lines = self._build_evidence_context(core["ideation"], core["blueprint"])
+        real_results_lines = self._build_real_results_context(
+            normalized_results, experiment_status,
+        )
+        analysis_lines = self._build_experiment_analysis_context(
+            experiment_analysis or {}, experiment_summary, experiment_status,
+        )
+
+        method = core["method"]
+        ablations = core["ablations"]
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Main Hypothesis: {core['hypothesis']}",
+            "",
+            f"Proposed Method: {core['method_name']}",
+            f"Method Overview: {core['method_brief']}",
+            "",
+            f"Datasets: {json.dumps(core['datasets'], indent=2, ensure_ascii=False)[:4000]}",
+            f"Metrics: {json.dumps(core['metrics'], indent=2, ensure_ascii=False)[:2000]}",
+            f"Baselines: {json.dumps(core['baselines'], indent=2, ensure_ascii=False)[:3000]}",
+            f"Ablation Groups: {json.dumps(ablations, indent=2, ensure_ascii=False)[:2000]}",
+            "",
+            evidence_lines,
+            "",
+            real_results_lines,
+            "",
+            analysis_lines,
+            "",
+            self._build_baseline_comparison_context(grounding),
+            "",
+            self._build_grounding_status_context(grounding),
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+            "",
+            "=== CONTRIBUTION-EXPERIMENT ALIGNMENT ===",
+            "Each contribution in Introduction MUST map to experimental evidence:",
+            f"- Method components: {json.dumps([c for c in method.get('key_components', [])], ensure_ascii=False)}",
+            f"- Ablation groups: {json.dumps([a.get('group_name', '') for a in ablations if isinstance(a, dict)], ensure_ascii=False)}",
+            "Every component listed above should appear in the ablation table.",
+            "=== END ALIGNMENT ===",
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_conclusion(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        experiment_results: dict | None = None,
+        experiment_status: str = "pending",
+        experiment_analysis: dict | None = None,
+        experiment_summary: str = "",
+        **_kwargs: Any,
+    ) -> str:
+        """Conclusion: topic, hypothesis, method brief, results summary, grounding."""
+        normalized_results = self._normalize_experiment_results(
+            experiment_results or {},
+            core["blueprint"],
+            experiment_analysis or {},
+        )
+        real_results_lines = self._build_real_results_context(
+            normalized_results, experiment_status,
+        )
+        analysis_lines = self._build_experiment_analysis_context(
+            experiment_analysis or {}, experiment_summary, experiment_status,
+        )
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Main Hypothesis: {core['hypothesis']}",
+            "",
+            f"Proposed Method: {core['method_name']}",
+            f"Method Overview: {core['method_brief']}",
+            f"Key Components: {json.dumps(core['key_components'], ensure_ascii=False)}",
+            "",
+            f"Datasets: {core['dataset_names']}",
+            f"Metrics: {core['metric_names']}",
+            "",
+            real_results_lines,
+            "",
+            analysis_lines,
+            "",
+            self._build_grounding_status_context(grounding),
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_default(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        experiment_results: dict | None = None,
+        experiment_status: str = "pending",
+        experiment_analysis: dict | None = None,
+        experiment_summary: str = "",
+        **_kwargs: Any,
+    ) -> str:
+        """Fallback: build full context for unknown section labels."""
+        return self._build_full_context(
+            core["ideation"],
+            core["blueprint"],
+            core["cite_keys"],
+            experiment_results,
+            experiment_status,
+            experiment_analysis,
+            experiment_summary,
+            grounding,
+        )
+
+    @staticmethod
+    def _cite_keys_block(ref_lines: list[str]) -> str:
+        """Format citation keys block."""
+        return (
+            "=== CITATION KEYS (use ONLY these exact keys with \\cite{}) ===\n"
+            + "\n".join(ref_lines)
+            + "\n=== END CITATION KEYS ==="
+        )
+
+    # ------------------------------------------------------------------
+    # P0-B: Contribution Contract extraction
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_contribution_contract(
+        intro_content: str,
+        method_name: str = "",
+    ) -> ContributionContract:
+        r"""Extract structured contribution claims from Introduction LaTeX content.
+
+        Parses \begin{itemize}...\end{itemize} blocks to find \item entries
+        that represent the paper's contribution claims.
+
+        Args:
+            intro_content: The generated Introduction section LaTeX.
+            method_name: The proposed method name from blueprint.
+
+        Returns:
+            ContributionContract with extracted claims.
+        """
+        contract = ContributionContract(method_name=method_name)
+
+        # Find itemize/enumerate blocks (contributions are usually in the last one)
+        list_blocks = re.findall(
+            r'\\begin\{(?:itemize|enumerate)\}(.*?)\\end\{(?:itemize|enumerate)\}',
+            intro_content, re.DOTALL,
+        )
+        if not list_blocks:
+            return contract
+
+        # Use the last list block (contributions typically appear at the end)
+        contrib_block = list_blocks[-1]
+        items = re.split(r'\\item\s*', contrib_block)
+        items = [it.strip() for it in items if it.strip()]
+
+        for item_text in items:
+            # Clean LaTeX for analysis (remove cite, ref, textbf, etc.)
+            clean = re.sub(r'\\(?:cite[tp]?|ref|eqref|label)\{[^}]*\}', '', item_text)
+            clean = re.sub(r'\\(?:textbf|textit|emph)\{([^}]*)\}', r'\1', clean)
+            clean = re.sub(r'[~\\]', ' ', clean)
+            clean = re.sub(r'\s+', ' ', clean).strip()
+
+            # Classify claim type
+            lower = clean.lower()
+            if any(kw in lower for kw in (
+                "experiment", "demonstrate", "achieve", "outperform",
+                "state-of-the-art", "sota", "benchmark", "empirical",
+                "show that", "shows that",
+            )):
+                claim_type = "empirical"
+            elif any(kw in lower for kw in (
+                "introduce", "design", "develop", "novel",
+                "module", "component", "mechanism", "layer",
+            )):
+                claim_type = "component"
+            else:
+                claim_type = "method"
+
+            # Extract key terms: capitalized multi-word names, or text in \textbf{}
+            key_terms: list[str] = []
+            # From \textbf{...} in original
+            bold_terms = re.findall(r'\\textbf\{([^}]+)\}', item_text)
+            key_terms.extend(t.strip() for t in bold_terms if len(t.strip()) > 1)
+            # Capitalized phrases (2+ words starting with caps, e.g. "Adaptive Channel Attention")
+            cap_phrases = re.findall(
+                r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+)+)\b', clean,
+            )
+            for phrase in cap_phrases:
+                if len(phrase) <= 5:
+                    continue
+                # Skip if this phrase is a substring of an existing term
+                if any(phrase in existing for existing in key_terms):
+                    continue
+                # If an existing term is a substring of this phrase, replace it
+                key_terms = [t for t in key_terms if t not in phrase]
+                key_terms.append(phrase)
+            # Method name if mentioned
+            if method_name and method_name.lower() in lower:
+                if method_name not in key_terms:
+                    key_terms.insert(0, method_name)
+
+            # Use first ~200 chars of item text (cleaned)
+            claim_text = clean[:200].rstrip()
+
+            contract.claims.append(ContributionClaim(
+                text=claim_text,
+                claim_type=claim_type,
+                key_terms=key_terms[:5],  # cap at 5 terms
+            ))
+
+        return contract
 
     @staticmethod
     def _build_evidence_context(ideation: dict, blueprint: dict) -> str:

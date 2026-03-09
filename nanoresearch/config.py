@@ -137,6 +137,10 @@ class ResearchConfig(BaseModel):
     auto_create_env: bool = True
     auto_download_resources: bool = True
     local_execution_timeout: int = 1800
+    runtime_auto_install_enabled: bool = True
+    runtime_auto_install_max_packages: int = 2
+    runtime_auto_install_max_nltk_downloads: int = 3
+    runtime_auto_install_allowlist: list[str] = Field(default_factory=list)
 
     # Use an existing conda env instead of creating a new venv.
     # When set, experiment agent skips venv creation and uses this env's Python.

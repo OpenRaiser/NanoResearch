@@ -23,16 +23,23 @@ import json
 import logging
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
 
-from nanoresearch.agents.base import BaseResearchAgent
+from nanoresearch.agents.base import BaseResearchAgent, _fix_json_escapes, _repair_truncated_json
 from nanoresearch.agents.cluster_executor import ClusterExecutor
 from nanoresearch.agents.experiment_tools import build_experiment_tools
 from nanoresearch.agents.feedback_analyzer import FeedbackAnalyzer
 from nanoresearch.agents.preflight import PreflightChecker
+from nanoresearch.agents.project_runner import RUNNER_SCRIPT_NAME, ensure_project_runner
+from nanoresearch.agents.repair_journal import (
+    append_snapshot_journal,
+    capture_repair_snapshot,
+    rollback_snapshot,
+)
 from nanoresearch.agents.runtime_env import RuntimeEnvironmentManager
 from nanoresearch.schemas.iteration import (
     ExperimentHypothesis,
@@ -216,35 +223,298 @@ def _is_finite(value: Any) -> bool:
 
 
 def _all_metrics_finite(metrics: list) -> bool:
-    """Check that all metric values in a list are finite numbers."""
+    """Check that all metric values in a list are finite numbers.
+
+    Returns False only if there are NO valid metrics at all.
+    NaN/Inf values are replaced with None in-place so the row is kept
+    with its valid data.
+    """
     if not isinstance(metrics, list):
         return False
+    has_valid = False
     for m in metrics:
         if not isinstance(m, dict):
-            return False
+            continue
         val = m.get("value")
-        if val is not None and not _is_finite(val):
-            return False
-    return True
+        if val is not None:
+            if _is_finite(val):
+                has_valid = True
+            else:
+                m["value"] = None  # replace NaN/Inf, keep the row
+    return has_valid
 
 
 def _training_entry_finite(entry: dict) -> bool:
-    """Check that numeric fields in a training log entry are finite."""
+    """Check that numeric fields in a training log entry are finite.
+
+    Replaces NaN/Inf values with None in-place rather than rejecting
+    the entire entry.  Returns False only for malformed entries.
+    """
     for key in ("train_loss", "val_loss"):
         val = entry.get(key)
         if val is not None and not _is_finite(val):
-            return False
+            entry[key] = None  # replace NaN/Inf, keep the entry
     metrics = entry.get("metrics", {})
     if not isinstance(metrics, dict):
         return False  # malformed metrics field
-    for val in metrics.values():
-        if val is not None and not _is_finite(val):
-            return False
+    for mk, mv in list(metrics.items()):
+        if mv is not None and not _is_finite(mv):
+            metrics[mk] = None  # replace NaN/Inf, keep the entry
     return True
+
+
+def _metric_entries_from_mapping(mapping: dict, *, num_runs: int | None = None) -> list[dict[str, Any]]:
+    """Extract summary metric entries from a flat/nested metrics mapping."""
+    metric_list: list[dict[str, Any]] = []
+    for mname, mval in mapping.items():
+        if any(str(mname).startswith(prefix) for prefix in ("per_class", "confusion_matrix", "qualitative")):
+            continue
+        if str(mname) in {
+            "run_seed", "num_runs", "num_samples", "variant", "training_time_sec",
+            "parameter_count", "FLOPs_M", "best_val_accuracy", "inference_time_ms",
+            "epoch", "step", "dataset", "method_name", "model_name", "name",
+        }:
+            continue
+
+        if isinstance(mval, dict) and "mean" in mval and _is_finite(mval.get("mean")):
+            entry = {
+                "metric_name": str(mname),
+                "value": mval["mean"],
+                "std": mval.get("std", 0.0),
+            }
+            if num_runs is not None:
+                entry["num_runs"] = num_runs
+            metric_list.append(entry)
+        elif _is_finite(mval):
+            entry = {
+                "metric_name": str(mname),
+                "value": mval,
+            }
+            if num_runs is not None:
+                entry["num_runs"] = num_runs
+            metric_list.append(entry)
+    return metric_list
 
 
 class ExperimentAgent(BaseResearchAgent):
     stage = PipelineStage.EXPERIMENT
+
+    @staticmethod
+    def _strip_json_fence(raw: str) -> str:
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            lines = text.split("\n")[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        return text
+
+    @staticmethod
+    def _json_parse_candidates(text: str) -> list[str]:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return [""]
+
+        candidates = [stripped]
+        bracket_positions = [
+            index for index in (stripped.find("{"), stripped.find("[")) if index >= 0
+        ]
+        if bracket_positions:
+            first_json_index = min(bracket_positions)
+            if first_json_index > 0:
+                candidates.append(stripped[first_json_index:])
+        return candidates
+
+    @staticmethod
+    def _decode_json_value(text: str, *, strict: bool) -> Any:
+        decoder = json.JSONDecoder(strict=strict)
+        value, _end = decoder.raw_decode(text.lstrip())
+        return value
+
+    @classmethod
+    def _parse_llm_json_payload(cls, raw: str) -> Any:
+        text = cls._strip_json_fence(raw)
+
+        last_error: json.JSONDecodeError | None = None
+        for candidate in cls._json_parse_candidates(text):
+            try:
+                return cls._decode_json_value(candidate, strict=True)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+        fixed = _fix_json_escapes(text)
+        for candidate in cls._json_parse_candidates(fixed):
+            try:
+                return cls._decode_json_value(candidate, strict=False)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+
+        repaired = _repair_truncated_json(fixed)
+        if repaired is not None:
+            for candidate in cls._json_parse_candidates(repaired):
+                try:
+                    return cls._decode_json_value(candidate, strict=False)
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+
+        if last_error is not None:
+            raise last_error
+        raise json.JSONDecodeError("Invalid JSON payload", text, 0)
+
+    @staticmethod
+    def _line_range_to_offsets(lines: list[str], start: int, end: int) -> tuple[int, int]:
+        start_offset = sum(len(line) for line in lines[:start])
+        end_offset = sum(len(line) for line in lines[:end])
+        return start_offset, end_offset
+
+    @classmethod
+    def _find_rstrip_line_span(cls, content: str, old: str) -> tuple[int, int] | None:
+        old_lines = old.splitlines()
+        if not old_lines:
+            return None
+
+        content_lines = content.splitlines(keepends=True)
+        if len(old_lines) > len(content_lines):
+            return None
+
+        for start in range(len(content_lines) - len(old_lines) + 1):
+            if all(
+                content_lines[start + index].rstrip() == old_lines[index].rstrip()
+                for index in range(len(old_lines))
+            ):
+                return cls._line_range_to_offsets(
+                    content_lines,
+                    start,
+                    start + len(old_lines),
+                )
+        return None
+
+    @classmethod
+    def _find_anchor_span(
+        cls,
+        content: str,
+        old: str,
+        *,
+        max_extra_lines: int = 8,
+    ) -> tuple[int, int] | None:
+        old_lines = [line.strip() for line in old.splitlines() if line.strip()]
+        if len(old_lines) < 2:
+            return None
+
+        first_line = old_lines[0]
+        last_line = old_lines[-1]
+        content_lines = content.splitlines(keepends=True)
+        if not content_lines:
+            return None
+
+        for start in range(len(content_lines)):
+            if first_line not in content_lines[start].strip():
+                continue
+            min_end = start + max(1, len(old_lines) - 1)
+            max_end = min(len(content_lines), start + len(old_lines) + max_extra_lines)
+            for end in range(min_end, max_end):
+                if last_line and last_line in content_lines[end - 1].strip():
+                    return cls._line_range_to_offsets(content_lines, start, end)
+        return None
+
+    @classmethod
+    def _find_definition_block_span(cls, content: str, old: str) -> tuple[int, int] | None:
+        first_nonempty = next((line.strip() for line in old.splitlines() if line.strip()), "")
+        if not first_nonempty:
+            return None
+
+        signature_match = re.match(r"^(async\s+def|def|class)\s+([A-Za-z_]\w*)\b", first_nonempty)
+        if not signature_match:
+            return None
+
+        keyword = signature_match.group(1)
+        name = signature_match.group(2)
+        content_lines = content.splitlines(keepends=True)
+        definition_pattern = re.compile(r"^(async\s+def|def|class)\s+([A-Za-z_]\w*)\b")
+
+        for start, line in enumerate(content_lines):
+            stripped = line.strip()
+            match = definition_pattern.match(stripped)
+            if not match:
+                continue
+            if match.group(1) != keyword or match.group(2) != name:
+                continue
+
+            indent = len(line) - len(line.lstrip())
+            end = start + 1
+            while end < len(content_lines):
+                next_line = content_lines[end]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    end += 1
+                    continue
+
+                next_indent = len(next_line) - len(next_line.lstrip())
+                if next_indent <= indent:
+                    if definition_pattern.match(next_stripped):
+                        break
+                    if next_stripped.startswith("@"):
+                        lookahead = end + 1
+                        while lookahead < len(content_lines) and not content_lines[lookahead].strip():
+                            lookahead += 1
+                        if lookahead < len(content_lines):
+                            decorated = content_lines[lookahead].strip()
+                            decorated_match = definition_pattern.match(decorated)
+                            if decorated_match and (
+                                len(content_lines[lookahead]) - len(content_lines[lookahead].lstrip())
+                            ) <= indent:
+                                break
+                end += 1
+
+            return cls._line_range_to_offsets(content_lines, start, end)
+        return None
+
+    @classmethod
+    def _apply_search_replace_edit(
+        cls,
+        content: str,
+        old: str,
+        new: str,
+    ) -> tuple[str, bool, str]:
+        if not old:
+            return content, False, ""
+
+        if old in content:
+            return content.replace(old, new, 1), True, "exact"
+
+        rstrip_span = cls._find_rstrip_line_span(content, old)
+        if rstrip_span is not None:
+            start, end = rstrip_span
+            return content[:start] + new + content[end:], True, "rstrip_lines"
+
+        if "\n" not in old.strip():
+            old_line = old.strip()
+            content_lines = content.splitlines(keepends=True)
+            for index, line in enumerate(content_lines):
+                if line.strip() != old_line:
+                    continue
+                indent = len(line) - len(line.lstrip())
+                replacement_lines = new.strip().split("\n")
+                replacement = "\n".join(
+                    (" " * indent + item.strip()) if item.strip() else ""
+                    for item in replacement_lines
+                )
+                if line.endswith("\n") and not replacement.endswith("\n"):
+                    replacement += "\n"
+                start, end = cls._line_range_to_offsets(content_lines, index, index + 1)
+                return content[:start] + replacement + content[end:], True, "single_line_stripped"
+
+        anchor_span = cls._find_anchor_span(content, old)
+        if anchor_span is not None:
+            start, end = anchor_span
+            return content[:start] + new + content[end:], True, "anchor_span"
+
+        definition_span = cls._find_definition_block_span(content, old)
+        if definition_span is not None:
+            start, end = definition_span
+            return content[:start] + new + content[end:], True, "definition_block"
+
+        return content, False, ""
 
     async def run(self, **inputs: Any) -> dict[str, Any]:
         blueprint_data: dict = inputs["experiment_blueprint"]
@@ -447,6 +717,8 @@ class ExperimentAgent(BaseResearchAgent):
 
             if preflight.overall_status == "failed":
                 self.log(f"Blocking preflight failures: {preflight.blocking_failures}")
+                if preflight.suggested_fixes:
+                    self.log(f"Suggested preflight fixes: {preflight.suggested_fixes[:5]}")
                 round_result = RoundResult(
                     round_number=round_num,
                     hypothesis=hypothesis,
@@ -1151,13 +1423,7 @@ Output a JSON object with:
                 prompt,
                 json_mode=True,
             )
-            text = raw.strip()
-            if text.startswith("```"):
-                lines = text.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-            data = json.loads(text)
+            data = self._parse_llm_json_payload(raw)
 
             # If LLM says no new ideas, signal early stop
             if data.get("no_new_ideas"):
@@ -1200,6 +1466,7 @@ Output a JSON object with:
         2. Avoid accidental deletion of unchanged code
         3. Make changes auditable
         """
+        self._remember_mutation_snapshot_entry(None)
         # Collect current file contents for context
         file_contents: dict[str, str] = {}
         for py_file in code_dir.rglob("*.py"):
@@ -1269,6 +1536,7 @@ IMPORTANT RULES:
 Output ONLY valid JSON array."""
 
         modified_files: list[str] = []
+        snapshot_batch: list[dict[str, Any]] = []
         try:
             code_gen_config = self.config.for_stage("code_gen")
             raw = await self._dispatcher.generate(
@@ -1276,14 +1544,7 @@ Output ONLY valid JSON array."""
                 "You are an ML code editor. Apply precise search-replace edits to implement the hypothesis. Output ONLY a JSON array.",
                 prompt,
             )
-            text = raw.strip()
-            if text.startswith("```"):
-                lines = text.split("\n")[1:]
-                if lines and lines[-1].strip().startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-
-            changes = json.loads(text)
+            changes = self._parse_llm_json_payload(raw)
             if not isinstance(changes, list):
                 changes = [changes]
 
@@ -1323,35 +1584,41 @@ Output ONLY valid JSON array."""
                         new = edit.get("new", "")
                         if not old:
                             continue
-                        if old in current:
-                            current = current.replace(old, new, 1)
+                        current, matched, match_strategy = self._apply_search_replace_edit(
+                            current,
+                            old,
+                            new,
+                        )
+                        if matched:
                             applied += 1
+                            self.log(f"  Matched edit in {file_path} via {match_strategy}")
                         else:
-                            # Try whitespace-normalized match
-                            old_normalized = " ".join(old.split())
-                            for line_start in range(len(current)):
-                                chunk = current[line_start:line_start + len(old) + 200]
-                                if " ".join(chunk[:len(old) + 100].split()).startswith(old_normalized[:60]):
-                                    # Find the actual extent
-                                    end = current.find("\n", line_start + len(old) - 10)
-                                    if end == -1:
-                                        end = len(current)
-                                    candidate = current[line_start:end]
-                                    if " ".join(candidate.split()) == old_normalized:
-                                        current = current[:line_start] + new + current[end:]
-                                        applied += 1
-                                        break
-                            else:
-                                logger.warning(
-                                    "Edit old text not found in %s: %s",
-                                    file_path, old[:80],
-                                )
+                            logger.warning(
+                                "Edit old text not found in %s: %s",
+                                file_path, old[:80],
+                            )
 
                     if applied > 0:
                         target_path = code_dir / file_path
                         target_path.parent.mkdir(parents=True, exist_ok=True)
+                        snapshot = capture_repair_snapshot(
+                            self.workspace.path,
+                            target_path,
+                            namespace="iteration_changes",
+                            root_dir=self.workspace.path,
+                            operation="rewrite",
+                        )
                         target_path.write_text(current, encoding="utf-8")
+                        if target_path.suffix.lower() == ".py" and not self._check_syntax(target_path):
+                            self.log(f"  Edited file became invalid Python in {file_path}, rolling back")
+                            rollback_snapshot(self.workspace.path, target_path, snapshot)
+                            snapshot["rolled_back"] = True
+                            snapshot["rollback_reason"] = "syntax_error"
+                            snapshot_batch.append(snapshot)
+                            continue
+
                         modified_files.append(file_path)
+                        snapshot_batch.append(snapshot)
                         self.log(f"  Edited: {file_path} ({applied}/{len(edits)} edits applied)")
                 else:
                     # Full write mode (new files or backwards compat)
@@ -1359,14 +1626,42 @@ Output ONLY valid JSON array."""
                     if not content:
                         continue
                     target_path = code_dir / file_path
+                    existed_before = target_path.exists()
+                    snapshot = capture_repair_snapshot(
+                        self.workspace.path,
+                        target_path,
+                        namespace="iteration_changes",
+                        root_dir=self.workspace.path,
+                        existed_before=existed_before,
+                        operation="rewrite" if existed_before else "create",
+                    )
                     target_path.parent.mkdir(parents=True, exist_ok=True)
                     target_path.write_text(content, encoding="utf-8")
+                    if target_path.suffix.lower() == ".py" and not self._check_syntax(target_path):
+                        self.log(f"  Wrote invalid Python in {file_path}, rolling back")
+                        rollback_snapshot(self.workspace.path, target_path, snapshot)
+                        snapshot["rolled_back"] = True
+                        snapshot["rollback_reason"] = "syntax_error"
+                        snapshot_batch.append(snapshot)
+                        continue
+
                     modified_files.append(file_path)
+                    snapshot_batch.append(snapshot)
                     self.log(f"  Wrote: {file_path}")
 
         except Exception as exc:
             logger.warning("Failed to apply iteration changes: %s", exc)
 
+        if snapshot_batch:
+            entry = append_snapshot_journal(
+                self.workspace.path,
+                agent=self.__class__.__name__,
+                mutation_kind="iteration_changes",
+                scope="legacy_iteration_search_replace",
+                snapshots=snapshot_batch,
+                metadata={"modified_files": list(modified_files)},
+            )
+            self._remember_mutation_snapshot_entry(entry)
         return modified_files
 
     async def _apply_iteration_changes_fullwrite(
@@ -1375,6 +1670,7 @@ Output ONLY valid JSON array."""
         code_dir: Path,
     ) -> list[str]:
         """Fallback: when search-replace fails, ask LLM to rewrite the target file entirely."""
+        self._remember_mutation_snapshot_entry(None)
         # Find the primary target file from planned_changes
         target_rel = None
         for change_desc in hypothesis.planned_changes:
@@ -1469,7 +1765,39 @@ The output MUST be a complete, runnable file — do NOT omit any functions or cl
                         target_rel, len(new_content), len(current), _last_line[-60:],
                     )
                     return []
+                snapshot = capture_repair_snapshot(
+                    self.workspace.path,
+                    target,
+                    namespace="iteration_fullwrite",
+                    root_dir=self.workspace.path,
+                    operation="rewrite",
+                )
                 target.write_text(new_content, encoding="utf-8")
+                if target.suffix.lower() == ".py" and not self._check_syntax(target):
+                    self.log(f"  Full-file rewrite produced invalid Python in {target_rel}, rolling back")
+                    rollback_snapshot(self.workspace.path, target, snapshot)
+                    snapshot["rolled_back"] = True
+                    snapshot["rollback_reason"] = "syntax_error"
+                    entry = append_snapshot_journal(
+                        self.workspace.path,
+                        agent=self.__class__.__name__,
+                        mutation_kind="iteration_fullwrite",
+                        scope="legacy_iteration_fullwrite",
+                        snapshots=[snapshot],
+                        metadata={"modified_files": []},
+                    )
+                    self._remember_mutation_snapshot_entry(entry)
+                    return []
+
+                entry = append_snapshot_journal(
+                    self.workspace.path,
+                    agent=self.__class__.__name__,
+                    mutation_kind="iteration_fullwrite",
+                    scope="legacy_iteration_fullwrite",
+                    snapshots=[snapshot],
+                    metadata={"modified_files": [target_rel]},
+                )
+                self._remember_mutation_snapshot_entry(entry)
                 self.log(f"  Rewrote {target_rel} (full-file fallback, {len(new_content)} chars)")
                 return [target_rel]
         except Exception as exc:
@@ -1759,16 +2087,27 @@ Return JSON:
     async def _run_quick_eval_subprocess(
         self, code_dir: Path, venv_python: str, timeout: int,
     ) -> dict:
-        """Run main.py --quick-eval in a subprocess. Returns raw result dict."""
+        """Run the legacy experiment entrypoint in quick-eval mode."""
         loop = asyncio.get_running_loop()
         # Record metrics.json mtime before run to detect stale files on timeout
         metrics_path = code_dir / "results" / "metrics.json"
         mtime_before = metrics_path.stat().st_mtime if metrics_path.exists() else None
+        command = self._build_legacy_subprocess_command(
+            code_dir,
+            venv_python,
+            mode="quick-eval",
+        )
+        if command is None:
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "No runnable entry script found (expected one of main.py/train.py/run.py)",
+            }
         try:
             proc_result = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    [venv_python, "main.py", "--quick-eval"],
+                    command,
                     cwd=str(code_dir),
                     capture_output=True,
                     text=False,
@@ -1831,10 +2170,181 @@ Return JSON:
         """
         expected_keys = {"main_results", "ablation_results", "training_log"}
         if expected_keys & set(data.keys()):
-            return data  # Already in expected format
+            normalized = dict(data)
+
+            if not normalized.get("main_results"):
+                summary_candidates = [
+                    normalized.get("results"),
+                    normalized.get("metrics"),
+                    normalized.get("summary"),
+                    normalized.get("final_metrics"),
+                    normalized.get("best_metrics"),
+                    normalized.get("aggregate"),
+                ]
+                for candidate in summary_candidates:
+                    if isinstance(candidate, dict):
+                        metric_list = _metric_entries_from_mapping(
+                            candidate,
+                            num_runs=normalized.get("num_runs") if isinstance(normalized.get("num_runs"), int) else None,
+                        )
+                        if metric_list:
+                            normalized["main_results"] = [
+                                {
+                                    "method_name": str(
+                                        normalized.get("method_name")
+                                        or normalized.get("model_name")
+                                        or normalized.get("name")
+                                        or "Ours"
+                                    ),
+                                    "dataset": str(normalized.get("dataset") or "UNKNOWN"),
+                                    "is_proposed": bool(normalized.get("is_proposed", True)),
+                                    "metrics": metric_list,
+                                }
+                            ]
+                            break
+
+            if not normalized.get("main_results"):
+                training_log = normalized.get("training_log")
+                if isinstance(training_log, list):
+                    for entry in reversed(training_log):
+                        if not isinstance(entry, dict):
+                            continue
+                        metrics = entry.get("metrics")
+                        if isinstance(metrics, dict):
+                            metric_list = _metric_entries_from_mapping(metrics)
+                            if metric_list:
+                                normalized["main_results"] = [
+                                    {
+                                        "method_name": str(
+                                            normalized.get("method_name")
+                                            or normalized.get("model_name")
+                                            or normalized.get("name")
+                                            or "Ours"
+                                        ),
+                                        "dataset": str(normalized.get("dataset") or "UNKNOWN"),
+                                        "is_proposed": bool(normalized.get("is_proposed", True)),
+                                        "metrics": metric_list,
+                                    }
+                                ]
+                                break
+
+            if not normalized.get("ablation_results"):
+                ablation_candidates = (
+                    normalized.get("ablations"),
+                    normalized.get("ablation"),
+                    normalized.get("ablation_study"),
+                )
+                for candidate in ablation_candidates:
+                    if isinstance(candidate, list):
+                        ablation_results = []
+                        for item in candidate:
+                            if not isinstance(item, dict):
+                                continue
+                            metric_source = item.get("metrics") if isinstance(item.get("metrics"), dict) else item
+                            if not isinstance(metric_source, dict):
+                                continue
+                            metric_list = _metric_entries_from_mapping(metric_source)
+                            if metric_list:
+                                ablation_results.append(
+                                    {
+                                        "variant_name": str(
+                                            item.get("variant_name")
+                                            or item.get("name")
+                                            or item.get("method_name")
+                                            or f"variant_{len(ablation_results) + 1}"
+                                        ),
+                                        "metrics": metric_list,
+                                    }
+                                )
+                        if ablation_results:
+                            normalized["ablation_results"] = ablation_results
+                            break
+                    elif isinstance(candidate, dict):
+                        ablation_results = []
+                        for variant_name, metric_source in candidate.items():
+                            if not isinstance(metric_source, dict):
+                                continue
+                            metric_list = _metric_entries_from_mapping(metric_source)
+                            if metric_list:
+                                ablation_results.append(
+                                    {
+                                        "variant_name": str(variant_name),
+                                        "metrics": metric_list,
+                                    }
+                                )
+                        if ablation_results:
+                            normalized["ablation_results"] = ablation_results
+                            break
+
+            return normalized
 
         variants = data.get("variants")
+        # Handle array-format variants: [{"name": "full", ...}, ...]
+        if isinstance(variants, list):
+            converted: dict = {}
+            for item in variants:
+                if isinstance(item, dict):
+                    name = item.pop("name", item.pop("variant_name", f"variant_{len(converted)}"))
+                    converted[str(name)] = item
+            variants = converted if converted else None
+            logger.debug("Converted list-format variants to dict (%d entries)", len(converted))
         if not isinstance(variants, dict) or not variants:
+            summary_candidates = [
+                data.get("results"),
+                data.get("metrics"),
+                data.get("summary"),
+                data.get("final_metrics"),
+                data.get("best_metrics"),
+                data.get("aggregate"),
+            ]
+            for candidate in summary_candidates:
+                if isinstance(candidate, dict):
+                    metric_list = _metric_entries_from_mapping(
+                        candidate,
+                        num_runs=data.get("num_runs") if isinstance(data.get("num_runs"), int) else None,
+                    )
+                    if metric_list:
+                        return {
+                            "main_results": [
+                                {
+                                    "method_name": str(
+                                        data.get("method_name")
+                                        or data.get("model_name")
+                                        or data.get("name")
+                                        or "Ours"
+                                    ),
+                                    "dataset": str(data.get("dataset") or "UNKNOWN"),
+                                    "is_proposed": bool(data.get("is_proposed", True)),
+                                    "metrics": metric_list,
+                                }
+                            ],
+                            "ablation_results": [],
+                            "training_log": data.get("training_log", []) if isinstance(data.get("training_log"), list) else [],
+                        }
+
+            top_level_metric_list = _metric_entries_from_mapping(
+                data,
+                num_runs=data.get("num_runs") if isinstance(data.get("num_runs"), int) else None,
+            )
+            if top_level_metric_list:
+                return {
+                    "main_results": [
+                        {
+                            "method_name": str(
+                                data.get("method_name")
+                                or data.get("model_name")
+                                or data.get("name")
+                                or "Ours"
+                            ),
+                            "dataset": str(data.get("dataset") or "UNKNOWN"),
+                            "is_proposed": bool(data.get("is_proposed", True)),
+                            "metrics": top_level_metric_list,
+                        }
+                    ],
+                    "ablation_results": [],
+                    "training_log": data.get("training_log", []) if isinstance(data.get("training_log"), list) else [],
+                }
+
             # Fallback: top-level keys are variant dicts themselves
             # e.g. {"full_model": {"runs": ..., "aggregate": {...}}, "ablation_no_kd": {...}}
             candidate_variants = {}
@@ -1942,6 +2452,12 @@ Return JSON:
         try:
             raw = metrics_path.read_text(encoding="utf-8")
             data = json.loads(raw)  # NaN/Inf handled by module-level helpers
+            if isinstance(data, list):
+                if all(isinstance(entry, dict) for entry in data):
+                    data = {"training_log": data}
+                else:
+                    logger.warning("metrics.json is a non-dict list, skipping")
+                    return {}
             if not isinstance(data, dict):
                 logger.warning("metrics.json is not a dict, skipping")
                 return {}
@@ -2024,6 +2540,20 @@ Return JSON:
         session_id = self.workspace.path.name
 
         try:
+            runner_command = self._build_legacy_runner_command(
+                code_dir,
+                mode="quick-eval",
+            )
+            if runner_command is None:
+                return (
+                    {
+                        "status": "skipped",
+                        "cluster_code_path": cluster_code_path,
+                        "stderr": "No runnable entry script found (expected one of main.py/train.py/run.py)",
+                    },
+                    {"status": "skipped", "metrics": {}},
+                )
+
             # Step 1: Prepare code on cluster
             if not cluster_code_path:
                 self.log("Preparing code on cluster...")
@@ -2046,7 +2576,7 @@ Return JSON:
                 await cluster.reupload_code(code_dir, cluster_code_path)
 
             # Step 3: Submit SLURM job
-            script_cmd = "python main.py --quick-eval"
+            script_cmd = runner_command
             job_id = await cluster.submit_job(cluster_code_path, script_cmd)
 
             # Step 4: Wait for completion
@@ -2116,18 +2646,22 @@ Return JSON:
     ) -> tuple[dict, str]:
         """Run _execute_code and also return the venv python path for reuse."""
         code_dir = self.workspace.path / "code"
-        main_py = code_dir / "main.py"
-
-        if not main_py.exists():
+        entry_script = self._find_legacy_entry_script(code_dir)
+        if entry_script is None:
             return (
-                {"status": "skipped", "reason": "main.py not found", "stdout": "", "stderr": ""},
+                {
+                    "status": "skipped",
+                    "reason": "No runnable entry script found (expected one of main.py/train.py/run.py)",
+                    "stdout": "",
+                    "stderr": "",
+                },
                 sys.executable,
             )
 
         venv_python = await self._setup_venv(code_dir)
         result = await self._execute_code(
             generated_files, blueprint_summary,
-            _code_dir=code_dir, _main_py=main_py, _venv_python=venv_python,
+            _code_dir=code_dir, _main_py=entry_script, _venv_python=venv_python,
         )
         return result, venv_python
 
@@ -2147,10 +2681,15 @@ Return JSON:
         bug at a time.
         """
         code_dir = _code_dir or (self.workspace.path / "code")
-        main_py = _main_py or (code_dir / "main.py")
+        main_py = _main_py or self._find_legacy_entry_script(code_dir)
 
-        if not main_py.exists():
-            return {"status": "skipped", "reason": "main.py not found", "stdout": "", "stderr": ""}
+        if main_py is None or not main_py.exists():
+            return {
+                "status": "skipped",
+                "reason": "No runnable entry script found (expected one of main.py/train.py/run.py)",
+                "stdout": "",
+                "stderr": "",
+            }
 
         venv_python = _venv_python or await self._setup_venv(code_dir)
 
@@ -2195,6 +2734,7 @@ Return JSON:
         blueprint_summary: str,
         mode: str = "dry-run",
         previous_fixes: list[dict] | None = None,
+        extra_context: str = "",
     ) -> list[str]:
         """Parse traceback, fix each affected file with a targeted LLM call.
 
@@ -2299,17 +2839,36 @@ Return JSON:
                 fix_history = (
                     "\n\nPrevious fix attempts that did NOT resolve the problem:\n"
                     + "\n".join(
-                        f"  Round {i+1}: {fx.get('diagnosis', fx.get('error_msg', ''))[:200]}"
+                        (
+                            f"  Round {i+1}: "
+                            f"{fx.get('diagnosis', fx.get('error_msg', ''))[:200]}"
+                            + (
+                                f" | repeated={fx.get('repeat_count')}"
+                                if fx.get("repeat_count", 1) > 1
+                                else ""
+                            )
+                            + (
+                                f" | files={fx.get('fixed_files', [])}"
+                                if fx.get("fixed_files")
+                                else ""
+                            )
+                        )
                         for i, fx in enumerate(previous_fixes)
                     )
                     + "\nDo NOT repeat the same fixes. Try a different approach.\n"
                 )
 
+            extra_context_text = (
+                f"Additional execution context:\n{extra_context}\n\n"
+                if extra_context.strip()
+                else ""
+            )
             fix_prompt = (
                 f"`python main.py {flag}` failed.\n\n"
                 f"Error: {error_msg}\n\n"
                 f"Full traceback (last 40 lines):\n```\n"
                 f"{chr(10).join(error_lines[-40:])}\n```\n\n"
+                f"{extra_context_text}"
                 f"File: {rel_path} (error around line {error_line}):\n```python\n"
                 f"{context_snippet}\n```\n\n"
                 f"Full file ({len(lines)} lines):\n```python\n{content[:4000]}\n```\n\n"
@@ -2332,14 +2891,7 @@ Return JSON:
                     f"You are a Python debugging expert. Fix the bug in {rel_path} using precise search-replace edits.",
                     fix_prompt,
                 )
-                text = (raw or "").strip()
-                if text.startswith("```"):
-                    text_lines = text.split("\n")[1:]
-                    if text_lines and text_lines[-1].strip().startswith("```"):
-                        text_lines = text_lines[:-1]
-                    text = "\n".join(text_lines)
-
-                edits = json.loads(text)
+                edits = self._parse_llm_json_payload(raw)
                 if not isinstance(edits, list):
                     edits = [edits]
 
@@ -2353,61 +2905,14 @@ Return JSON:
                     new = edit.get("new", "")
                     if not old:
                         continue
-
-                    # 4-layer patch matching (borrowed from Deep Pipeline DebugAgent)
-                    matched = False
-
-                    # Layer 1: Exact match
-                    if old in content:
-                        content = content.replace(old, new, 1)
-                        matched = True
-
-                    # Layer 2: Strip trailing whitespace per line
-                    if not matched:
-                        def _strip_trailing(t: str) -> str:
-                            return "\n".join(l.rstrip() for l in t.split("\n"))
-                        c_stripped = _strip_trailing(content)
-                        o_stripped = _strip_trailing(old)
-                        if o_stripped in c_stripped:
-                            content = c_stripped.replace(o_stripped, _strip_trailing(new), 1)
-                            matched = True
-
-                    # Layer 3: First-line + last-line fuzzy span match
-                    if not matched:
-                        old_parts = old.strip().split("\n")
-                        if len(old_parts) >= 2:
-                            first_line = old_parts[0].strip()
-                            last_line = old_parts[-1].strip()
-                            c_lines = content.split("\n")
-                            for i in range(len(c_lines)):
-                                if first_line and first_line in c_lines[i].strip():
-                                    for j in range(i + len(old_parts) - 1,
-                                                   min(i + len(old_parts) + 5, len(c_lines))):
-                                        if last_line and last_line in c_lines[j].strip():
-                                            new_lines = new.rstrip().split("\n")
-                                            c_lines[i:j+1] = new_lines
-                                            content = "\n".join(c_lines)
-                                            matched = True
-                                            break
-                                    if matched:
-                                        break
-
-                    # Layer 4: Single-line match (strip + compare)
-                    if not matched and "\n" not in old.strip():
-                        old_line = old.strip()
-                        c_lines = content.split("\n")
-                        for i, line in enumerate(c_lines):
-                            if old_line == line.strip():
-                                indent = len(line) - len(line.lstrip())
-                                new_parts = new.strip().split("\n")
-                                indented = [" " * indent + nl.strip() if nl.strip() else "" for nl in new_parts]
-                                c_lines[i:i+1] = indented
-                                content = "\n".join(c_lines)
-                                matched = True
-                                break
-
+                    content, matched, match_strategy = self._apply_search_replace_edit(
+                        content,
+                        old,
+                        new,
+                    )
                     if matched:
                         applied += 1
+                        self.log(f"  Patch matched in {rel_path} via {match_strategy}")
 
                 if applied > 0:
                     # Syntax validation + rollback (borrowed from Deep Pipeline DebugAgent)
@@ -2423,8 +2928,8 @@ Return JSON:
 
             except json.JSONDecodeError:
                 # Fallback: LLM might return the full fixed file
-                if text and len(text) > 50:
-                    target_file.write_text(text, encoding="utf-8")
+                if raw and len(raw) > 50:
+                    target_file.write_text(raw, encoding="utf-8")
                     if target_file.suffix == ".py" and not self._check_syntax(target_file):
                         self.log(f"  Fallback rewrite has syntax error in {rel_path}, rolling back")
                         target_file.write_text(content, encoding="utf-8")
@@ -2448,6 +2953,7 @@ Return JSON:
         targeted edits that reduce computation: fewer epochs, smaller subset,
         num_workers=0, num_runs=1.
         """
+        self._remember_mutation_snapshot_entry(None)
         main_py = code_dir / "main.py"
         if not main_py.exists():
             return []
@@ -2490,7 +2996,39 @@ Return JSON:
         )
 
         if content != original:
+            snapshot = capture_repair_snapshot(
+                self.workspace.path,
+                main_py,
+                namespace="timeout_fix",
+                root_dir=self.workspace.path,
+                operation="rewrite",
+            )
             main_py.write_text(content, encoding="utf-8")
+            if not self._check_syntax(main_py):
+                self.log("Timeout fix introduced invalid syntax in main.py, rolling back")
+                rollback_snapshot(self.workspace.path, main_py, snapshot)
+                snapshot["rolled_back"] = True
+                snapshot["rollback_reason"] = "syntax_error"
+                entry = append_snapshot_journal(
+                    self.workspace.path,
+                    agent=self.__class__.__name__,
+                    mutation_kind="timeout_fix",
+                    scope="legacy_timeout_fix",
+                    snapshots=[snapshot],
+                    metadata={"modified_files": []},
+                )
+                self._remember_mutation_snapshot_entry(entry)
+                return []
+
+            entry = append_snapshot_journal(
+                self.workspace.path,
+                agent=self.__class__.__name__,
+                mutation_kind="timeout_fix",
+                scope="legacy_timeout_fix",
+                snapshots=[snapshot],
+                metadata={"modified_files": ["main.py"]},
+            )
+            self._remember_mutation_snapshot_entry(entry)
             self.log("Timeout fix: reduced epochs/subset/workers in main.py")
             return ["main.py"]
 
@@ -2507,7 +3045,23 @@ Return JSON:
             cfg_content = _re.sub(r'(num_workers\s*:\s*)(\d+)', r'\g<1>0', cfg_content)
             cfg_content = _re.sub(r'(num_runs\s*:\s*)(\d+)', r'\g<1>1', cfg_content)
             if cfg_content != cfg_original:
+                snapshot = capture_repair_snapshot(
+                    self.workspace.path,
+                    config_yaml,
+                    namespace="timeout_fix",
+                    root_dir=self.workspace.path,
+                    operation="rewrite",
+                )
                 config_yaml.write_text(cfg_content, encoding="utf-8")
+                entry = append_snapshot_journal(
+                    self.workspace.path,
+                    agent=self.__class__.__name__,
+                    mutation_kind="timeout_fix",
+                    scope="legacy_timeout_fix",
+                    snapshots=[snapshot],
+                    metadata={"modified_files": ["config/default.yaml"]},
+                )
+                self._remember_mutation_snapshot_entry(entry)
                 self.log("Timeout fix: reduced epochs/workers/runs in config/default.yaml")
                 return ["config/default.yaml"]
 
@@ -2536,15 +3090,70 @@ Return JSON:
         runtime = RuntimeEnvironmentManager(self.config, self.log)
         await runtime.install_requirements(python, code_dir)
 
+    @staticmethod
+    def _find_legacy_entry_script(code_dir: Path) -> Path | None:
+        """Return the first supported legacy experiment entry script."""
+        for candidate in ("main.py", "train.py", "run.py"):
+            script_path = code_dir / candidate
+            if script_path.exists():
+                return script_path
+        return None
+
+    def _ensure_legacy_runner(self, code_dir: Path) -> dict[str, Any] | None:
+        """Materialize deterministic runner assets for legacy experiment projects."""
+        entry_script = self._find_legacy_entry_script(code_dir)
+        if entry_script is None:
+            return None
+        return ensure_project_runner(code_dir, f"python {entry_script.name}")
+
+    def _build_legacy_runner_command(self, code_dir: Path, *, mode: str) -> str | None:
+        """Build a runner-backed shell command for legacy experiment execution."""
+        runner_assets = self._ensure_legacy_runner(code_dir)
+        if runner_assets is None:
+            return None
+
+        command = str(runner_assets.get("runner_command") or f"python {RUNNER_SCRIPT_NAME}").strip()
+        if mode == "dry-run":
+            return f"{command} --dry-run"
+        if mode == "quick-eval":
+            return f"{command} --quick-eval"
+        return command
+
+    def _build_legacy_subprocess_command(
+        self,
+        code_dir: Path,
+        python: str | None,
+        *,
+        mode: str,
+    ) -> list[str] | None:
+        """Build the concrete argv for a legacy experiment subprocess."""
+        if self._build_legacy_runner_command(code_dir, mode=mode) is None:
+            return None
+
+        normalized_python = python or sys.executable
+        suffix: list[str] = []
+        if mode == "dry-run":
+            suffix = ["--dry-run"]
+        elif mode == "quick-eval":
+            suffix = ["--quick-eval"]
+        return [normalized_python, RUNNER_SCRIPT_NAME, *suffix]
+
     async def _run_main_py(self, code_dir: Path, python: str | None = None) -> dict:
-        """Run main.py in a subprocess with timeout."""
+        """Run the legacy experiment entrypoint in dry-run mode with timeout."""
         python = python or sys.executable
+        command = self._build_legacy_subprocess_command(code_dir, python, mode="dry-run")
+        if command is None:
+            return {
+                "returncode": -1,
+                "stdout": "",
+                "stderr": "No runnable entry script found (expected one of main.py/train.py/run.py)",
+            }
         loop = asyncio.get_running_loop()
         try:
             proc_result = await loop.run_in_executor(
                 None,
                 lambda: subprocess.run(
-                    [python, "main.py", "--dry-run"],
+                    command,
                     cwd=str(code_dir),
                     capture_output=True,
                     text=False,
@@ -2629,23 +3238,12 @@ Output the project plan as a JSON object."""
             code_gen_config, PROJECT_PLAN_SYSTEM_PROMPT, prompt, json_mode=True
         )
 
-        # Parse JSON (handle markdown fences)
-        text = (raw or "").strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove opening fence (e.g. ```json)
-            lines = lines[1:]
-            # Remove only the last closing fence
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
         try:
-            return json.loads(text)
+            return self._parse_llm_json_payload(raw)
         except json.JSONDecodeError as exc:
             logger.error(
                 "Failed to parse project plan JSON. First 500 chars: %s",
-                text[:500],
+                self._strip_json_fence(raw)[:500],
             )
             raise RuntimeError(
                 f"Project plan is not valid JSON: {exc}"

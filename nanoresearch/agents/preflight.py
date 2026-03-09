@@ -43,8 +43,10 @@ class PreflightChecker:
             self.check_import_resolution(),
         ]
 
-        blocking = [c.check_name for c in checks if c.status == "failed"]
-        has_warnings = any(c.status == "warning" for c in checks)
+        failed_checks = [check for check in checks if check.status == "failed"]
+        warning_checks = [check for check in checks if check.status == "warning"]
+        blocking = [self._format_check_summary(check) for check in failed_checks]
+        has_warnings = bool(warning_checks)
 
         if blocking:
             overall = "failed"
@@ -57,7 +59,52 @@ class PreflightChecker:
             overall_status=overall,
             checks=checks,
             blocking_failures=blocking,
+            blocking_check_names=[check.check_name for check in failed_checks],
+            warning_messages=[self._format_check_summary(check) for check in warning_checks],
+            warning_check_names=[check.check_name for check in warning_checks],
+            suggested_fixes=self._collect_suggested_fixes(checks),
         )
+
+    @staticmethod
+    def _format_check_summary(check: PreflightResult) -> str:
+        return f"{check.check_name}: {check.message}"
+
+    @staticmethod
+    def _collect_suggested_fixes(checks: list[PreflightResult]) -> list[str]:
+        fixes: list[str] = []
+        for check in checks:
+            for fix in check.details.get("suggested_fixes", []):
+                normalized = str(fix).strip()
+                if normalized and normalized not in fixes:
+                    fixes.append(normalized)
+        return fixes
+
+    def _entrypoint_candidates(self) -> list[Path]:
+        return [
+            self.code_dir / "main.py",
+            self.code_dir / "train.py",
+            self.code_dir / "run.py",
+            self.code_dir / "run_train.py",
+            self.code_dir / "experiment.py",
+            self.code_dir / "scripts" / "train.py",
+            self.code_dir / "scripts" / "run.py",
+            self.code_dir / "src" / "main.py",
+        ]
+
+    def _dependency_manifests(self) -> list[Path]:
+        manifests: list[Path] = []
+        for rel_path in (
+            "requirements.txt",
+            "environment.yml",
+            "environment.yaml",
+            "pyproject.toml",
+            "setup.py",
+            "setup.cfg",
+        ):
+            candidate = self.code_dir / rel_path
+            if candidate.exists():
+                manifests.append(candidate)
+        return manifests
 
     # ------------------------------------------------------------------
     # 1. config/default.yaml — blocking
@@ -82,11 +129,19 @@ class PreflightChecker:
                         check_name="config_yaml",
                         status="passed",
                         message=f"Config found at {alt.name} (alternative format)",
+                        details={"config_path": str(alt)},
                     )
             return PreflightResult(
                 check_name="config_yaml",
                 status="warning",
                 message="No config file found (config/default.yaml, config.py, etc.)",
+                details={
+                    "expected_paths": [str(yaml_path), *(str(path) for path in alt_configs)],
+                    "suggested_fixes": [
+                        "Add config/default.yaml or an alternative config module like config.py.",
+                        "Include a random_seed/seed field so dry-run can validate determinism.",
+                    ],
+                },
             )
 
         try:
@@ -109,6 +164,12 @@ class PreflightChecker:
                     check_name="config_yaml",
                     status="failed",
                     message="config/default.yaml does not parse as a YAML mapping",
+                    details={
+                        "config_path": str(yaml_path),
+                        "suggested_fixes": [
+                            "Rewrite config/default.yaml as a valid YAML mapping with top-level key/value pairs."
+                        ],
+                    },
                 )
             # Flatten nested keys for checking (e.g. top-level or one level deep)
             all_keys = set(data.keys())
@@ -127,7 +188,13 @@ class PreflightChecker:
                     check_name="config_yaml",
                     status="failed",
                     message=f"config/default.yaml missing required keys: {set(missing)}",
-                    details={"missing_keys": sorted(missing)},
+                    details={
+                        "config_path": str(yaml_path),
+                        "missing_keys": sorted(missing),
+                        "suggested_fixes": [
+                            f"Add the missing config keys to config/default.yaml: {', '.join(sorted(missing))}."
+                        ],
+                    },
                 )
         except ImportError:
             # PyYAML not available — do a simple text-based check
@@ -138,18 +205,30 @@ class PreflightChecker:
                         check_name="config_yaml",
                         status="failed",
                         message=f"config/default.yaml appears to be missing key: {key} (PyYAML unavailable for full parse)",
+                        details={
+                            "config_path": str(yaml_path),
+                            "missing_keys": [key],
+                            "suggested_fixes": [f"Add '{key}' (or one of its aliases) to config/default.yaml."],
+                        },
                     )
         except Exception as exc:
             return PreflightResult(
                 check_name="config_yaml",
                 status="failed",
                 message=f"config/default.yaml is not valid YAML: {exc}",
+                details={
+                    "config_path": str(yaml_path),
+                    "suggested_fixes": [
+                        "Fix YAML syntax in config/default.yaml so it parses cleanly."
+                    ],
+                },
             )
 
         return PreflightResult(
             check_name="config_yaml",
             status="passed",
             message="config/default.yaml OK",
+            details={"config_path": str(yaml_path)},
         )
 
     # ------------------------------------------------------------------
@@ -158,11 +237,53 @@ class PreflightChecker:
     def check_requirements(self) -> PreflightResult:
         """Check requirements.txt for parse errors and obvious conflicts."""
         req_path = self.code_dir / "requirements.txt"
+        manifests = self._dependency_manifests()
         if not req_path.exists():
+            for manifest in manifests:
+                if manifest.name != "requirements.txt":
+                    details = {"manifest": str(manifest)}
+                    if manifest.name in {"environment.yml", "environment.yaml"}:
+                        pip_dependencies = self._extract_environment_pip_dependencies(manifest)
+                        details["pip_dependencies"] = pip_dependencies
+                        if not pip_dependencies:
+                            return PreflightResult(
+                                check_name="requirements",
+                                status="warning",
+                                message=(
+                                    f"{manifest.name} found but it has no pip-installable dependencies; "
+                                    "local venv execution may still need a conda env"
+                                ),
+                                details={
+                                    **details,
+                                    "suggested_fixes": [
+                                        "Add a pip block to environment.yml/environment.yaml or provide requirements.txt for local execution.",
+                                        "If the project depends on Conda-only packages, run with experiment_conda_env configured.",
+                                    ],
+                                },
+                            )
+                    return PreflightResult(
+                        check_name="requirements",
+                        status="passed",
+                        message=f"Dependency manifest found at {manifest.name}",
+                        details=details,
+                    )
             return PreflightResult(
                 check_name="requirements",
                 status="warning",
-                message="requirements.txt not found",
+                message="No dependency manifest found (requirements.txt, environment.yml, pyproject.toml, setup.py)",
+                details={
+                    "expected_manifests": [
+                        "requirements.txt",
+                        "environment.yml",
+                        "environment.yaml",
+                        "pyproject.toml",
+                        "setup.py",
+                        "setup.cfg",
+                    ],
+                    "suggested_fixes": [
+                        "Add requirements.txt, pyproject.toml, or setup.py so the runtime manager can install dependencies.",
+                    ],
+                },
             )
 
         try:
@@ -172,6 +293,10 @@ class PreflightChecker:
                 check_name="requirements",
                 status="warning",
                 message=f"Cannot read requirements.txt: {exc}",
+                details={
+                    "manifest": str(req_path),
+                    "suggested_fixes": ["Fix file permissions or regenerate requirements.txt."],
+                },
             )
 
         # Collect package base names (lowercased, before any version specifier)
@@ -202,13 +327,20 @@ class PreflightChecker:
                 check_name="requirements",
                 status="warning",
                 message="; ".join(warnings),
-                details={"warnings": warnings},
+                details={
+                    "manifest": str(req_path),
+                    "warnings": warnings,
+                    "suggested_fixes": [
+                        "Remove malformed lines from requirements.txt and avoid mixing conflicting frameworks in one environment."
+                    ],
+                },
             )
 
         return PreflightResult(
             check_name="requirements",
             status="passed",
             message="requirements.txt OK",
+            details={"manifest": str(req_path)},
         )
 
     # ------------------------------------------------------------------
@@ -262,7 +394,14 @@ class PreflightChecker:
                 check_name="data_references",
                 status="warning",
                 message="; ".join(warnings),
-                details={"warnings": warnings},
+                details={
+                    "warnings": warnings,
+                    "hardcoded_paths": hardcoded_paths[:10],
+                    "suggested_fixes": [
+                        "Replace hardcoded absolute data paths with config-driven or relative paths.",
+                        "Add a synthetic or dummy-data fallback for quick-eval mode.",
+                    ],
+                },
             )
 
         return PreflightResult(
@@ -276,25 +415,25 @@ class PreflightChecker:
     # ------------------------------------------------------------------
     def check_main_entrypoint(self) -> PreflightResult:
         """Verify a Python entrypoint exists (main.py, train.py, run.py, etc.)."""
-        main_py = self.code_dir / "main.py"
-        if not main_py.exists():
-            # Accept common alternative entrypoints
-            alt_entrypoints = [
-                self.code_dir / "train.py",
-                self.code_dir / "run.py",
-                self.code_dir / "run_train.py",
-                self.code_dir / "experiment.py",
-            ]
-            for alt in alt_entrypoints:
-                if alt.exists():
-                    main_py = alt
-                    break
-            else:
-                return PreflightResult(
-                    check_name="main_entrypoint",
-                    status="warning",
-                    message="No standard entrypoint found (main.py, train.py, run.py)",
-                )
+        main_py: Path | None = None
+        for candidate in self._entrypoint_candidates():
+            if candidate.exists():
+                main_py = candidate
+                break
+        if main_py is None:
+            searched_paths = [str(path.relative_to(self.code_dir)) for path in self._entrypoint_candidates()]
+            return PreflightResult(
+                check_name="main_entrypoint",
+                status="warning",
+                message="No standard Python entrypoint found (main.py, train.py, run.py, scripts/train.py)",
+                details={
+                    "searched_paths": searched_paths,
+                    "suggested_fixes": [
+                        "Add a runnable entrypoint such as main.py, train.py, or scripts/train.py.",
+                        "Make the entrypoint accept --dry-run and --quick-eval so execution can validate it automatically.",
+                    ],
+                },
+            )
 
         try:
             source = main_py.read_text(encoding="utf-8", errors="replace")
@@ -303,6 +442,10 @@ class PreflightChecker:
                 check_name="main_entrypoint",
                 status="failed",
                 message=f"Cannot read main.py: {exc}",
+                details={
+                    "entrypoint_path": str(main_py),
+                    "suggested_fixes": [f"Fix file permissions or rewrite {main_py.name} so it can be inspected."],
+                },
             )
 
         missing_flags: list[str] = []
@@ -316,13 +459,20 @@ class PreflightChecker:
                 check_name="main_entrypoint",
                 status="warning",
                 message=f"{main_py.name} missing flag handling: {missing_flags}",
-                details={"missing_flags": missing_flags},
+                details={
+                    "entrypoint_path": str(main_py),
+                    "missing_flags": missing_flags,
+                    "suggested_fixes": [
+                        f"Update {main_py.name} to accept {', '.join(missing_flags)} and exit cleanly in those modes."
+                    ],
+                },
             )
 
         return PreflightResult(
             check_name="main_entrypoint",
             status="passed",
-            message="main.py entrypoint OK",
+            message=f"{main_py.name} entrypoint OK",
+            details={"entrypoint_path": str(main_py)},
         )
 
     # ------------------------------------------------------------------
@@ -360,7 +510,12 @@ class PreflightChecker:
                 check_name="import_resolution",
                 status="warning",
                 message=f"{len(warnings)} unresolved import(s)",
-                details={"unresolved": warnings[:10]},
+                details={
+                    "unresolved": warnings[:10],
+                    "suggested_fixes": [
+                        "Create the missing src modules/packages or update import paths to match generated file names."
+                    ],
+                },
             )
 
         return PreflightResult(
@@ -368,3 +523,36 @@ class PreflightChecker:
             status="passed",
             message="All src.* imports resolve",
         )
+
+    @staticmethod
+    def _extract_environment_pip_dependencies(environment_file: Path) -> list[str]:
+        if not environment_file.exists():
+            return []
+        try:
+            lines = environment_file.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+
+        dependencies: list[str] = []
+        in_pip_block = False
+        pip_indent = 0
+        for raw_line in lines:
+            stripped = raw_line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+
+            indent = len(raw_line) - len(raw_line.lstrip())
+            if stripped in {"- pip:", "pip:"}:
+                in_pip_block = True
+                pip_indent = indent
+                continue
+
+            if in_pip_block:
+                if indent <= pip_indent:
+                    in_pip_block = False
+                elif stripped.startswith("- "):
+                    dependency = stripped[2:].strip()
+                    if dependency:
+                        dependencies.append(dependency)
+
+        return dependencies

@@ -39,6 +39,10 @@ class PreflightReport(BaseModel):
     overall_status: str  # "passed" / "failed" / "warnings"
     checks: list[PreflightResult] = Field(default_factory=list)
     blocking_failures: list[str] = Field(default_factory=list)
+    blocking_check_names: list[str] = Field(default_factory=list)
+    warning_messages: list[str] = Field(default_factory=list)
+    warning_check_names: list[str] = Field(default_factory=list)
+    suggested_fixes: list[str] = Field(default_factory=list)
 
 
 class TrainingDynamics(BaseModel):

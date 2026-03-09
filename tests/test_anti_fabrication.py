@@ -111,6 +111,33 @@ class TestParseMetricsJson:
         result = ExperimentAgent._parse_metrics_json(code_dir)
         assert result == {}
 
+
+class TestParseLlmJsonPayload:
+    def test_repairs_invalid_backslash_escapes(self):
+        raw = '```json\n{"old": "\\cite{demo}", "new": "fixed"}\n```'
+        result = ExperimentAgent._parse_llm_json_payload(raw)
+        assert result["old"] == "\\cite{demo}"
+        assert result["new"] == "fixed"
+
+    def test_repairs_truncated_json_array(self):
+        raw = '[{"old": "a", "new": "b"}'
+        result = ExperimentAgent._parse_llm_json_payload(raw)
+        assert isinstance(result, list)
+        assert result[0]["old"] == "a"
+        assert result[0]["new"] == "b"
+
+    def test_ignores_trailing_text_after_valid_json(self):
+        raw = '[{"old": "a", "new": "b"}]\nDone. Applied safely.'
+        result = ExperimentAgent._parse_llm_json_payload(raw)
+        assert isinstance(result, list)
+        assert result[0]["old"] == "a"
+
+    def test_skips_leading_explanation_before_json(self):
+        raw = 'Here is the patch:\n[{"old": "a", "new": "b"}]'
+        result = ExperimentAgent._parse_llm_json_payload(raw)
+        assert isinstance(result, list)
+        assert result[0]["new"] == "b"
+
     def test_malformed_json(self, tmp_path):
         """Malformed JSON returns empty dict."""
         code_dir = tmp_path / "code"
@@ -120,6 +147,25 @@ class TestParseMetricsJson:
 
         result = ExperimentAgent._parse_metrics_json(code_dir)
         assert result == {}
+
+    def test_top_level_training_log_list_is_wrapped(self, tmp_path):
+        """List-only metrics.json should be treated as training_log when entries are dicts."""
+        code_dir = tmp_path / "code"
+        results_dir = code_dir / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "metrics.json").write_text(
+            json.dumps(
+                [
+                    {"epoch": 1, "train_loss": 0.8, "metrics": {"Accuracy": 0.7}},
+                    {"epoch": 2, "train_loss": 0.6, "metrics": {"Accuracy": 0.8}},
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        result = ExperimentAgent._parse_metrics_json(code_dir)
+        assert result["training_log"][0]["epoch"] == 1
+        assert result["main_results"][0]["metrics"][0]["metric_name"] == "Accuracy"
 
     def test_wrong_structure(self, tmp_path):
         """JSON without expected keys returns empty dict."""
@@ -265,6 +311,70 @@ class TestParseMetricsJson:
         # Only epoch 2 survives — epoch 1 has metrics as a list
         assert len(result["training_log"]) == 1
         assert result["training_log"][0]["epoch"] == 2
+
+    def test_flat_metrics_dict_is_normalized_to_contract(self, tmp_path):
+        """Flat summary metrics are wrapped into the standard main_results schema."""
+        code_dir = tmp_path / "code"
+        results_dir = code_dir / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "metrics.json").write_text(
+            json.dumps({"dataset": "MNIST", "accuracy": 0.91, "f1": 0.88}),
+            encoding="utf-8",
+        )
+
+        result = ExperimentAgent._parse_metrics_json(code_dir)
+        assert result["main_results"][0]["dataset"] == "MNIST"
+        metric_names = {metric["metric_name"] for metric in result["main_results"][0]["metrics"]}
+        assert {"accuracy", "f1"} <= metric_names
+
+    def test_nested_results_dict_is_normalized_to_contract(self, tmp_path):
+        """Nested results/summary dicts are normalized into main_results."""
+        code_dir = tmp_path / "code"
+        results_dir = code_dir / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "dataset": "CIFAR-10",
+                    "results": {
+                        "Accuracy": {"mean": 85.4, "std": 0.3},
+                        "F1": 84.1,
+                    },
+                    "training_log": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = ExperimentAgent._parse_metrics_json(code_dir)
+        assert result["main_results"][0]["dataset"] == "CIFAR-10"
+        metrics = {metric["metric_name"]: metric["value"] for metric in result["main_results"][0]["metrics"]}
+        assert metrics["Accuracy"] == 85.4
+        assert metrics["F1"] == 84.1
+
+    def test_training_log_only_derives_main_results(self, tmp_path):
+        """A valid training_log-only payload derives a summary main_results entry."""
+        code_dir = tmp_path / "code"
+        results_dir = code_dir / "results"
+        results_dir.mkdir(parents=True)
+        (results_dir / "metrics.json").write_text(
+            json.dumps(
+                {
+                    "dataset": "DemoSet",
+                    "training_log": [
+                        {"epoch": 1, "metrics": {"Accuracy": 0.75}},
+                        {"epoch": 2, "metrics": {"Accuracy": 0.84, "F1": 0.82}},
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = ExperimentAgent._parse_metrics_json(code_dir)
+        assert result["main_results"][0]["dataset"] == "DemoSet"
+        metrics = {metric["metric_name"]: metric["value"] for metric in result["main_results"][0]["metrics"]}
+        assert metrics["Accuracy"] == 0.84
+        assert metrics["F1"] == 0.82
 
 
 # ===========================================================================

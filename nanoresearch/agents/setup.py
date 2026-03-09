@@ -10,6 +10,7 @@ import asyncio
 import gzip
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 GLOBAL_CACHE_DIR = Path.home() / ".nanobot" / "cache"
 GLOBAL_MODELS_DIR = GLOBAL_CACHE_DIR / "models"
 GLOBAL_DATA_DIR = GLOBAL_CACHE_DIR / "data"
+SUCCESS_RESOURCE_STATUSES = {"downloaded", "full", "config_only"}
 
 
 class SetupAgent(BaseResearchAgent):
@@ -73,7 +75,7 @@ class SetupAgent(BaseResearchAgent):
             self.log("Automatic resource download disabled, skipping dataset/model fetch")
             resources = []
 
-        # Also create workspace-local symlinks for convenience
+        # Stage workspace-local aliases so generated code can run against local resources
         data_dir = self.workspace.path / "data"
         models_dir = self.workspace.path / "models"
         for d in (data_dir, models_dir):
@@ -118,18 +120,142 @@ class SetupAgent(BaseResearchAgent):
                         "error": "Not found by SETUP agent",
                     })
 
+        staged_resources, workspace_aliases = self._stage_workspace_resources(
+            verified_resources,
+            data_dir,
+            models_dir,
+        )
+
         result = {
             "search_plan": search_plan,
             "cloned_repos": cloned_repos,
             "code_analysis": code_analysis,
-            "downloaded_resources": verified_resources,
-            "data_dir": str(GLOBAL_DATA_DIR),
-            "models_dir": str(GLOBAL_MODELS_DIR),
+            "downloaded_resources": staged_resources,
+            "data_dir": str(data_dir),
+            "models_dir": str(models_dir),
+            "cache_data_dir": str(GLOBAL_DATA_DIR),
+            "cache_models_dir": str(GLOBAL_MODELS_DIR),
+            "workspace_resource_aliases": workspace_aliases,
             "resource_download_enabled": self.config.auto_download_resources,
         }
 
         self.workspace.write_json("plans/setup_output.json", result)
         return result
+
+    @staticmethod
+    def _safe_alias_name(value: str, fallback: str) -> str:
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", value.strip()).strip("._")
+        return normalized or fallback
+
+    @staticmethod
+    def _stage_path(source: Path, dest: Path) -> str:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() or dest.is_symlink():
+            return "existing"
+
+        if source.is_dir():
+            try:
+                os.symlink(source, dest, target_is_directory=True)
+                return "symlink"
+            except OSError:
+                shutil.copytree(source, dest)
+                return "copytree"
+
+        try:
+            os.link(source, dest)
+            return "hardlink"
+        except OSError:
+            try:
+                os.symlink(source, dest)
+                return "symlink"
+            except OSError:
+                shutil.copy2(source, dest)
+                return "copy"
+
+    @classmethod
+    def _stage_workspace_resources(
+        cls,
+        resources: list[dict],
+        data_dir: Path,
+        models_dir: Path,
+    ) -> tuple[list[dict], list[dict]]:
+        staged_resources: list[dict] = []
+        workspace_aliases: list[dict] = []
+
+        for resource in resources:
+            staged = dict(resource)
+            status = str(resource.get("status", "")).strip()
+            source_path = str(resource.get("path", "")).strip()
+            resource_type = str(resource.get("type", "dataset")).strip().lower()
+            target_root = models_dir if resource_type == "model" else data_dir
+
+            if status not in SUCCESS_RESOURCE_STATUSES or not source_path:
+                staged_resources.append(staged)
+                continue
+
+            source = Path(source_path)
+            if not source.exists():
+                staged_resources.append(staged)
+                continue
+
+            alias_details: dict[str, Any] = {
+                "name": staged.get("name", ""),
+                "type": resource_type,
+                "cache_path": str(source),
+            }
+
+            if source.is_dir() and staged.get("files"):
+                staged_file_paths: list[str] = []
+                strategies: list[str] = []
+                for file_name in staged.get("files", []):
+                    candidate = source / str(file_name)
+                    if not candidate.exists():
+                        continue
+                    dest = target_root / candidate.name
+                    strategy = cls._stage_path(candidate, dest)
+                    staged_file_paths.append(str(dest))
+                    strategies.append(strategy)
+
+                if staged_file_paths:
+                    staged["cache_path"] = str(source)
+                    staged["path"] = str(target_root)
+                    staged["workspace_path"] = str(target_root)
+                    staged["workspace_files"] = staged_file_paths
+                    staged["staging_strategy"] = (
+                        strategies[0] if len(set(strategies)) == 1 else "mixed"
+                    )
+                    alias_details.update(
+                        {
+                            "workspace_path": str(target_root),
+                            "workspace_files": staged_file_paths,
+                            "staging_strategy": staged["staging_strategy"],
+                        }
+                    )
+                    workspace_aliases.append(alias_details)
+                staged_resources.append(staged)
+                continue
+
+            alias_base = source.name or cls._safe_alias_name(
+                str(staged.get("name", "resource")),
+                "resource",
+            )
+            dest = target_root / alias_base
+            strategy = cls._stage_path(source, dest)
+
+            staged["cache_path"] = str(source)
+            staged["path"] = str(dest)
+            staged["workspace_path"] = str(dest)
+            staged["staging_strategy"] = strategy
+            alias_details.update(
+                {
+                    "workspace_path": str(dest),
+                    "staging_strategy": strategy,
+                }
+            )
+            workspace_aliases.append(alias_details)
+            staged_resources.append(staged)
+
+        return staged_resources, workspace_aliases
 
     @staticmethod
     def _augment_search_plan_with_blueprint_resources(
