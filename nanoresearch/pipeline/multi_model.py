@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from functools import partial
 from typing import Any
 
@@ -17,6 +18,7 @@ import httpx
 from openai import OpenAI
 
 from nanoresearch.config import ResearchConfig, StageModelConfig
+from nanoresearch.pipeline.cost_tracker import LLMResult
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +44,9 @@ class ModelDispatcher:
     def __init__(self, config: ResearchConfig) -> None:
         self._config = config
         self._clients: dict[tuple, OpenAI] = {}
+        # Optional callback for cost tracking: called with (LLMResult,) after
+        # each successful LLM call.  Set by orchestrator to feed CostTracker.
+        self._usage_callback: Any | None = None
 
     def _get_client(
         self,
@@ -82,6 +87,29 @@ class ModelDispatcher:
         msg = str(exc).lower()
         return any(pat in msg for pat in _RETRYABLE_PATTERNS)
 
+    @staticmethod
+    def _extract_usage(response: Any) -> dict[str, int]:
+        """Extract token usage dict from an OpenAI response object."""
+        if hasattr(response, "usage") and response.usage is not None:
+            return {
+                "prompt_tokens": getattr(response.usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(response.usage, "completion_tokens", 0) or 0,
+                "total_tokens": getattr(response.usage, "total_tokens", 0) or 0,
+            }
+        return {}
+
+    def _notify_usage(self, content: str, usage: dict[str, int],
+                      model: str, latency_ms: float) -> None:
+        """Invoke usage callback if registered.  Never raises."""
+        if self._usage_callback is not None:
+            try:
+                self._usage_callback(LLMResult(
+                    content=content, usage=usage,
+                    model=model, latency_ms=round(latency_ms, 1),
+                ))
+            except Exception:
+                pass  # cost tracking must never break the pipeline
+
     async def generate(
         self,
         config: StageModelConfig,
@@ -121,17 +149,21 @@ class ModelDispatcher:
         loop = asyncio.get_running_loop()
         last_exc: Exception | None = None
         for attempt in range(MAX_API_RETRIES + 1):
+            t0 = time.monotonic()
             try:
                 response = await loop.run_in_executor(
                     None,
                     partial(client.chat.completions.create, **kwargs),
                 )
+                latency = (time.monotonic() - t0) * 1000
                 if not response.choices:
                     raise RuntimeError(
                         f"LLM returned empty choices (model={config.model})"
                     )
                 content = response.choices[0].message.content or ""
                 logger.debug("Response length: %d chars", len(content))
+                self._notify_usage(content, self._extract_usage(response),
+                                   config.model, latency)
                 return content
             except Exception as exc:
                 last_exc = exc
@@ -156,6 +188,169 @@ class ModelDispatcher:
         logger.error("LLM call failed (model=%s): %s", config.model, last_exc)
         raise RuntimeError(
             f"LLM call to model {config.model!r} failed after {MAX_API_RETRIES + 1} attempts: {last_exc}"
+        ) from last_exc
+
+    async def generate_with_usage(
+        self,
+        config: StageModelConfig,
+        system_prompt: str,
+        user_prompt: str,
+        json_mode: bool = False,
+    ) -> LLMResult:
+        """Like generate(), but returns an LLMResult with usage metadata.
+
+        Does NOT change the signature of generate() — callers that only need
+        the text can keep using generate() unchanged.
+        """
+        timeout = config.timeout or self._config.timeout
+        client = self._get_client(timeout, config.base_url, config.api_key)
+
+        _m = config.model.lower()
+        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+
+        kwargs: dict[str, Any] = {
+            "model": config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+        if is_thinking:
+            kwargs["max_completion_tokens"] = config.max_tokens
+        else:
+            kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None and not is_thinking:
+            kwargs["temperature"] = config.temperature
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        loop = asyncio.get_running_loop()
+        last_exc: Exception | None = None
+        for attempt in range(MAX_API_RETRIES + 1):
+            t0 = time.monotonic()
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    partial(client.chat.completions.create, **kwargs),
+                )
+                latency = (time.monotonic() - t0) * 1000
+                if not response.choices:
+                    raise RuntimeError(
+                        f"LLM returned empty choices (model={config.model})"
+                    )
+                content = response.choices[0].message.content or ""
+                usage = self._extract_usage(response)
+                result = LLMResult(
+                    content=content, usage=usage,
+                    model=config.model, latency_ms=round(latency, 1),
+                )
+                self._notify_usage(content, usage, config.model, latency)
+                return result
+            except Exception as exc:
+                last_exc = exc
+                if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                if attempt < MAX_API_RETRIES and self._is_retryable(exc):
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    if "connection" in str(exc).lower():
+                        delay = max(delay, 10.0)
+                    logger.warning(
+                        "LLM call failed (model=%s, attempt %d/%d): %s. Retrying in %.1fs...",
+                        config.model, attempt + 1, MAX_API_RETRIES + 1, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    break
+
+        logger.error("LLM call failed (model=%s): %s", config.model, last_exc)
+        raise RuntimeError(
+            f"LLM call to model {config.model!r} failed after {MAX_API_RETRIES + 1} attempts: {last_exc}"
+        ) from last_exc
+
+    async def generate_with_image(
+        self,
+        config: StageModelConfig,
+        system_prompt: str,
+        user_prompt: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        json_mode: bool = False,
+    ) -> str:
+        """Generate a completion with an image attachment (vision).
+
+        Uses the OpenAI multimodal message format with base64-encoded inline
+        image data.  Falls back to text-only if the model rejects image input.
+        """
+        import base64
+        b64 = base64.b64encode(image_bytes).decode("ascii")
+        data_url = f"data:{mime_type};base64,{b64}"
+
+        timeout = config.timeout or self._config.timeout
+        client = self._get_client(timeout, config.base_url, config.api_key)
+
+        _m = config.model.lower()
+        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+
+        kwargs: dict[str, Any] = {
+            "model": config.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text", "text": user_prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ]},
+            ],
+        }
+        if is_thinking:
+            kwargs["max_completion_tokens"] = config.max_tokens
+        else:
+            kwargs["max_tokens"] = config.max_tokens
+        if config.temperature is not None and not is_thinking:
+            kwargs["temperature"] = config.temperature
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        logger.debug("Calling vision model=%s timeout=%ss", config.model, timeout)
+
+        loop = asyncio.get_running_loop()
+        last_exc: Exception | None = None
+        for attempt in range(MAX_API_RETRIES + 1):
+            t0_img = time.monotonic()
+            try:
+                response = await loop.run_in_executor(
+                    None,
+                    partial(client.chat.completions.create, **kwargs),
+                )
+                latency_img = (time.monotonic() - t0_img) * 1000
+                if not response.choices:
+                    raise RuntimeError(
+                        f"LLM returned empty choices (model={config.model})"
+                    )
+                content_img = response.choices[0].message.content or ""
+                self._notify_usage(content_img, self._extract_usage(response),
+                                   config.model, latency_img)
+                return content_img
+            except Exception as exc:
+                last_exc = exc
+                if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
+                    kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                if attempt < MAX_API_RETRIES and self._is_retryable(exc):
+                    delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
+                    if "connection" in str(exc).lower():
+                        delay = max(delay, 10.0)
+                    logger.warning(
+                        "LLM vision call failed (model=%s, attempt %d/%d): %s. Retrying in %.1fs...",
+                        config.model, attempt + 1, MAX_API_RETRIES + 1, exc, delay,
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    break
+
+        logger.error("LLM vision call failed (model=%s): %s", config.model, last_exc)
+        raise RuntimeError(
+            f"LLM vision call to model {config.model!r} failed: {last_exc}"
         ) from last_exc
 
     async def generate_with_tools(
@@ -202,16 +397,24 @@ class ModelDispatcher:
         loop = asyncio.get_running_loop()
         last_exc: Exception | None = None
         for attempt in range(MAX_API_RETRIES + 1):
+            t0_tc = time.monotonic()
             try:
                 response = await loop.run_in_executor(
                     None,
                     partial(client.chat.completions.create, **kwargs),
                 )
+                latency_tc = (time.monotonic() - t0_tc) * 1000
                 if not response.choices:
                     raise RuntimeError(
                         f"LLM returned empty choices (model={config.model})"
                     )
-                return response.choices[0].message
+                msg = response.choices[0].message
+                self._notify_usage(
+                    getattr(msg, "content", None) or "",
+                    self._extract_usage(response),
+                    config.model, latency_tc,
+                )
+                return msg
             except Exception as exc:
                 last_exc = exc
                 if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
@@ -266,6 +469,7 @@ class ModelDispatcher:
         loop = asyncio.get_running_loop()
         last_exc: Exception | None = None
         for attempt in range(3):
+            t0_ig = time.monotonic()
             try:
                 response = await loop.run_in_executor(
                     None,
@@ -278,6 +482,12 @@ class ModelDispatcher:
                         n=1,
                         response_format="b64_json",
                     ),
+                )
+                latency_ig = (time.monotonic() - t0_ig) * 1000
+                # Image gen has no token usage, but we track calls + latency
+                self._notify_usage(
+                    f"[image_gen:{size}:{quality}]", {},
+                    config.model, latency_ig,
                 )
                 if not response.data:
                     logger.warning("OpenAI image API returned no images (model=%s)", config.model)
@@ -341,11 +551,17 @@ class ModelDispatcher:
         last_exc: Exception | None = None
         data: dict = {}
         for attempt in range(3):
+            t0_gm = time.monotonic()
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.post(url, json=payload, headers=headers)
                     response.raise_for_status()
                     data = response.json()
+                latency_gm = (time.monotonic() - t0_gm) * 1000
+                self._notify_usage(
+                    "[gemini_image_gen]", {},
+                    config.model, latency_gm,
+                )
                 break  # success
             except (httpx.TimeoutException, httpx.HTTPError) as exc:
                 last_exc = exc

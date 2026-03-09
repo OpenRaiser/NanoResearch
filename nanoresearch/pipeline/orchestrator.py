@@ -16,6 +16,9 @@ from nanoresearch.agents.figure_gen import FigureAgent
 from nanoresearch.agents.writing import WritingAgent
 from nanoresearch.agents.review import ReviewAgent
 from nanoresearch.config import ResearchConfig
+from nanoresearch.pipeline.blueprint_validator import validate_blueprint
+from nanoresearch.pipeline.cost_tracker import CostTracker
+from nanoresearch.pipeline.progress import ProgressEmitter
 from nanoresearch.pipeline.state import PipelineStateMachine
 from nanoresearch.pipeline.workspace import Workspace
 from nanoresearch.schemas.manifest import PipelineStage
@@ -43,6 +46,8 @@ class PipelineOrchestrator:
         self.workspace = workspace
         self.config = config
         self.progress_callback = progress_callback
+        self.cost_tracker = CostTracker()
+        self.progress_emitter = ProgressEmitter(workspace.path / "progress.json")
         self.state_machine = PipelineStateMachine(workspace.manifest.current_stage)
         self._agents: dict[PipelineStage, BaseResearchAgent] = {
             PipelineStage.IDEATION: IdeationAgent(workspace, config),
@@ -52,6 +57,9 @@ class PipelineOrchestrator:
             PipelineStage.WRITING: WritingAgent(workspace, config),
             PipelineStage.REVIEW: ReviewAgent(workspace, config),
         }
+        # Wire each agent's dispatcher to feed the cost tracker
+        for agent in self._agents.values():
+            agent._dispatcher._usage_callback = self.cost_tracker.record
 
     def _report_progress(self, stage: str, status: str, message: str) -> None:
         """Report progress via callback if registered."""
@@ -128,6 +136,11 @@ class PipelineOrchestrator:
                     stage.value, "started",
                     f"[{stage_idx+1}/{len(stages)}] Running {stage.value}...",
                 )
+                self.progress_emitter.stage_start(
+                    stage.value, len(stages), stage_idx,
+                    f"[{stage_idx+1}/{len(stages)}] Running {stage.value}...",
+                )
+                self.cost_tracker.set_stage(stage.value)
 
                 # Run with retry
                 t0 = time.monotonic()
@@ -139,17 +152,48 @@ class PipelineOrchestrator:
                 # P0: Cross-stage reference validation after each stage
                 self._validate_cross_stage_refs(stage, results)
 
+                # Blueprint semantic validation after PLANNING
+                if stage == PipelineStage.PLANNING:
+                    bp = results.get("experiment_blueprint", {})
+                    issues = validate_blueprint(bp)
+                    if issues:
+                        for issue in issues:
+                            logger.warning("Blueprint issue: %s", issue)
+                        self.progress_emitter.substep(
+                            stage.value,
+                            f"Blueprint validation: {len(issues)} issue(s) found",
+                        )
+
                 self._report_progress(
                     stage.value, "completed",
                     f"[{stage_idx+1}/{len(stages)}] {stage.value} completed",
+                )
+                self.progress_emitter.stage_complete(
+                    stage.value, len(stages), stage_idx,
+                    f"[{stage_idx+1}/{len(stages)}] {stage.value} completed in {duration:.1f}s",
                 )
 
             # Mark pipeline as DONE
             self.state_machine.transition(PipelineStage.DONE)
             self.workspace.update_manifest(current_stage=PipelineStage.DONE)
+
+            # Save cost summary
+            cost_summary = self.cost_tracker.summary()
+            self.workspace.write_json("logs/cost_summary.json", cost_summary)
+            results["cost_summary"] = cost_summary
+            if cost_summary["total_tokens"] > 0:
+                logger.info(
+                    "Cost summary: %d total tokens, %d calls, %.1fs total latency",
+                    cost_summary["total_tokens"],
+                    cost_summary["total_calls"],
+                    cost_summary["total_latency_ms"] / 1000,
+                )
+
+            self.progress_emitter.pipeline_complete(True, "Pipeline completed successfully")
             logger.info("Pipeline completed successfully!")
             return results
         except Exception:
+            self.progress_emitter.pipeline_complete(False, "Pipeline failed")
             raise  # let caller (CLI) handle close()
 
     async def _run_stage_with_retry(

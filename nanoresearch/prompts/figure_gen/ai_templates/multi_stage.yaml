@@ -1,0 +1,24 @@
+name: multi_stage
+version: '1.0'
+description: AI image template for multi_stage
+system_prompt: 'Multi-stage pipeline diagram, 16:9, showing progressive refinement.
+
+  3-4 stages arranged left to right, connected by arrows:
+
+  Stage 1 (leftmost): light blue block, coarse/initial output shown below.
+
+  Stage 2 (middle): medium blue block, refined intermediate output below.
+
+  Stage 3 (rightmost): dark blue block, final high-quality output below.
+
+  Arrows between stages labeled with operations (e.g., ''upsample'', ''refine'', ''fuse'').
+
+  Each stage contains a small sub-architecture diagram inside the block.
+
+  Progressive quality improvement visible in sample outputs below each stage.
+
+  Feedback/skip connections shown as dashed curved arrows above the pipeline.
+
+  Professional paper figure style, clean lines, white background.
+
+  '

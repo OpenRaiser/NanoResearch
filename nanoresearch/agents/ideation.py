@@ -81,6 +81,7 @@ async def _get_oa_search():
     return _oa_search if _oa_search else None
 
 
+from nanoresearch.prompts import load_prompt as _load_prompt
 from nanoresearch.skill_prompts import (
     IDEATION_QUERY_SYSTEM,
     IDEATION_ANALYSIS_SYSTEM,
@@ -90,6 +91,8 @@ from nanoresearch.skill_prompts import (
 
 # Legacy alias — some internal methods still reference this.
 IDEATION_SYSTEM_PROMPT = IDEATION_QUERY_SYSTEM
+
+SEARCH_COVERAGE_SYSTEM_PROMPT = _load_prompt("ideation", "search_coverage")
 
 
 class IdeationAgent(BaseResearchAgent):
@@ -166,6 +169,26 @@ class IdeationAgent(BaseResearchAgent):
 
             # Step 2d: Enrich top papers with full-text PDF reading
             papers = await self._enrich_with_full_text(papers)
+
+            # Step 2d2: Search coverage self-evaluation (max 2 rounds)
+            all_papers_dict = {self._dedup_key(p): p for p in papers}
+            for _eval_round in range(2):
+                coverage = await self._evaluate_search_coverage(topic, papers)
+                score = coverage.get("coverage_score", 10)
+                if score >= 8:
+                    self.log(f"Search coverage: {score}/10 — sufficient")
+                    break
+                missing = coverage.get("missing_directions", [])
+                if not missing:
+                    break
+                self.log(f"Search coverage: {score}/10 — supplementing {len(missing)} directions")
+                new_papers = await self._supplementary_search(missing, all_papers_dict)
+                if new_papers:
+                    papers.extend(new_papers)
+                    for np in new_papers:
+                        all_papers_dict[self._dedup_key(np)] = np
+                    papers = self._rank_and_filter_papers(papers)
+                    self.log(f"Added {len(new_papers)} papers from supplementary search")
 
             # Step 2e: Extract must-cite papers from surveys
             must_cites = await self._extract_must_cites(
@@ -785,6 +808,82 @@ Return JSON: {{"queries": ["query1", "query2", ...]}}"""
                 logger.warning("[%s]   PDF extraction failed: %s", self.stage.value, e)
 
         return papers
+
+    # ------------------------------------------------------------------
+    # Search coverage self-evaluation
+    # ------------------------------------------------------------------
+
+    async def _evaluate_search_coverage(
+        self, topic: str, papers: list[dict],
+    ) -> dict:
+        """Ask LLM to evaluate how well the collected papers cover the topic.
+
+        Returns dict with coverage_score (1-10), missing_directions, suggested_queries,
+        and well_covered lists.
+        """
+        paper_summaries = []
+        for p in papers[:MAX_PAPERS_FOR_ANALYSIS]:
+            title = (p.get("title") or "")[:120]
+            abstract_snippet = (p.get("abstract") or "")[:200]
+            paper_summaries.append(f"- {title}: {abstract_snippet}")
+        papers_text = "\n".join(paper_summaries)
+
+        user_prompt = f"""Topic: {topic}
+
+Collected papers ({len(papers)} total, showing top {min(len(papers), MAX_PAPERS_FOR_ANALYSIS)}):
+{papers_text}
+
+Evaluate the search coverage for this topic. Return JSON:
+{{
+  "coverage_score": <1-10, where 10 is comprehensive>,
+  "missing_directions": ["<specific missing research sub-area>", ...],
+  "suggested_queries": ["<search query to fill each gap>", ...],
+  "well_covered": ["<research direction that is well represented>", ...]
+}}"""
+
+        try:
+            result = await self.generate_json(SEARCH_COVERAGE_SYSTEM_PROMPT, user_prompt)
+            if not isinstance(result, dict):
+                return {"coverage_score": 10}
+            # Clamp score to 1-10
+            score = result.get("coverage_score", 10)
+            if isinstance(score, (int, float)):
+                result["coverage_score"] = max(1, min(10, int(score)))
+            else:
+                result["coverage_score"] = 10
+            return result
+        except Exception as e:
+            logger.warning("[%s] Search coverage evaluation failed: %s", self.stage.value, e)
+            return {"coverage_score": 10}
+
+    async def _supplementary_search(
+        self, missing_directions: list[str], existing_papers_dict: dict[str, dict],
+    ) -> list[dict]:
+        """Run supplementary searches for missing research directions.
+
+        Args:
+            missing_directions: List of missing research sub-areas (max 3 used).
+            existing_papers_dict: Dict of dedup_key -> paper for de-duplication.
+
+        Returns:
+            List of newly found papers (already de-duplicated).
+        """
+        queries = [d.strip() for d in missing_directions[:3] if d and d.strip()]
+        if not queries:
+            return []
+
+        try:
+            raw_papers = await self._search_literature(queries)
+        except Exception as e:
+            logger.warning("[%s] Supplementary search failed: %s", self.stage.value, e)
+            return []
+
+        new_papers = []
+        for p in raw_papers:
+            key = self._dedup_key(p)
+            if key and key not in existing_papers_dict:
+                new_papers.append(p)
+        return new_papers
 
     async def _extract_must_cites(self, survey_papers: list[dict]) -> list[str]:
         """Ask LLM to extract must-cite papers from survey abstracts."""

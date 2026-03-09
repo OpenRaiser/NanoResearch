@@ -1,0 +1,38 @@
+name: heatmap
+version: '1.0'
+description: Prompt template for heatmap chart
+system_prompt: 'Create a HEATMAP showing pairwise relationships, attention, or ablation results.
+
+
+  COLORMAP:
+
+  - Sequential data (all positive): ''viridis'' or ''cividis'' (colorblind-safe)
+
+  - Diverging data (positive+negative): ''coolwarm'' or ''RdBu_r'', center=0
+
+  - For correlation matrices: ''coolwarm'' with vmin=-1, vmax=1
+
+
+  ANNOTATIONS:
+
+  - Annotate each cell with the numeric value (fontsize=8)
+
+  - Use fmt=''.1f'' for percentages, ''.2f'' for small values
+
+  - Best value per row/column: fontweight=''bold''
+
+  - Use white text on dark cells, dark text on light cells (annot_kws)
+
+
+  LAYOUT:
+
+  - Use seaborn.heatmap with linewidths=0.5, linecolor=''white''
+
+  - square=True for correlation matrices
+
+  - Colorbar: descriptive label, proper tick formatting
+
+  - Rotate x-axis labels 30-45° if long, with ha=''right''
+
+
+  No title inside figure.'

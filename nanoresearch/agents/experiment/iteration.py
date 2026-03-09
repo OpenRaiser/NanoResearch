@@ -567,92 +567,18 @@ The output MUST be a complete, runnable file — do NOT omit any functions or cl
 
     @staticmethod
     def _check_import_consistency(code_dir: Path) -> list[dict]:
-        """Scan all generated files for cross-file import mismatches.
+        """Scan all generated files for cross-file import mismatches via AST.
 
-        Borrowed from Deep Pipeline's CodingAgent — checks two patterns:
+        Checks two patterns:
         1. `from X import Y` where Y doesn't exist in X
         2. `import X; X.func()` where func doesn't exist in X
 
         Returns list of mismatch dicts.
         """
-        import re as _re
+        from nanoresearch.agents.import_checker import ImportChecker
 
-        definitions: dict[str, list[str]] = {}  # module -> [defined names]
-        imports: list[dict] = []
-        module_accesses: list[dict] = []
-        local_modules = {f.stem for f in code_dir.rglob("*.py")}
-
-        for py_file in code_dir.rglob("*.py"):
-            if "__pycache__" in str(py_file):
-                continue
-            try:
-                content = py_file.read_text(encoding="utf-8", errors="replace")
-            except OSError:
-                continue
-            module_name = py_file.stem
-
-            # Find class and top-level function definitions
-            defs = [m.group(1) for m in _re.finditer(r"^(?:class|def)\s+(\w+)", content, _re.MULTILINE)]
-            definitions[module_name] = defs
-
-            # Find cross-file imports: from X import Y, Z
-            for m in _re.finditer(r"^from\s+(?:src\.)?(\w+)\s+import\s+(.+)$", content, _re.MULTILINE):
-                src_module = m.group(1)
-                # Strip inline comments before parsing names
-                import_text = m.group(2).split("#")[0]
-                imported_names = [n.strip().split(" as ")[0].strip() for n in import_text.split(",")]
-                imported_names = [n for n in imported_names if n]  # drop empty after comment strip
-                imports.append({"importer": py_file.name, "module": src_module, "names": imported_names})
-
-            # Find `import X` for local modules, then scan for X.attr() calls
-            imported_modules: dict[str, str] = {}
-            for m in _re.finditer(r"^import\s+(?:src\.)?(\w+)(?:\s+as\s+(\w+))?$", content, _re.MULTILINE):
-                real_name = m.group(1)
-                alias = m.group(2) or real_name
-                if real_name in local_modules:
-                    imported_modules[alias] = real_name
-
-            for alias, real_name in imported_modules.items():
-                for m in _re.finditer(rf"\b{_re.escape(alias)}\.(\w+)\s*\(", content):
-                    attr = m.group(1)
-                    if not attr.startswith("_"):
-                        module_accesses.append({
-                            "importer": py_file.name, "module": real_name, "attr": attr,
-                        })
-
-        # Check mismatches
-        mismatches = []
-        for imp in imports:
-            module = imp["module"]
-            if module not in definitions:
-                continue
-            defined = set(definitions[module])
-            for name in imp["names"]:
-                if name and name not in defined:
-                    mismatches.append({
-                        "importer": imp["importer"], "module": module,
-                        "missing_name": name, "available": sorted(defined),
-                    })
-
-        seen_access: set[tuple[str, str, str]] = set()
-        for acc in module_accesses:
-            module = acc["module"]
-            if module not in definitions:
-                continue
-            attr = acc["attr"]
-            key = (acc["importer"], module, attr)
-            if key in seen_access:
-                continue
-            seen_access.add(key)
-            defined = set(definitions[module])
-            if attr not in defined:
-                mismatches.append({
-                    "importer": acc["importer"], "module": module,
-                    "missing_name": attr, "available": sorted(defined),
-                    "usage_pattern": f"import {module}; {module}.{attr}()",
-                })
-
-        return mismatches
+        checker = ImportChecker(code_dir)
+        return checker.check_imports()
 
     async def _fix_import_mismatches(
         self, code_dir: Path, mismatches: list[dict],

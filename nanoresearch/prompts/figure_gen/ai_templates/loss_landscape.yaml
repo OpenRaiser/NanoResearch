@@ -1,0 +1,24 @@
+name: loss_landscape
+version: '1.0'
+description: AI image template for loss_landscape
+system_prompt: '3D loss landscape visualization, 4:3 aspect.
+
+  3D surface plot: X and Y as parameter dimensions, Z as loss value.
+
+  Surface colored by height: dark blue (low/valley) to red (high/peak).
+
+  Optimization trajectories plotted on surface:
+
+  - SGD path: white line, oscillating, slow convergence.
+
+  - Our optimizer: yellow line, smooth, fast convergence to global minimum.
+
+  Start point marked with circle, endpoints with star markers.
+
+  Viewing angle: 30° elevation, 45° azimuth for good 3D perception.
+
+  Mesh grid visible on surface. Color bar on right.
+
+  Clean academic style, labeled axes.
+
+  '

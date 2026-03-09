@@ -181,11 +181,14 @@ class _ReactModeMixin:
 
         container_config = "\n".join(container_lines)
 
-        system_prompt = self._REACT_SYSTEM_PROMPT.format(
-            slurm_config=slurm_config,
-            conda_env_hint=conda_env_hint,
-            container_config=container_config,
-        )
+        # Fill variables in the loaded YAML template via str.replace
+        system_prompt = self._REACT_SYSTEM_TEMPLATE
+        for _key, _val in [
+            ("slurm_config", slurm_config),
+            ("conda_env_hint", conda_env_hint),
+            ("container_config", container_config),
+        ]:
+            system_prompt = system_prompt.replace(f"{{{_key}}}", _val)
 
         # Build user prompt with blueprint
         blueprint_summary = json.dumps(blueprint_data, indent=2, ensure_ascii=False)

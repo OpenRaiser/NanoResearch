@@ -137,6 +137,9 @@ class ReviewAgent(BaseResearchAgent):
         except Exception as exc:
             logger.warning("Citation fact-checking failed: %s", exc)
 
+        # Deduplicate consistency issues before entering revision loop
+        review.consistency_issues = self._dedup_consistency_issues(review.consistency_issues)
+
         # Step 2b: Fix incoherent reviews (low score but no issues)
         for sr in review.section_reviews:
             if sr.score < MIN_SECTION_SCORE and not sr.issues:
@@ -205,6 +208,21 @@ class ReviewAgent(BaseResearchAgent):
                 ends = len(re.findall(r'\\end\{', current_tex))
                 if begins != ends:
                     bp_issues.append(f"Unbalanced environments: {begins} \\begin vs {ends} \\end")
+                # Check for mismatched environment types (e.g. \begin{itemize}...\end{enumerate})
+                env_stack: list[str] = []
+                for env_m in re.finditer(r'\\(begin|end)\{([^}]+)\}', current_tex):
+                    cmd, env_name = env_m.group(1), env_m.group(2)
+                    if cmd == "begin":
+                        env_stack.append(env_name)
+                    elif env_stack and env_stack[-1] == env_name:
+                        env_stack.pop()
+                    elif env_stack:
+                        bp_issues.append(
+                            f"Mismatched environment: \\begin{{{env_stack[-1]}}} "
+                            f"closed by \\end{{{env_name}}}"
+                        )
+                        env_stack.pop()  # consume it to avoid cascading errors
+                        break  # one mismatch is enough to revert
                 if '\\documentclass' not in current_tex:
                     bp_issues.append("Missing \\documentclass")
                 if '\\end{document}' not in current_tex:
@@ -225,6 +243,7 @@ class ReviewAgent(BaseResearchAgent):
             review.consistency_issues.extend(
                 self._check_figure_text_alignment(current_tex)
             )
+            review.consistency_issues = self._dedup_consistency_issues(review.consistency_issues)
             if review.consistency_issues:
                 self.log(f"  {len(review.consistency_issues)} consistency issues remain after revision")
 
@@ -255,8 +274,8 @@ class ReviewAgent(BaseResearchAgent):
                         old_sr.score = new_sr.score
                         old_sr.issues = new_sr.issues
                         old_sr.suggestions = new_sr.suggestions
-                        if hasattr(new_sr, '_strengths'):
-                            old_sr._strengths = new_sr._strengths  # type: ignore[attr-defined]
+                        if new_sr.strengths:
+                            old_sr.strengths = new_sr.strengths
                     break
 
             # Meta-refine: diagnose failed revisions, retry with improved prompt
@@ -295,8 +314,8 @@ class ReviewAgent(BaseResearchAgent):
                             old_sr.score = rescore.score
                             old_sr.issues = rescore.issues
                             old_sr.suggestions = rescore.suggestions
-                            if hasattr(rescore, '_strengths'):
-                                old_sr._strengths = rescore._strengths  # type: ignore[attr-defined]
+                            if rescore.strengths:
+                                old_sr.strengths = rescore.strengths
                             round_revised[old_sr.section] = refined
                             review.revised_sections[old_sr.section] = refined
                             continue
@@ -320,6 +339,7 @@ class ReviewAgent(BaseResearchAgent):
                 review.consistency_issues.extend(
                     self._check_figure_text_alignment(current_tex)
                 )
+                review.consistency_issues = self._dedup_consistency_issues(review.consistency_issues)
             elif round_revised:
                 # All sections accepted (no reverts) — update current_tex
                 current_tex = self._apply_revisions(paper_tex, review.revised_sections)
@@ -1112,10 +1132,9 @@ Return JSON:
             score=max(1, min(10, score)),
             issues=issues,
             suggestions=suggestions,
+            strengths=strengths,
+            score_justification=result.get("score_justification", ""),
         )
-        # Store strengths and justification as extra attributes for revision use
-        sr._strengths = strengths  # type: ignore[attr-defined]
-        sr._score_justification = result.get("score_justification", "")  # type: ignore[attr-defined]
         return sr
 
     async def _review_paper(
@@ -1133,6 +1152,16 @@ Return JSON:
         # so a \section{Method} followed by \subsection{...} would only contain
         # the intro paragraph. We merge subsection content back into the parent.
         main_sections: list[tuple[str, str]] = []
+
+        # Extract abstract for review (it's in \begin{abstract}...\end{abstract},
+        # not in \section{}, so _extract_sections misses it)
+        abs_match = re.search(
+            r'\\begin\{abstract\}(.*?)\\end\{abstract\}',
+            paper_tex, re.DOTALL,
+        )
+        if abs_match:
+            main_sections.append(("Abstract", abs_match.group(1).strip()))
+
         for h, _c, level in sections:
             if level == 0:
                 merged = self._get_full_section_content(sections, h)
@@ -1208,7 +1237,7 @@ Return JSON:
         suggestions_json = json.dumps(section_review.suggestions[:10], indent=2)
 
         # Extract strengths if available (set by _review_single_section)
-        strengths = getattr(section_review, '_strengths', [])
+        strengths = section_review.strengths
         strengths_block = ""
         if strengths:
             strengths_json = json.dumps(strengths, indent=2)
@@ -1332,7 +1361,12 @@ If the section contains \\subsection{{}} commands, include them in your output."
         3. Retries revision with the augmented prompt
         """
         section_name = old_review.section
-        old_strengths = getattr(old_review, '_strengths', [])
+        old_strengths = old_review.strengths
+
+        # Guard: if failed_revision is empty, nothing to diagnose
+        if not failed_revision or not failed_revision.strip():
+            logger.warning("Meta-refine: empty failed revision for '%s', skipping", section_name)
+            return None
 
         # Step 1: Diagnose with review-stage LLM (cheap + fast)
         diagnosis_prompt = f"""A revision of the "{section_name}" section made the paper WORSE.
@@ -1397,8 +1431,9 @@ Return JSON:
                 f"Extra constraints:\n{constraints_block}"
             ],
         )
-        # Carry over strengths
-        augmented_review._strengths = old_strengths  # type: ignore[attr-defined]
+        # Carry over strengths and justification
+        augmented_review.strengths = old_strengths
+        augmented_review.score_justification = old_review.score_justification
 
         self.log(f"  '{section_name}' retrying revision with {len(extra_constraints)} extra constraints")
         try:
@@ -1718,6 +1753,20 @@ Return JSON:
             logger.debug("checkers module not available, skipping automated checks")
 
         return issues
+
+    @staticmethod
+    def _dedup_consistency_issues(
+        issues: list[ConsistencyIssue],
+    ) -> list[ConsistencyIssue]:
+        """Remove duplicate consistency issues by (issue_type, description) key."""
+        seen: set[tuple[str, str]] = set()
+        deduped: list[ConsistencyIssue] = []
+        for issue in issues:
+            key = (issue.issue_type, issue.description)
+            if key not in seen:
+                seen.add(key)
+                deduped.append(issue)
+        return deduped
 
     async def _resolve_missing_citations(
         self, latex: str, bib_path: Path
@@ -2089,6 +2138,24 @@ Return JSON:
             else:
                 body_start = 0
 
+            # Special case: Abstract lives in \begin{abstract}...\end{abstract}
+            if heading == "Abstract":
+                abs_pat = re.compile(
+                    r'(\\begin\{abstract\})(.*?)(\\end\{abstract\})',
+                    re.DOTALL,
+                )
+                abs_m = abs_pat.search(result)
+                if abs_m:
+                    result = (
+                        result[:abs_m.start(2)]
+                        + "\n" + new_content.strip() + "\n"
+                        + result[abs_m.end(2):]
+                    )
+                    logger.info("Applied abstract revision")
+                else:
+                    logger.warning("Cannot find abstract in paper — revision discarded")
+                continue
+
             # Determine the level of the section being revised
             # by finding its command in the document
             esc_heading = re.escape(heading)
@@ -2147,15 +2214,24 @@ Return JSON:
                 label_match = re.search(r'\\label\{([^}]+)\}', fig_block)
                 if label_match:
                     label = label_match.group(1)
-                    if label not in new_content:
+                    # Exact label match (not substring) to avoid fig:method matching fig:method_base
+                    if not re.search(r'\\label\{' + re.escape(label) + r'\}', new_content):
                         preserved.append(fig_block)
-                elif 'includegraphics' in fig_block and 'includegraphics' not in new_content:
-                    preserved.append(fig_block)
+                else:
+                    # No label — check if specific includegraphics file is already present
+                    file_m = re.search(r'\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}', fig_block)
+                    if file_m:
+                        fname = re.escape(file_m.group(1))
+                        if not re.search(r'\\includegraphics(?:\[[^\]]*\])?\{' + fname + r'\}', new_content):
+                            preserved.append(fig_block)
+                    elif 'includegraphics' not in new_content:
+                        preserved.append(fig_block)
             for tbl_block in old_tables:
                 label_match = re.search(r'\\label\{([^}]+)\}', tbl_block)
                 if label_match:
                     label = label_match.group(1)
-                    if label not in new_content:
+                    # Exact label match (not substring)
+                    if not re.search(r'\\label\{' + re.escape(label) + r'\}', new_content):
                         preserved.append(tbl_block)
                 elif 'caption' in tbl_block and '\\begin{tabular}' not in new_content:
                     preserved.append(tbl_block)

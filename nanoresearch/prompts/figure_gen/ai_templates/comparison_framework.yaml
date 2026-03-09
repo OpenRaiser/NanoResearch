@@ -1,0 +1,4 @@
+name: comparison_framework
+version: '1.0'
+description: AI image template for comparison_framework
+system_prompt: "Side-by-side comparison diagram, 16:9, two rows with clear visual contrast.\nTop row labeled '(a) Previous Method':\n  Simple, basic pipeline: Input → [Single Module (gray)] → Output.\n  Limited connections, simple architecture. Faded/muted colors.\nBottom row labeled '(b) Our Method (Proposed)':\n  Richer pipeline: Input → [Multi-component Module (blue)] → [Novel Module (orange)] → Output.\n  Skip connections (dashed), attention highlighted, more sophisticated.\nRed dashed box highlighting the novel component with annotation 'Our contribution'.\nSmall red star or badge on the novel module.\nBoth rows aligned vertically for easy comparison.\nClean academic style, consistent arrow styles, white background.\n"

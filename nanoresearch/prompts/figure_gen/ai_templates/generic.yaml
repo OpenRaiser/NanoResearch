@@ -1,0 +1,18 @@
+name: generic
+version: '1.0'
+description: AI image template for generic
+system_prompt: 'A clean, professional scientific diagram for an AI research paper.
+
+  Use a structured layout with clear visual hierarchy.
+
+  Rounded rectangles for modules, arrows for connections.
+
+  Color scheme: steel blue, coral, amber, muted green (max 4 colors).
+
+  All labels in sans-serif font, horizontal orientation.
+
+  White background, no decorative elements.
+
+  Publication-ready quality for a top-tier venue.
+
+  '

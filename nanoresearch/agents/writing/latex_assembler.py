@@ -690,7 +690,9 @@ class _LaTeXAssemblerMixin:
             block = (
                 "\\begin{figure}[t!]\n"
                 "\\centering\n"
-                f"\\includegraphics[width=\\textwidth]{{{include_name}}}\n"
+                f"\\includegraphics[width=0.85\\textwidth, "
+                f"height=0.32\\textheight, keepaspectratio]"
+                f"{{{include_name}}}\n"
                 f"\\caption{{{caption}}}\n"
                 f"\\label{{fig:{label_suffix}}}\n"
                 "\\end{figure}"
@@ -715,7 +717,53 @@ class _LaTeXAssemblerMixin:
         else:
             self.log("  VALIDATION: all figures present in LaTeX ✓")
 
+        # Global pass: ensure ALL \includegraphics have a height cap.
+        # LLM-written sections may include \includegraphics with only width=...
+        # which can cause tall images to fill an entire page.
+        latex_content = self._enforce_figure_height_cap(latex_content)
+
         return latex_content
+
+    @staticmethod
+    def _enforce_figure_height_cap(latex: str) -> str:
+        r"""Ensure every \includegraphics has a height cap.
+
+        Handles two cases:
+        1. \includegraphics[width=...]{file} — add height if missing
+        2. \includegraphics{file} — add full [width+height] options
+        """
+        import re
+
+        _HEIGHT_OPTS = "height=0.32\\textheight, keepaspectratio"
+
+        # Case 1: has [options] but no height= → append height
+        def _add_height(m: re.Match) -> str:
+            opts = m.group(1)
+            if "height=" in opts:
+                return m.group(0)
+            new_opts = opts + ", " + _HEIGHT_OPTS
+            return f"\\includegraphics[{new_opts}]" + m.group(2)
+
+        latex = re.sub(
+            r'\\includegraphics\[([^\]]+)\](\{[^}]+\})',
+            _add_height,
+            latex,
+        )
+
+        # Case 2: no [options] at all → add default options
+        def _add_full_opts(m: re.Match) -> str:
+            filename = m.group(1)
+            return (f"\\includegraphics"
+                    f"[width=0.85\\textwidth, {_HEIGHT_OPTS}]"
+                    f"{{{filename}}}")
+
+        latex = re.sub(
+            r'\\includegraphics\{([^}]+)\}',
+            _add_full_opts,
+            latex,
+        )
+
+        return latex
 
     def _copy_style_files(self, template_format: str) -> None:
         """Copy .sty/.cls/.bst files bundled with *template_format* to drafts/."""

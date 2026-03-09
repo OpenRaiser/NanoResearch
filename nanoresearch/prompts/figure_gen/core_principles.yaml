@@ -1,0 +1,4 @@
+name: core_principles
+version: '1.0'
+description: Core principles for figure prompts
+system_prompt: "\nCORE PRINCIPLES for prompt construction:\n1. BE EXTREMELY SPECIFIC: Don't say \"draw a network\" — say \"6-layer Transformer encoder,\n   each layer containing Multi-Head Attention and Feed-Forward sub-layers\"\n2. SPECIFY ASPECT RATIO: Architecture diagrams 16:9, comparison grids 4:3, embeddings 1:1\n3. DEFINE COLORS by hex: encoder=#4682B4 (steel blue), decoder=#E07B54 (coral),\n   attention=#2E8B57 (teal), highlight=#C0392B (muted red)\n4. LABEL EVERYTHING: every box, every arrow, every axis — specify exact text\n5. STATE STYLE: \"clean academic style, white background, sans-serif font, no decorative elements, 300 DPI\"\n6. DESCRIBE IN LAYERS: overall layout first → module details → annotations and labels\n7. SPECIFY EXCLUSIONS: \"no 3D effects, no shadows, no gradients on boxes, no watermarks, no emojis\"\n"

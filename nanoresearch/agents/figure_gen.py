@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
+from nanoresearch.prompts import load_prompt
 from nanoresearch.schemas.manifest import PipelineStage
 
 logger = logging.getLogger(__name__)
@@ -32,716 +33,70 @@ MAX_IMAGE_RETRIES = 2  # retries before LLM diagnosis
 MAX_OPTIMIZED_PROMPT_LEN = 1500  # shorter prompt for retry after diagnosis
 MAX_CODE_CHART_RETRIES = 3  # retries for code chart generation (with error feedback)
 
-# ---------------------------------------------------------------------------
-# Prompts
-# ---------------------------------------------------------------------------
+# Maximum allowed figure dimensions (pixels at 300 DPI).
+# A4 width = 8.27in → at 300 DPI = 2481px.  Max height = 1.5x width.
+MAX_FIG_WIDTH_PX = 2600
+MAX_FIG_HEIGHT_PX = 3000
+MAX_FIG_ASPECT_RATIO = 1.8  # height / width — reject if taller than this
 
-FIGURE_PLAN_SYSTEM = """You are a scientific paper figure planner for top-tier venues \
-(NeurIPS, ICML, ACL, CVPR, ICLR).
-
-=== STEP 1: IDENTIFY THE RESEARCH DOMAIN ===
-
-First, determine the paper's domain from the context:
-- "nlp": NLP, language models, text generation, machine translation, etc.
-- "cv": Computer vision, image classification, detection, segmentation, generation, etc.
-- "llm": Large language models, pretraining, scaling, alignment, RLHF, etc.
-- "multimodal": Vision-language, image captioning, VQA, text-to-image, etc.
-- "general_ml": General ML methods, optimization, reinforcement learning, etc.
-
-=== STEP 2: SELECT FIGURES FOLLOWING TOP-VENUE CONVENTIONS ===
-
-Each domain has an established figure convention at top venues. Follow these templates:
-
---- NLP (ACL / EMNLP / NAACL) — typically 4 figures ---
-  Fig 1: Architecture diagram (ai_image → system_overview or encoder_decoder)
-  Fig 2: Main results bar chart (code_chart → grouped_bar)
-  Fig 3: Ablation study (code_chart → horizontal_bar)
-  Fig 4: Analysis — pick ONE of:
-         • Attention heatmap (ai_image → attention_map) if using attention
-         • Embedding visualization (code_chart → embedding_scatter) if representation learning
-         • Case study / qualitative examples (ai_image → qualitative_comparison) if generation
-
---- CV (CVPR / ICCV / ECCV) — typically 4-5 figures ---
-  Fig 1: Architecture diagram (ai_image → system_overview or multi_stage)
-  Fig 2: Qualitative comparison grid (ai_image → qualitative_comparison)
-  Fig 3: Quantitative results (code_chart → grouped_bar)
-  Fig 4: Ablation study (code_chart → horizontal_bar)
-  Fig 5 (optional): Analysis — pick ONE of:
-         • Attention / feature visualization (ai_image → attention_map)
-         • t-SNE embedding (code_chart → embedding_scatter)
-         • Efficiency-accuracy scatter (code_chart → scatter)
-
---- LLM (NeurIPS / ICML / ICLR) — typically 4 figures ---
-  Fig 1: Architecture or framework diagram (ai_image → system_overview or comparison_framework)
-  Fig 2: Scaling law or training curves (code_chart → scaling_law or line_plot)
-  Fig 3: Main results comparison (code_chart → grouped_bar or radar)
-  Fig 4: Analysis — pick ONE of:
-         • Ablation study (code_chart → horizontal_bar)
-         • Hyperparameter sensitivity heatmap (code_chart → heatmap)
-         • Efficiency tradeoff (code_chart → scatter)
-
---- Multimodal (CVPR / NeurIPS / ACL) — typically 4-5 figures ---
-  Fig 1: Framework overview (ai_image → system_overview or multi_stage)
-  Fig 2: Qualitative examples grid (ai_image → qualitative_comparison)
-  Fig 3: Quantitative comparison (code_chart → grouped_bar)
-  Fig 4: Ablation (code_chart → horizontal_bar)
-  Fig 5 (optional): Attention visualization or cross-modal analysis (ai_image → attention_map)
-
---- General ML (NeurIPS / ICML / ICLR) — typically 4 figures ---
-  Fig 1: Method overview (ai_image → system_overview or comparison_framework)
-  Fig 2: Main results (code_chart → grouped_bar or line_plot)
-  Fig 3: Ablation / sensitivity analysis (code_chart → horizontal_bar or heatmap)
-  Fig 4: Analysis — pick ONE of:
-         • Convergence curves (code_chart → line_plot)
-         • Loss landscape (ai_image → loss_landscape)
-         • Distribution comparison (code_chart → box_plot or violin)
-
-=== CRITICAL RULES ===
-
-1. FIGURE COUNT: exactly 4 figures (5 only for CV/multimodal papers with visual results).
-   Do NOT generate 6+ figures — that looks amateurish, not like a top venue paper.
-2. NEVER repeat the same chart_type. Every figure must use a DIFFERENT visualization.
-3. Fig 1 MUST be an architecture/framework diagram (fig_type: "ai_image").
-4. At least one figure must show main quantitative results comparison.
-5. Each figure must provide UNIQUE INSIGHT — no redundant data in different formats.
-6. Select ai_image_type carefully: use transformer_arch for Transformer-based models,
-   encoder_decoder for seq2seq, multi_stage for progressive refinement, etc.
-
-=== CAPTION CONVENTIONS (top-venue standard) ===
-- Captions must be STANDALONE — understandable without reading the main text
-- Use a declarative title that summarizes the finding, not just describes the content
-  Good: "Our method consistently outperforms baselines across all three benchmarks."
-  Bad: "Results on benchmarks."
-- Lowercase except first word and proper nouns
-- For multi-panel figures: describe each panel with (a), (b), (c) labels
-- Do NOT put a title inside the figure graphic; the caption IS the title
-
-=== OUTPUT FORMAT ===
-
-Return JSON:
-{
-  "domain": "nlp",
-  "figures": [
-    {
-      "fig_key": "fig1_architecture",
-      "fig_type": "ai_image",
-      "ai_image_type": "system_overview",
-      "chart_type": null,
-      "title": "Overview of the proposed method",
-      "description": "Block diagram showing ...",
-      "caption": "Architecture of [METHOD], showing ..."
-    },
-    ...
-  ]
-}
-
-=== VALID VALUES ===
-
-fig_type: "ai_image" — ai_image_type: "system_overview", "transformer_arch",
-  "encoder_decoder", "multi_stage", "comparison_framework", "attention_map",
-  "embedding_viz", "qualitative_comparison", "data_pipeline", "loss_landscape", "generic"
-
-fig_type: "code_chart" — chart_type: "grouped_bar", "line_plot", "heatmap", "radar",
-  "scatter", "box_plot", "stacked_bar", "violin", "horizontal_bar", "scaling_law",
-  "confusion_matrix", "embedding_scatter"
-"""
-
-FIGURE_PROMPT_SYSTEM = """You are a world-class scientific illustration prompt engineer \
-specializing in figures for top-tier venues (NeurIPS, ICML, CVPR, Nature, Science).
-
-Given a research context and figure description, write a DETAILED image generation prompt
-that will produce a professional, publication-quality scientific figure.
-
-=== MANDATORY STYLE REQUIREMENTS ===
-
-LAYOUT & COMPOSITION:
-- Use a clean, well-organized layout with clear visual hierarchy
-- Main data flow goes left-to-right or top-to-bottom
-- Group related components in labeled dashed-border regions
-- Leave adequate whitespace between components (not cramped)
-- Use consistent sizing for similar elements
-
-VISUAL ELEMENTS:
-- Rounded rectangles for processing modules/blocks (with subtle shadows or gradients)
-- Sharp rectangles for data/tensors
-- Circles/ellipses for operations (⊕, ⊗, softmax, etc.)
-- Arrows: clean, properly routed (no crossing when avoidable), with arrowheads
-- Use curved/rounded connectors for complex routing (not zigzag)
-
-COLOR SCHEME (academic standard):
-- Primary modules: steel blue (#4682B4) or teal (#2E8B57)
-- Secondary modules: coral (#E07B54) or amber (#E5A84B)
-- Accent/highlight: muted red (#C0392B) for key innovations
-- Backgrounds of grouped regions: very light pastel fills (alpha ~0.08)
-- Data tensors: light gray (#F0F0F0) with dark border
-- Use at most 4 distinct hue families for clarity
-- Avoid neon, bright saturated, or clashing colors
-
-TYPOGRAPHY:
-- All labels must use a clean sans-serif font (Arial/Helvetica style)
-- Module names: 10-12pt, bold
-- Dimension annotations: 8-9pt, italic, gray
-- Operation symbols: math notation style
-- All text must be horizontal (never rotated/diagonal)
-
-ANNOTATIONS & DETAILS:
-- Show tensor dimensions where relevant (e.g., "B×L×D", "N×C×H×W")
-- Label key operations explicitly (e.g., "Multi-Head Attention", "Layer Norm")
-- Mark the novel/proposed components with a subtle colored highlight or border
-- Include a small legend if using color coding for different module types
-- Add "..." or ellipsis to indicate repeated blocks
-
-BACKGROUND:
-- Pure white (#FFFFFF) background
-- No decorative elements, watermarks, or unnecessary borders
-
-=== OUTPUT FORMAT ===
-Output ONLY the image generation prompt text. No markdown, no explanation.
-Aim for 1500-3000 characters of detailed, specific instructions.
-Be explicit about spatial layout, colors, shapes, and labels."""
-
-CHART_CODE_SYSTEM = """You are an expert data visualization programmer producing figures \
-for top-tier venues (NeurIPS, ICML, CVPR, Nature, Science).
-Generate a COMPLETE, self-contained Python script that creates a publication-quality chart.
-
-MANDATORY SETUP (include at the top of every script):
-```
-import matplotlib as mpl
-mpl.use('Agg')
+# Preamble injected before EVERY LLM-generated figure script.
+# This ensures matplotlib is properly configured regardless of what the LLM writes.
+_FIGURE_CODE_PREAMBLE = """\
+import matplotlib as _mpl
+_mpl.use('Agg')
 import matplotlib.pyplot as plt
-import matplotlib.ticker as mticker
-import seaborn as sns
-import numpy as np
-from matplotlib.patches import FancyBboxPatch
-import matplotlib.patheffects as pe
 
-# Okabe-Ito colorblind-safe palette (Nature Methods standard)
-COLORS = ['#0072B2', '#E69F00', '#009E73', '#D55E00', '#56B4E9', '#CC79A7', '#F0E442', '#000000']
-
-# Publication rcParams — matches Nature/Science figure guidelines
-mpl.rcParams.update({
-    'font.family': 'sans-serif',
-    'font.sans-serif': ['Arial', 'Helvetica', 'DejaVu Sans'],
-    'font.size': 10,
-    'axes.labelsize': 11,
-    'axes.titlesize': 11,
-    'legend.fontsize': 9,
-    'xtick.labelsize': 9,
-    'ytick.labelsize': 9,
-    'axes.linewidth': 0.8,
-    'lines.linewidth': 1.5,
-    'lines.markersize': 5,
-    'xtick.direction': 'in',
-    'ytick.direction': 'in',
-    'xtick.major.size': 4,
-    'xtick.major.width': 0.8,
-    'ytick.major.size': 4,
-    'ytick.major.width': 0.8,
-    'xtick.minor.visible': True,
-    'ytick.minor.visible': True,
-    'xtick.minor.size': 2,
-    'ytick.minor.size': 2,
-    'legend.frameon': False,
-    'legend.handlelength': 1.5,
-    'legend.columnspacing': 1.0,
-    'axes.prop_cycle': plt.cycler(color=COLORS),
+# === Enforced rcParams (injected by NanoResearch) ===
+_mpl.rcParams.update({
+    'figure.autolayout': True,
     'savefig.dpi': 300,
     'savefig.bbox': 'tight',
     'savefig.pad_inches': 0.05,
-    'pdf.fonttype': 42,
-    'ps.fonttype': 42,
-    'axes.grid': False,
+    'figure.figsize': (7, 4.3),     # sane default: ~golden ratio
+    'figure.max_open_warning': 5,
+    'font.size': 10,
+    'axes.titlesize': 11,
+    'axes.labelsize': 11,
+    'legend.fontsize': 9,
+    'xtick.labelsize': 9,
+    'ytick.labelsize': 9,
     'axes.spines.top': False,
     'axes.spines.right': False,
-    'figure.autolayout': True,
+    'legend.frameon': False,
+    'pdf.fonttype': 42,
 })
-
-# Soft black for text (avoid pure black)
-TEXT_COLOR = '#2D2D2D'
-GRID_COLOR = '#E0E0E0'
-mpl.rcParams['text.color'] = TEXT_COLOR
-mpl.rcParams['axes.labelcolor'] = TEXT_COLOR
-mpl.rcParams['xtick.color'] = TEXT_COLOR
-mpl.rcParams['ytick.color'] = TEXT_COLOR
-```
-
-=== FIGURE DESIGN PRINCIPLES (CRITICAL) ===
-
-LAYOUT:
-- Figure size: single-column = (3.5, 2.8), double-column = (7.0, 4.0).
-  Use golden ratio height: width * 0.618.
-- Remove top and right spines (already set in rcParams).
-- Do NOT put a title inside the figure — the LaTeX caption serves as the title.
-- For multi-panel figures: use plt.subplot_mosaic() or gridspec, label panels
-  as (a), (b), (c) in the upper-left corner using ax.text(-0.12, 1.08, '(a)',
-  transform=ax.transAxes, fontweight='bold', fontsize=12).
-
-AXES & GRIDS:
-- Label ALL axes with descriptive names and units (e.g., "Accuracy (%)", "Training epochs").
-- Use subtle horizontal grid lines (color=GRID_COLOR, linewidth=0.5, alpha=0.7, zorder=0)
-  for bar charts and line plots to aid reading — but NOT for heatmaps or radar.
-- Y-axis: start from a value that shows meaningful differences, not always zero.
-  Use ax.set_ylim(bottom_val - margin, top_val + margin) for zoomed view.
-- X-axis tick labels: rotate 0° if they fit; rotate 30° with ha='right' if they don't.
-- Use mticker.MaxNLocator or mticker.MultipleLocator for clean tick spacing.
-
-LEGEND:
-- No frame (already set). Use ncol=N for horizontal layout when possible.
-- Place in upper-left/upper-right corner of the plot, NOT overlapping data.
-- If too many entries, place below the figure using fig.legend() with
-  bbox_to_anchor=(0.5, -0.02), loc='upper center'.
-- CRITICAL for multi-panel figures with shared legend at bottom:
-  * Use ncol=2 maximum when labels are long (>15 chars).
-  * Call plt.subplots_adjust(bottom=0.18) to reserve space for the legend.
-  * Ensure legend text does not overlap with x-axis labels of bottom subplots.
-  * Use fontsize=8 for legends with 4+ entries.
-
-COLOR:
-- Proposed method MUST always use COLORS[0] (#0072B2, steel blue).
-- Baselines: COLORS[1] (#E69F00, amber), COLORS[2] (#009E73, teal), etc.
-- Keep the same color assignment across ALL figures in the paper.
-- For sequential/continuous data: 'viridis' or 'cividis' colormaps.
-- For diverging data: 'coolwarm' or 'RdBu_r'.
-- Add hatching patterns (/ , \\\\ , x , o) alongside colors for grayscale accessibility.
-
-DATA ANNOTATION:
-- Bar charts: add numeric value labels above each bar using ax.bar_label() or
-  ax.text(). Use fontsize=8, fontweight='bold' for best values.
-- Best values per group: bold font + slight font size increase.
-- Use "mean ± std" notation: e.g., "85.4±0.3" (no spaces around ±).
-- Numeric precision: 1 decimal for percentages, 2 for small values (<1).
-- Significance markers: use * (p<0.05), ** (p<0.01), *** (p<0.001) with
-  horizontal brackets where applicable.
-
-ADVANCED STYLING:
-- Error bars: use capsize=3, elinewidth=0.8. Do NOT use 'capthick' (removed in recent matplotlib).
-- Bar chart edge: edgecolor='white', linewidth=0.5 for clean separation.
-- Scatter: edgecolor='white', linewidth=0.3, alpha=0.8 for depth effect.
-- Line plots: use distinct markers (o, s, D, ^, v) AND line styles (-, --, :, -.)
-  so lines are distinguishable in grayscale.
-
-LAYOUT (MANDATORY):
-- ALWAYS call fig.tight_layout() (or plt.subplots_adjust()) before saving.
-- Figure size: use fig, ax = plt.subplots(figsize=(7, 4.5)) for single charts.
-  For multi-panel figures, increase height proportionally.
-- Prevent text overlap: rotate long x-tick labels (rotation=30, ha='right'),
-  abbreviate method names if >12 chars, use adjustText if installed.
-- Reserve space for legend: if legend outside axes, call fig.tight_layout(rect=[0,0,1,0.92]).
-- NEVER use deprecated matplotlib kwargs: 'capthick' does NOT exist. Only use capsize and elinewidth.
-
-SAVE:
-- Save as PNG at 300 DPI to the EXACT output_path specified.
-- The script must be fully self-contained (define data inline, no external files).
-- plt.close(fig) after saving to free memory.
-
-Output ONLY the Python code, no markdown fences, no explanation."""
-
-# Per-chart-type prompts: detailed academic-quality instructions for each chart type
-CHART_TYPE_PROMPTS = {
-    "grouped_bar": (
-        "Create a GROUPED BAR CHART comparing methods across metrics/datasets.\n\n"
-        "LAYOUT:\n"
-        "- Group bars by dataset or metric on x-axis, with each method as a separate bar\n"
-        "- Bar width ~0.12-0.15 per method; gap between groups ~0.3\n"
-        "- Use edgecolor='white', linewidth=0.5 for clean bar separation\n\n"
-        "DATA ANNOTATION:\n"
-        "- Add numeric value labels on top of each bar (fontsize=7-8)\n"
-        "- Best value in each group: fontweight='bold', slightly larger font\n"
-        "- If std available, add error bars (capsize=3, elinewidth=0.8). Do NOT use capthick.\n"
-        "- Use '±' notation in value labels when std is shown\n\n"
-        "AXES:\n"
-        "- Y-axis: start from a value ~3-5% below the minimum to magnify differences\n"
-        "- Add subtle horizontal grid lines (GRID_COLOR, lw=0.5, alpha=0.6, zorder=0)\n"
-        "- Y-axis label: metric name with units, e.g., 'Accuracy (%)'\n"
-        "- Remove top+right spines\n\n"
-        "LEGEND:\n"
-        "- No frame, placed at upper-left or outside above the plot\n"
-        "- If >5 methods, use ncol=N for horizontal layout\n"
-        "- Proposed method entry first in legend\n\n"
-        "HATCHING (for grayscale accessibility):\n"
-        "- Proposed method: solid fill (no hatch)\n"
-        "- Baselines: add different hatch patterns ('/', '\\\\', 'x', '.') at alpha=0.3\n\n"
-        "No title inside figure — caption handles it."
-    ),
-    "line_plot": (
-        "Create a LINE PLOT showing trends (convergence, scaling, ablation sweep).\n\n"
-        "LINES:\n"
-        "- Each method: unique color (Okabe-Ito) + line style (-, --, :, -.) + marker (o, s, D, ^, v)\n"
-        "- This ensures lines are distinguishable even in grayscale\n"
-        "- Proposed method: solid line, thicker (lw=2.0), circle markers\n"
-        "- Baselines: thinner lines (lw=1.2), distinct dash patterns\n\n"
-        "CONFIDENCE/VARIANCE:\n"
-        "- Add shaded regions using plt.fill_between(alpha=0.15) for ±1 std\n"
-        "- Or use error bars at each data point if only a few points\n\n"
-        "AXES:\n"
-        "- Use log scale (ax.set_xscale/yscale('log')) if range spans >2 orders of magnitude\n"
-        "- Add subtle grid lines (GRID_COLOR, lw=0.5, alpha=0.5)\n"
-        "- Label axes with descriptive names and units\n"
-        "- Mark key transition points or convergence with a vertical dashed line + annotation\n\n"
-        "ANNOTATIONS:\n"
-        "- If showing convergence: annotate final values at the right edge\n"
-        "- Use ax.annotate with arrowprops for pointing out key phenomena\n\n"
-        "LEGEND: no frame, upper-right or lower-right (wherever data is least dense).\n"
-        "No title inside figure."
-    ),
-    "heatmap": (
-        "Create a HEATMAP showing pairwise relationships, attention, or ablation results.\n\n"
-        "COLORMAP:\n"
-        "- Sequential data (all positive): 'viridis' or 'cividis' (colorblind-safe)\n"
-        "- Diverging data (positive+negative): 'coolwarm' or 'RdBu_r', center=0\n"
-        "- For correlation matrices: 'coolwarm' with vmin=-1, vmax=1\n\n"
-        "ANNOTATIONS:\n"
-        "- Annotate each cell with the numeric value (fontsize=8)\n"
-        "- Use fmt='.1f' for percentages, '.2f' for small values\n"
-        "- Best value per row/column: fontweight='bold'\n"
-        "- Use white text on dark cells, dark text on light cells (annot_kws)\n\n"
-        "LAYOUT:\n"
-        "- Use seaborn.heatmap with linewidths=0.5, linecolor='white'\n"
-        "- square=True for correlation matrices\n"
-        "- Colorbar: descriptive label, proper tick formatting\n"
-        "- Rotate x-axis labels 30-45° if long, with ha='right'\n\n"
-        "No title inside figure."
-    ),
-    "radar": (
-        "Create a RADAR (SPIDER) CHART comparing methods across multiple dimensions.\n\n"
-        "SETUP:\n"
-        "- Use matplotlib polar axes: fig, ax = plt.subplots(subplot_kw={'projection': 'polar'})\n"
-        "- Each axis represents a metric/dimension\n"
-        "- Normalize all values to [0, 1] range for fair visual comparison\n\n"
-        "STYLING:\n"
-        "- Each method is a closed polygon with Okabe-Ito color\n"
-        "- Proposed method: solid line (lw=2.0), fill alpha=0.20\n"
-        "- Baselines: dashed lines (lw=1.2), fill alpha=0.08\n"
-        "- Add value labels at each vertex of the proposed method polygon\n"
-        "- Use subtle radial grid lines (alpha=0.3)\n\n"
-        "LABELS:\n"
-        "- Metric names at each axis, positioned just outside the chart\n"
-        "- Use ax.set_thetagrids for proper label placement\n"
-        "- Increase padding between labels and chart edge\n\n"
-        "LEGEND: no frame, placed below or to the right of the chart.\n"
-        "Figure size: square aspect ratio (6, 6).\n"
-        "No title inside figure."
-    ),
-    "scatter": (
-        "Create a SCATTER PLOT showing relationships between two variables.\n\n"
-        "MARKERS:\n"
-        "- Different Okabe-Ito colors per method/category\n"
-        "- Different marker shapes per category (o, s, D, ^, v, P)\n"
-        "- edgecolor='white', linewidth=0.3 for depth effect\n"
-        "- alpha=0.75 for overlapping points\n"
-        "- marker size ~40-60 (s parameter in scatter)\n\n"
-        "ANALYSIS OVERLAYS:\n"
-        "- Add trend line (linear/polynomial fit) with R² annotation\n"
-        "- Or Pareto frontier if showing efficiency-vs-quality tradeoff\n"
-        "- Annotate key/outlier points with method names using ax.annotate\n"
-        "- Consider adding marginal distributions (sns.jointplot) if bivariate\n\n"
-        "AXES:\n"
-        "- Label with descriptive names and units\n"
-        "- Add subtle grid lines (GRID_COLOR)\n"
-        "- rasterized=True if >500 points for clean PDF export\n\n"
-        "LEGEND: no frame, placed away from data cluster.\n"
-        "No title inside figure."
-    ),
-    "box_plot": (
-        "Create a BOX PLOT showing distribution of results across runs/datasets.\n\n"
-        "STYLING:\n"
-        "- Use Okabe-Ito palette, each method a distinct color\n"
-        "- Box: width=0.6, edgecolor=TEXT_COLOR, linewidth=0.8\n"
-        "- Median line: color=TEXT_COLOR, linewidth=1.5\n"
-        "- Mean marker: diamond (D), edgecolor='black', zorder=5\n"
-        "- Whiskers: extend to 1.5×IQR\n\n"
-        "DATA OVERLAY:\n"
-        "- If N < 30: add individual data points as jittered strip (alpha=0.5, size=3)\n"
-        "- Use sns.stripplot or manual jitter with np.random.normal\n\n"
-        "STATISTICAL ANNOTATIONS:\n"
-        "- Add significance brackets between key pairs with *, **, *** markers\n"
-        "- Annotate median/mean values above each box (fontsize=7)\n\n"
-        "AXES:\n"
-        "- Y-axis: metric name with units\n"
-        "- X-axis: method names (proposed method first or highlighted)\n"
-        "- Remove top+right spines, add subtle horizontal grid\n\n"
-        "No title inside figure."
-    ),
-    "stacked_bar": (
-        "Create a STACKED BAR CHART showing composition or component breakdown.\n\n"
-        "STYLING:\n"
-        "- Each segment uses an Okabe-Ito color with edgecolor='white', linewidth=0.5\n"
-        "- Add hatching patterns for grayscale accessibility\n"
-        "- Label each segment with its percentage or value inside the bar (if space allows)\n"
-        "  or use leader lines to annotations outside\n\n"
-        "DATA:\n"
-        "- Total value label on top of each stacked bar\n"
-        "- If showing ablation: highlight the component being removed\n\n"
-        "LEGEND:\n"
-        "- No frame, placed below the figure or to the right\n"
-        "- Order legend entries to match the stacking order (bottom to top)\n\n"
-        "AXES: label y-axis with the total metric, x-axis with categories.\n"
-        "Remove top+right spines.\n"
-        "No title inside figure."
-    ),
-    "violin": (
-        "Create a VIOLIN PLOT showing full distribution shapes.\n\n"
-        "STYLING:\n"
-        "- Use seaborn.violinplot with Okabe-Ito palette\n"
-        "- inner='box' to show quartiles inside the violin\n"
-        "- cut=0 to limit violin to data range\n"
-        "- saturation=0.8, alpha=0.85 for visual depth\n"
-        "- linewidth=0.8 for outlines\n\n"
-        "OVERLAY:\n"
-        "- Add individual data points as a swarm/strip overlay (alpha=0.4, size=2)\n"
-        "- Mark the mean with a horizontal line or triangle marker\n\n"
-        "ANNOTATIONS:\n"
-        "- Annotate median/mean values above each violin\n"
-        "- Add significance brackets if comparing methods\n\n"
-        "AXES: descriptive labels, remove top+right spines, subtle horizontal grid.\n"
-        "No title inside figure."
-    ),
-    "horizontal_bar": (
-        "Create a HORIZONTAL BAR CHART (ideal for ablation studies or rankings).\n\n"
-        "LAYOUT:\n"
-        "- Sort bars by value (best on top or full model on top)\n"
-        "- Full model / proposed method: COLORS[0], no hatch\n"
-        "- Ablated variants: lighter/muted colors with hatch patterns\n"
-        "- Bar height ~0.6, edgecolor='white', linewidth=0.5\n\n"
-        "REFERENCE LINE:\n"
-        "- Add a vertical dashed line at the full model's value (color=COLORS[0], alpha=0.5)\n"
-        "- This clearly shows the impact of each ablation\n\n"
-        "ANNOTATIONS:\n"
-        "- Value labels at the right end of each bar (fontsize=8)\n"
-        "- Best value: fontweight='bold'\n"
-        "- Show delta from full model: e.g., '(-2.3)' in gray next to ablated bars\n\n"
-        "LABELS:\n"
-        "- Y-axis: component/variant names (clean, readable)\n"
-        "- X-axis: metric name with units\n"
-        "- Use descriptive variant names (e.g., 'w/o Attention Module' not 'Ablation 3')\n\n"
-        "Remove top+right spines, add subtle vertical grid.\n"
-        "No title inside figure."
-    ),
-    "scaling_law": (
-        "Create a LOG-LOG SCALING LAW plot showing power-law relationships.\n\n"
-        "AXES:\n"
-        "- X-axis: compute/data/model-size on LOG scale (ax.set_xscale('log'))\n"
-        "- Y-axis: loss/error on LOG scale (ax.set_yscale('log'))\n"
-        "- Both axes should show clean powers of 10 as tick labels\n\n"
-        "LINES:\n"
-        "- Each scaling dimension as a distinct curve (color + marker + line style)\n"
-        "- Fitted power-law lines shown alongside actual data points\n"
-        "- Annotate slope: 'α = -0.076' next to each fitted line using ax.annotate\n"
-        "- If showing compute-optimal frontier: dashed black line labeled 'Compute-optimal'\n\n"
-        "DATA POINTS:\n"
-        "- Use distinct markers at each measured point (circle, square, triangle)\n"
-        "- Fit a linear regression in log-log space for the power-law trend\n"
-        "- Show R² value for each fit\n\n"
-        "STYLING:\n"
-        "- Add subtle grid lines on both axes (GRID_COLOR, alpha=0.4)\n"
-        "- Use scientific notation for axis tick labels where appropriate\n"
-        "- Legend with fitted equation: 'L = C^α, α = ...' for each curve\n\n"
-        "No title inside figure."
-    ),
-    "confusion_matrix": (
-        "Create a CONFUSION MATRIX heatmap for classification evaluation.\n\n"
-        "LAYOUT:\n"
-        "- Square 1:1 aspect ratio, use figure size (7, 6)\n"
-        "- X-axis: 'Predicted Label', Y-axis: 'True Label'\n"
-        "- Class names on both axes, rotated 30-45° on x-axis with ha='right'\n\n"
-        "COLORMAP:\n"
-        "- Use 'Blues' colormap (white=0%, dark blue=100%)\n"
-        "- Normalize each row to show percentages (row-wise normalization)\n\n"
-        "ANNOTATIONS:\n"
-        "- Each cell: show count or percentage (fontsize=8)\n"
-        "- Diagonal cells (correct): fontweight='bold'\n"
-        "- High off-diagonal values (confusions >5%): highlight with red text\n"
-        "- Low values (<2%): use light gray text to reduce visual clutter\n\n"
-        "STYLING:\n"
-        "- Use seaborn.heatmap with linewidths=0.5, linecolor='white'\n"
-        "- Colorbar on right labeled 'Accuracy (%)' or 'Count'\n"
-        "- Add overall accuracy annotation: 'Overall: XX.X%' in upper-right corner\n\n"
-        "No title inside figure."
-    ),
-    "embedding_scatter": (
-        "Create a t-SNE/UMAP EMBEDDING SCATTER plot for representation visualization.\n\n"
-        "LAYOUT:\n"
-        "- Square 1:1 aspect ratio, figure size (6, 6)\n"
-        "- NO axis tick marks or values (embedding dimensions are meaningless)\n"
-        "- Remove all spines, ticks, and labels from axes\n"
-        "- Use ax.set_xticks([]) and ax.set_yticks([])\n\n"
-        "MARKERS:\n"
-        "- Each class: distinct color from a categorical palette (tab10 or tab20)\n"
-        "- Point size s=8-15, alpha=0.7 for overlap visibility\n"
-        "- edgecolor='white', linewidth=0.1 for subtle depth\n\n"
-        "CLUSTERS:\n"
-        "- Generate data showing CLEAR cluster separation (use sklearn.datasets or manual)\n"
-        "- Same-class points should form tight groups with small spread\n"
-        "- Add a few outliers between clusters for realism\n\n"
-        "LEGEND:\n"
-        "- Legend outside the plot (bbox_to_anchor=(1.05, 1))\n"
-        "- List all class names with corresponding colors\n"
-        "- Use markerscale=2.0 in legend for visibility\n\n"
-        "MULTI-PANEL (if comparing before/after):\n"
-        "- Use 1×2 subplot: (a) Before fine-tuning, (b) After fine-tuning\n"
-        "- Panel (a): mixed, overlapping clusters; Panel (b): clean separation\n"
-        "- Label panels in upper-left corner\n\n"
-        "No title inside figure."
-    ),
-}
-
-# ---------------------------------------------------------------------------
-# AI figure templates — detailed prompt templates for AI-generated images
-# ---------------------------------------------------------------------------
-
-AI_FIGURE_TEMPLATES = {
-    "system_overview": (
-        "A clean, professional system overview diagram for an AI research paper, 16:9 landscape.\n"
-        "Left-to-right data flow showing the complete model pipeline.\n"
-        "Each module is a rounded rectangle with distinct color:\n"
-        "- Input data: light gray box with data format annotation\n"
-        "- Processing modules: distinct colors (blue=#4682B4, orange=#E5A84B, green=#2E8B57)\n"
-        "- Output: green box with prediction label\n"
-        "Arrows between modules are solid dark gray with arrowheads.\n"
-        "Dashed arrows for skip/residual connections.\n"
-        "Each module box contains internal sub-blocks showing key operations.\n"
-        "Tensor dimensions annotated along arrows (e.g., B×L×D).\n"
-        "Novel components highlighted with a colored border or subtle background.\n"
-        "Loss function shown at top-right with dashed arrow from output.\n"
-        "White background, sans-serif font (Arial), no decorative elements.\n"
-        "Publication-ready, clean vector-style lines, no shadows or gradients.\n"
-    ),
-    "transformer_arch": (
-        "A detailed Transformer architecture diagram for an AI paper, portrait 3:4.\n"
-        "Left side: Encoder stack (N identical layers in a tall dashed box labeled 'N×').\n"
-        "Right side: Decoder stack (N identical layers in a tall dashed box labeled 'N×').\n"
-        "Each encoder layer contains: Multi-Head Attention → Add & Norm → Feed Forward → Add & Norm.\n"
-        "Each decoder layer contains: Masked MHA → Add & Norm → Cross-Attention → Add & Norm → FFN → Add & Norm.\n"
-        "Residual connections shown as thin arrows bypassing each sub-layer.\n"
-        "Input embeddings + Positional Encoding at the bottom.\n"
-        "Output probabilities via Linear + Softmax at the top.\n"
-        "Color coding: attention blocks in steel blue (#4682B4), FFN in coral (#E07B54),\n"
-        "norm layers in light gray (#D0D0D0), embedding in amber (#E5A84B).\n"
-        "Clean white background, labeled arrows, professional academic style.\n"
-    ),
-    "encoder_decoder": (
-        "Encoder-decoder architecture diagram, 16:9 landscape.\n"
-        "Left: Encoder processes input sequence through stacked layers,\n"
-        "producing hidden states shown as a row of blue circles/rectangles.\n"
-        "Middle: Context/attention mechanism shown as connecting lines from encoder\n"
-        "to decoder with attention weight annotations (α_i).\n"
-        "Right: Decoder generates output sequence through stacked layers shown\n"
-        "as green circles/rectangles.\n"
-        "Bottom: input tokens in gray boxes with embeddings flowing upward.\n"
-        "Top: output tokens in white boxes with probabilities.\n"
-        "Attention connections shown as semi-transparent lines of varying thickness.\n"
-        "Clean academic style, sans-serif labels, white background.\n"
-    ),
-    "multi_stage": (
-        "Multi-stage pipeline diagram, 16:9, showing progressive refinement.\n"
-        "3-4 stages arranged left to right, connected by arrows:\n"
-        "Stage 1 (leftmost): light blue block, coarse/initial output shown below.\n"
-        "Stage 2 (middle): medium blue block, refined intermediate output below.\n"
-        "Stage 3 (rightmost): dark blue block, final high-quality output below.\n"
-        "Arrows between stages labeled with operations (e.g., 'upsample', 'refine', 'fuse').\n"
-        "Each stage contains a small sub-architecture diagram inside the block.\n"
-        "Progressive quality improvement visible in sample outputs below each stage.\n"
-        "Feedback/skip connections shown as dashed curved arrows above the pipeline.\n"
-        "Professional paper figure style, clean lines, white background.\n"
-    ),
-    "comparison_framework": (
-        "Side-by-side comparison diagram, 16:9, two rows with clear visual contrast.\n"
-        "Top row labeled '(a) Previous Method':\n"
-        "  Simple, basic pipeline: Input → [Single Module (gray)] → Output.\n"
-        "  Limited connections, simple architecture. Faded/muted colors.\n"
-        "Bottom row labeled '(b) Our Method (Proposed)':\n"
-        "  Richer pipeline: Input → [Multi-component Module (blue)] → [Novel Module (orange)] → Output.\n"
-        "  Skip connections (dashed), attention highlighted, more sophisticated.\n"
-        "Red dashed box highlighting the novel component with annotation 'Our contribution'.\n"
-        "Small red star or badge on the novel module.\n"
-        "Both rows aligned vertically for easy comparison.\n"
-        "Clean academic style, consistent arrow styles, white background.\n"
-    ),
-    "attention_map": (
-        "Attention visualization figure for a research paper.\n"
-        "For NLP: token-level attention heatmap matrix.\n"
-        "  Rows = query tokens, columns = key tokens.\n"
-        "  Cell color intensity: white (0.0) to dark blue (1.0).\n"
-        "  Notable attention patterns highlighted.\n"
-        "For Vision: attention heatmap overlaid on input images.\n"
-        "  Top row: 3-4 original input images.\n"
-        "  Bottom row: corresponding attention maps (jet colormap, semi-transparent overlay).\n"
-        "  Attention correctly focuses on semantically meaningful regions.\n"
-        "  Each column labeled (a), (b), (c), (d).\n"
-        "Clean layout, thin borders between panels, professional academic style.\n"
-    ),
-    "embedding_viz": (
-        "t-SNE/UMAP embedding visualization diagram, square 1:1 aspect.\n"
-        "2D scatter plot with clear cluster structure.\n"
-        "Multiple classes shown as distinct colored point clouds.\n"
-        "Clear cluster separation: same-class points form tight groups.\n"
-        "Color-coded by class with a clear legend on the side.\n"
-        "No axis tick marks (embedding dimensions are meaningless).\n"
-        "If comparing: two panels side by side:\n"
-        "  (a) Before training: mixed, overlapping clusters.\n"
-        "  (b) After training: well-separated, tight clusters.\n"
-        "Point size small, alpha=0.7 for overlap visibility.\n"
-        "Professional academic style, clean and minimal.\n"
-    ),
-    "qualitative_comparison": (
-        "Qualitative comparison grid for visual results, 16:9.\n"
-        "Multiple columns: 'Input', 'Method A', 'Method B', 'Ours'.\n"
-        "Multiple rows showing different difficulty levels (easy/medium/hard).\n"
-        "Our method shows clearly better results in hard cases.\n"
-        "Red boxes with zoom-in patches highlighting detail differences.\n"
-        "Small green checkmarks on best results, red X on failures.\n"
-        "Thin white borders between all panels.\n"
-        "Method names in bold at top of each column.\n"
-        "Row labels on the left: 'Easy', 'Medium', 'Hard'.\n"
-        "Clean layout, publication-ready quality.\n"
-    ),
-    "data_pipeline": (
-        "Data preprocessing pipeline diagram, 16:9, left-to-right flow.\n"
-        "4-5 stages as colored rounded rectangles:\n"
-        "Stage 1: 'Raw Data' (gray) → Stage 2: 'Cleaning' (blue) →\n"
-        "Stage 3: 'Processing' (green) → Stage 4: 'Augmentation' (orange) →\n"
-        "Stage 5: 'Final Dataset' (dark blue).\n"
-        "Arrows between stages with small text labels describing operations.\n"
-        "Each stage has a small icon or sample data visualization inside.\n"
-        "Dataset statistics shown below: sample counts, class distribution.\n"
-        "Professional academic style, consistent sizing, white background.\n"
-    ),
-    "loss_landscape": (
-        "3D loss landscape visualization, 4:3 aspect.\n"
-        "3D surface plot: X and Y as parameter dimensions, Z as loss value.\n"
-        "Surface colored by height: dark blue (low/valley) to red (high/peak).\n"
-        "Optimization trajectories plotted on surface:\n"
-        "- SGD path: white line, oscillating, slow convergence.\n"
-        "- Our optimizer: yellow line, smooth, fast convergence to global minimum.\n"
-        "Start point marked with circle, endpoints with star markers.\n"
-        "Viewing angle: 30° elevation, 45° azimuth for good 3D perception.\n"
-        "Mesh grid visible on surface. Color bar on right.\n"
-        "Clean academic style, labeled axes.\n"
-    ),
-    "generic": (
-        "A clean, professional scientific diagram for an AI research paper.\n"
-        "Use a structured layout with clear visual hierarchy.\n"
-        "Rounded rectangles for modules, arrows for connections.\n"
-        "Color scheme: steel blue, coral, amber, muted green (max 4 colors).\n"
-        "All labels in sans-serif font, horizontal orientation.\n"
-        "White background, no decorative elements.\n"
-        "Publication-ready quality for a top-tier venue.\n"
-    ),
-}
-
-# Core prompt engineering principles for academic figures
-PROMPT_CORE_PRINCIPLES = """
-CORE PRINCIPLES for prompt construction:
-1. BE EXTREMELY SPECIFIC: Don't say "draw a network" — say "6-layer Transformer encoder,
-   each layer containing Multi-Head Attention and Feed-Forward sub-layers"
-2. SPECIFY ASPECT RATIO: Architecture diagrams 16:9, comparison grids 4:3, embeddings 1:1
-3. DEFINE COLORS by hex: encoder=#4682B4 (steel blue), decoder=#E07B54 (coral),
-   attention=#2E8B57 (teal), highlight=#C0392B (muted red)
-4. LABEL EVERYTHING: every box, every arrow, every axis — specify exact text
-5. STATE STYLE: "clean academic style, white background, sans-serif font, no decorative elements, 300 DPI"
-6. DESCRIBE IN LAYERS: overall layout first → module details → annotations and labels
-7. SPECIFY EXCLUSIONS: "no 3D effects, no shadows, no gradients on boxes, no watermarks, no emojis"
+# === End enforced rcParams ===
 """
+
+# ---------------------------------------------------------------------------
+# Prompts (loaded from nanoresearch/prompts/figure_gen/*.yaml)
+# ---------------------------------------------------------------------------
+
+FIGURE_PLAN_SYSTEM = load_prompt("figure_gen", "planning")
+FIGURE_PROMPT_SYSTEM = load_prompt("figure_gen", "prompt_engineering")
+CHART_CODE_SYSTEM = load_prompt("figure_gen", "chart_code")
+PROMPT_CORE_PRINCIPLES = load_prompt("figure_gen", "core_principles")
+
+# Chart type specific prompts — dict[str, str]
+CHART_TYPE_PROMPTS: dict[str, str] = {
+    ct: load_prompt("figure_gen/chart_types", ct)
+    for ct in [
+        "grouped_bar", "line_plot", "heatmap", "radar", "scatter",
+        "box_plot", "stacked_bar", "violin", "horizontal_bar",
+        "scaling_law", "confusion_matrix", "embedding_scatter",
+    ]
+}
+
+# AI figure templates — dict[str, str]
+AI_FIGURE_TEMPLATES: dict[str, str] = {
+    tmpl: load_prompt("figure_gen/ai_templates", tmpl)
+    for tmpl in [
+        "system_overview", "transformer_arch", "encoder_decoder",
+        "multi_stage", "comparison_framework", "attention_map",
+        "embedding_viz", "qualitative_comparison", "data_pipeline",
+        "loss_landscape", "generic",
+    ]
+}
 
 # ---------------------------------------------------------------------------
 # FigureAgent — dynamic figure planning + hybrid AI/code generation
@@ -1460,7 +815,7 @@ class FigureAgent(BaseResearchAgent):
                 )
                 if b64_images:
                     self.log(f"  {fig_key} image generated on attempt {attempt + 1}")
-                    return self._save_figure_files(
+                    return await self._save_figure_files(
                         fig_key, filename_stem,
                         caption or description,
                         base64.b64decode(b64_images[0]),
@@ -1489,7 +844,7 @@ class FigureAgent(BaseResearchAgent):
                     )
                     if b64_images:
                         self.log(f"  {fig_key} succeeded with optimized prompt (attempt {opt_attempt + 1})")
-                        return self._save_figure_files(
+                        return await self._save_figure_files(
                             fig_key, filename_stem,
                             caption or description,
                             base64.b64decode(b64_images[0]),
@@ -1499,7 +854,7 @@ class FigureAgent(BaseResearchAgent):
 
         # Step 5: Final fallback — code-generated placeholder
         self.log(f"  {fig_key} all AI generation attempts exhausted, using fallback")
-        return self._generate_fallback_chart(fig_key, filename_stem, caption or description)
+        return await self._generate_fallback_chart(fig_key, filename_stem, caption or description)
 
     async def _diagnose_and_optimize_prompt(
         self,
@@ -1620,6 +975,20 @@ class FigureAgent(BaseResearchAgent):
                 lines = [l for l in lines[1:] if not l.strip().startswith("```")]
                 code = "\n".join(lines)
 
+            # Inject preamble: enforce sane rcParams in the subprocess
+            # Strip any `import matplotlib` / `mpl.use('Agg')` the LLM wrote
+            # to avoid double-import conflicts with the preamble
+            code = re.sub(
+                r"^import matplotlib(?:\.\w+)? as .*$|"
+                r"^import matplotlib$|"
+                r"^from matplotlib import .*$|"
+                r"^matplotlib\.use\(.*\)$|"
+                r"^mpl\.use\(.*\)$|"
+                r"^import matplotlib\.pyplot as plt$",
+                "", code, flags=re.MULTILINE,
+            )
+            code = _FIGURE_CODE_PREAMBLE + code
+
             # Save the generated code for debugging/reproducibility
             code_path = self.workspace.write_text(
                 f"figures/{filename_stem}_plot.py", code
@@ -1663,17 +1032,39 @@ class FigureAgent(BaseResearchAgent):
                 self.log(f"  {fig_key} attempt {attempt + 1}: {last_error}")
                 continue
 
+            # Step 3b: Validate image dimensions — reject absurd sizes
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(png_path) as _img:
+                    _w, _h = _img.size
+                self.log(f"  {fig_key} output size: {_w}x{_h}")
+                aspect = _h / max(_w, 1)
+                if _h > MAX_FIG_HEIGHT_PX and aspect > MAX_FIG_ASPECT_RATIO:
+                    last_error = (
+                        f"Figure too tall: {_w}x{_h} pixels "
+                        f"(aspect {aspect:.1f} > {MAX_FIG_ASPECT_RATIO}). "
+                        f"Use a smaller figsize like (7, 4.3) or (7, 5) "
+                        f"and call fig.tight_layout(). "
+                        f"Do NOT use figsize with height > 8 inches."
+                    )
+                    self.log(f"  {fig_key} attempt {attempt + 1} rejected: {last_error}")
+                    png_path.unlink(missing_ok=True)
+                    continue
+            except Exception:
+                pass  # PIL not available or file invalid — let it through
+
             self.log(f"  {fig_key} saved (attempt {attempt + 1})")
-            return self._save_figure_files(fig_key, filename_stem, caption,
-                                           png_path.read_bytes(), already_saved=True)
+            return await self._save_figure_files(fig_key, filename_stem, caption,
+                                                 png_path.read_bytes(), already_saved=True,
+                                                 code_generated=True)
 
         # All retries exhausted — use fallback placeholder
         self.log(f"  {fig_key} all {MAX_CODE_CHART_RETRIES} attempts failed, using fallback")
-        result = self._generate_fallback_chart(fig_key, filename_stem, caption)
+        result = await self._generate_fallback_chart(fig_key, filename_stem, caption)
         result["is_fallback"] = True
         return result
 
-    def _generate_fallback_chart(
+    async def _generate_fallback_chart(
         self, fig_key: str, filename_stem: str, caption: str,
     ) -> dict[str, Any]:
         """Generate a simple fallback chart if LLM code fails."""
@@ -1695,27 +1086,44 @@ class FigureAgent(BaseResearchAgent):
         plt.close("all")  # ensure no leaked figures from prior in-process rendering
 
         self.log(f"  {fig_key} fallback placeholder saved")
-        return self._save_figure_files(fig_key, filename_stem, caption,
-                                       png_path.read_bytes(), already_saved=True)
+        return await self._save_figure_files(fig_key, filename_stem, caption,
+                                             png_path.read_bytes(), already_saved=True,
+                                             code_generated=True)
 
     # -----------------------------------------------------------------------
     # Shared: save PNG + PDF + register artifacts
     # -----------------------------------------------------------------------
 
-    def _save_figure_files(
+    async def _save_figure_files(
         self,
         fig_key: str,
         filename_stem: str,
         caption: str,
         image_bytes: bytes,
         already_saved: bool = False,
+        code_generated: bool = False,
     ) -> dict[str, Any]:
-        """Save PNG (if not already saved) + convert to PDF + register artifacts."""
+        """Save PNG (if not already saved) + convert to PDF + register artifacts.
+
+        Args:
+            code_generated: True for matplotlib/code-generated charts.
+                Only code-generated figures go through LLM-driven trim,
+                because API-generated figures (DALL-E, Gemini) are already
+                properly sized by the image model.
+        """
         png_path = self.workspace.path / "figures" / f"{filename_stem}.png"
         png_path.parent.mkdir(parents=True, exist_ok=True)
 
         if not already_saved:
             png_path.write_bytes(image_bytes)
+
+        # LLM-driven trim: only for code-generated charts (matplotlib etc.)
+        # API-generated figures (DALL-E/Gemini) are already properly composed
+        if code_generated:
+            try:
+                await self._smart_trim_figure(fig_key, png_path)
+            except Exception as e:
+                self.log(f"  {fig_key} smart-trim failed (non-fatal): {e}")
 
         # Convert to PDF via Pillow
         pdf_path = self.workspace.path / "figures" / f"{filename_stem}.pdf"
@@ -1743,3 +1151,272 @@ class FigureAgent(BaseResearchAgent):
             "pdf_path": str(pdf_path) if pdf_path else None,
             "caption": caption,
         }
+
+    # ------------------------------------------------------------------
+    # LLM-driven figure trim: LLM sees image → writes code → executes
+    # → LLM verifies result → approve / iterate (max 2 rounds)
+    # ------------------------------------------------------------------
+
+    _TRIM_ANALYZE_SYSTEM = (
+        "You are a figure layout expert for academic papers. "
+        "You will see a scientific figure image. Analyze it and decide "
+        "whether it needs cropping to remove excess whitespace.\n\n"
+        "RULES:\n"
+        "- Academic figures MUST be compact — crop AGGRESSIVELY\n"
+        "- Remove ALL blank/whitespace regions beyond a small margin\n"
+        "- Orphaned text fragments (stray 'N/A', watermarks) floating in "
+        "whitespace far from charts are NOT meaningful — crop them away\n"
+        "- Keep ~20-30px margin around actual chart content\n\n"
+        "OUTPUT FORMAT — respond with ONLY valid JSON, no markdown fences:\n"
+        '{"needs_trim": false}\n'
+        "OR\n"
+        '{"needs_trim": true, "code": "<python code>"}\n\n'
+        "If needs_trim is true, write Python code using this PROVEN algorithm:\n"
+        "```\n"
+        "from PIL import Image\n"
+        "import numpy as np\n"
+        "img = Image.open(INPUT_PATH)\n"
+        "arr = np.array(img)\n"
+        "# Detect non-white pixels (threshold 245 catches light gray too)\n"
+        "if arr.ndim == 3:\n"
+        "    gray = np.mean(arr[:,:,:3], axis=2)\n"
+        "else:\n"
+        "    gray = arr.astype(float)\n"
+        "non_white = gray < 245\n"
+        "rows_mask = np.any(non_white, axis=1)\n"
+        "cols_mask = np.any(non_white, axis=0)\n"
+        "row_indices = np.where(rows_mask)[0]\n"
+        "col_indices = np.where(cols_mask)[0]\n"
+        "margin = 25\n"
+        "top = max(0, row_indices[0] - margin)\n"
+        "bottom = min(arr.shape[0], row_indices[-1] + margin)\n"
+        "left = max(0, col_indices[0] - margin)\n"
+        "right = min(arr.shape[1], col_indices[-1] + margin)\n"
+        "cropped = img.crop((left, top, right, bottom))\n"
+        "cropped.save(OUTPUT_PATH)\n"
+        "print(f'Cropped: {img.size} -> {cropped.size}')\n"
+        "```\n"
+        "You may adapt this algorithm (e.g., adjust margin, threshold) but "
+        "the core approach of detecting content via non-white pixel boundaries "
+        "is REQUIRED. Do NOT use hardcoded pixel coordinates.\n"
+        'Variables INPUT_PATH and OUTPUT_PATH are pre-defined strings.'
+    )
+
+    _TRIM_VERIFY_SYSTEM = (
+        "You are a figure quality inspector for academic papers. "
+        "You will see a cropped scientific figure. "
+        "Check if the cropping is correct.\n\n"
+        "APPROVE if:\n"
+        "- All MAIN chart/graph content is fully visible: axes, tick marks, "
+        "axis labels, legends, titles, data (bars/lines/points), and "
+        "data annotations (value labels above bars, arrows, etc.)\n"
+        "- Margins are compact (small gap around the content is fine)\n"
+        "- The figure looks clean and publication-ready\n\n"
+        "REJECT ONLY if:\n"
+        "- A chart axis, axis label, or tick mark is visibly clipped\n"
+        "- A legend entry is cut off or missing\n"
+        "- Data (bars, lines, points) is partially clipped\n"
+        "- A subplot panel is missing or cut off\n\n"
+        "DO NOT reject for:\n"
+        "- Removal of blank whitespace (that is the GOAL)\n"
+        "- Removal of orphaned text fragments (stray 'N/A' etc.) that were "
+        "floating in whitespace far from the chart\n"
+        "- Tight margins — compact is good for papers\n\n"
+        "OUTPUT FORMAT — respond with ONLY valid JSON, no markdown fences:\n"
+        '{"verdict": "APPROVE"}\n'
+        "OR\n"
+        '{"verdict": "REJECT", "reason": "...", "code": "<fix code>"}\n\n'
+        "If REJECT, provide Python code that fixes the crop (same format: "
+        "reads INPUT_PATH, saves to OUTPUT_PATH, uses PIL/numpy)."
+    )
+
+    async def _smart_trim_figure(self, fig_key: str, png_path: Path) -> None:
+        """LLM-driven figure trimming.
+
+        Flow:
+        1. Send original image to LLM → LLM decides if trim needed
+        2. If yes, LLM writes Python cropping code → execute it
+        3. Send result to LLM for verification → APPROVE or REJECT with fix
+        4. Max 2 rounds; on any failure fall back to original
+        """
+        import io
+        from PIL import Image
+
+        original_bytes = png_path.read_bytes()
+        img = Image.open(io.BytesIO(original_bytes))
+        w, h = img.size
+        self.log(f"  {fig_key} trim check: {w}x{h}")
+
+        # Round 1: LLM analyzes original image
+        try:
+            trim_plan = await self._llm_analyze_trim(fig_key, original_bytes, w, h)
+        except Exception as e:
+            self.log(f"  {fig_key} LLM trim analysis failed: {e}")
+            return
+
+        if not trim_plan.get("needs_trim"):
+            self.log(f"  {fig_key} LLM says no trim needed")
+            return
+
+        code = trim_plan.get("code", "")
+        if not code.strip():
+            self.log(f"  {fig_key} LLM returned needs_trim but no code")
+            return
+
+        # Execute LLM's cropping code
+        trimmed_path = png_path.parent / f"{png_path.stem}_trimmed.png"
+        success = self._exec_trim_code(code, str(png_path), str(trimmed_path))
+
+        if not success or not trimmed_path.exists():
+            self.log(f"  {fig_key} trim code execution failed")
+            return
+
+        # Round 2: LLM verifies the trimmed result (max 2 rounds)
+        import shutil
+        trimmed_bytes = trimmed_path.read_bytes()
+        accepted = False
+
+        for verify_round in range(2):
+            try:
+                verdict = await self._llm_verify_trim(fig_key, trimmed_bytes)
+            except Exception as e:
+                self.log(f"  {fig_key} LLM verify failed: {e}, accepting trim")
+                accepted = True  # LLM wrote the code; trust it on API failure
+                break
+
+            if verdict.get("verdict", "").upper() == "APPROVE":
+                accepted = True
+                break
+
+            # REJECT — try the fix code if provided
+            fix_code = verdict.get("code", "")
+            reason = verdict.get("reason", "unknown")
+            self.log(f"  {fig_key} LLM REJECTED (round {verify_round + 1}): {reason}")
+
+            if not fix_code.strip() or verify_round >= 1:
+                break  # no fix code or last round — give up
+
+            # Execute fix code
+            fix_output = png_path.parent / f"{png_path.stem}_fix.png"
+            success = self._exec_trim_code(
+                fix_code, str(trimmed_path), str(fix_output),
+            )
+            if success and fix_output.exists():
+                trimmed_bytes = fix_output.read_bytes()
+                shutil.copy2(str(fix_output), str(trimmed_path))
+                fix_output.unlink(missing_ok=True)
+            else:
+                self.log(f"  {fig_key} fix code execution failed")
+                break
+
+        if accepted:
+            shutil.copy2(str(trimmed_path), str(png_path))
+            with Image.open(png_path) as _img:
+                tw, th = _img.size
+            self.log(f"  {fig_key} trim ACCEPTED: {w}x{h} -> {tw}x{th}")
+        else:
+            self.log(f"  {fig_key} keeping original (LLM did not approve trim)")
+
+        trimmed_path.unlink(missing_ok=True)
+
+    async def _llm_analyze_trim(
+        self, fig_key: str, image_bytes: bytes, width: int, height: int,
+    ) -> dict:
+        """Send image to LLM; get back trim decision + code.
+
+        Uses figure_code stage (vision-capable model like Claude Sonnet),
+        NOT figure_gen (image generation model like Gemini).
+        """
+        # Use vision-capable model, not the image-generation model
+        vision_config = self.config.for_stage("figure_code")
+        response = await self.generate_with_image(
+            self._TRIM_ANALYZE_SYSTEM,
+            f"Figure '{fig_key}', dimensions: {width}x{height} pixels.\n"
+            f"Analyze this figure. Is there excess whitespace that should "
+            f"be cropped? If yes, write Python code to crop it properly.\n"
+            f"Remember: preserve ALL chart content (axes, labels, legends, data).",
+            image_bytes,
+            json_mode=True,
+            stage_override=vision_config,
+        )
+        return self._safe_parse_json(response, {"needs_trim": False})
+
+    async def _llm_verify_trim(
+        self, fig_key: str, image_bytes: bytes,
+    ) -> dict:
+        """Send trimmed image to LLM for visual verification.
+
+        Uses figure_code stage (vision-capable model like Claude Sonnet),
+        NOT figure_gen (image generation model like Gemini).
+        """
+        # Use vision-capable model, not the image-generation model
+        vision_config = self.config.for_stage("figure_code")
+        response = await self.generate_with_image(
+            self._TRIM_VERIFY_SYSTEM,
+            f"This is a cropped version of figure '{fig_key}'. "
+            f"Is the crop correct? Is all content preserved?",
+            image_bytes,
+            json_mode=True,
+            stage_override=vision_config,
+        )
+        return self._safe_parse_json(response, {"verdict": "APPROVE"})
+
+    @staticmethod
+    def _exec_trim_code(code: str, input_path: str, output_path: str) -> bool:
+        """Execute LLM-written trim code in a subprocess.
+
+        Pre-defines INPUT_PATH and OUTPUT_PATH variables for the code.
+        Returns True if execution succeeded and output file exists.
+        """
+        import os
+        import subprocess
+        import sys
+        import textwrap
+
+        preamble = textwrap.dedent("""\
+            import os, sys
+            INPUT_PATH = %s
+            OUTPUT_PATH = %s
+            from PIL import Image, ImageChops
+            import numpy as np
+        """) % (repr(input_path), repr(output_path))
+        wrapper = preamble + "\n" + code
+
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", wrapper],
+                capture_output=True, text=True, timeout=30,
+            )
+            if result.returncode != 0:
+                logger.warning("Trim code failed: %s", result.stderr[:500])
+                return False
+            return os.path.exists(output_path)
+        except subprocess.TimeoutExpired:
+            logger.warning("Trim code timed out (30s)")
+            return False
+        except Exception as e:
+            logger.warning("Trim code execution error: %s", e)
+            return False
+
+    @staticmethod
+    def _safe_parse_json(text: str, default: dict) -> dict:
+        """Parse JSON from LLM response, stripping markdown fences."""
+        import json as _json
+        text = text.strip()
+        # Strip markdown code fences
+        if text.startswith("```"):
+            lines = text.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            text = "\n".join(lines).strip()
+        try:
+            return _json.loads(text)
+        except _json.JSONDecodeError:
+            # Try to find JSON object in the text
+            start = text.find("{")
+            end = text.rfind("}") + 1
+            if start >= 0 and end > start:
+                try:
+                    return _json.loads(text[start:end])
+                except _json.JSONDecodeError:
+                    pass
+            return default

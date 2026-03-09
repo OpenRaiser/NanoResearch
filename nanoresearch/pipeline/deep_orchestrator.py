@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import traceback
 from typing import Any
 
@@ -18,6 +19,9 @@ from nanoresearch.agents.review import ReviewAgent
 from nanoresearch.agents.setup import SetupAgent
 from nanoresearch.agents.writing import WritingAgent
 from nanoresearch.config import ResearchConfig
+from nanoresearch.pipeline.blueprint_validator import validate_blueprint
+from nanoresearch.pipeline.cost_tracker import CostTracker
+from nanoresearch.pipeline.progress import ProgressEmitter
 from nanoresearch.pipeline.state import PipelineStateMachine
 from nanoresearch.pipeline.workspace import Workspace
 from nanoresearch.schemas.manifest import PipelineMode, PipelineStage
@@ -58,6 +62,8 @@ class DeepPipelineOrchestrator:
     def __init__(self, workspace: Workspace, config: ResearchConfig) -> None:
         self.workspace = workspace
         self.config = config
+        self.cost_tracker = CostTracker()
+        self.progress_emitter = ProgressEmitter(workspace.path / "progress.json")
         self.state_machine = PipelineStateMachine(
             workspace.manifest.current_stage,
             mode=PipelineMode.DEEP,
@@ -73,6 +79,9 @@ class DeepPipelineOrchestrator:
             PipelineStage.WRITING: WritingAgent(workspace, config),
             PipelineStage.REVIEW: ReviewAgent(workspace, config),
         }
+        # Wire each agent's dispatcher to feed the cost tracker
+        for agent in self._agents.values():
+            agent._dispatcher._usage_callback = self.cost_tracker.record
 
     async def close(self) -> None:
         for agent in self._agents.values():
@@ -94,7 +103,18 @@ class DeepPipelineOrchestrator:
             "pipeline_mode": PipelineMode.DEEP.value,
         }
 
-        for stage in DEEP_PROCESSING_STAGES:
+        try:
+            return await self._run_all_stages(topic, results)
+        except Exception:
+            self.progress_emitter.pipeline_complete(False, "Deep pipeline failed")
+            raise
+
+    async def _run_all_stages(
+        self, topic: str, results: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Execute all deep pipeline stages sequentially."""
+        total_stages = len(DEEP_PROCESSING_STAGES)
+        for stage_idx, stage in enumerate(DEEP_PROCESSING_STAGES):
             stage_record = self.workspace.manifest.stages.get(stage.value)
             if stage_record and stage_record.status == "completed":
                 logger.info("Skipping completed stage: %s", stage.value)
@@ -127,11 +147,50 @@ class DeepPipelineOrchestrator:
             if self.state_machine.current != stage:
                 self.state_machine.transition(stage)
 
+            self.progress_emitter.stage_start(
+                stage.value, total_stages, stage_idx,
+                f"[{stage_idx+1}/{total_stages}] Running {stage.value}...",
+            )
+            self.cost_tracker.set_stage(stage.value)
+
+            t0 = time.monotonic()
             stage_result = await self._run_stage_with_retry(stage, topic, results)
+            duration = time.monotonic() - t0
             results.update(stage_result)
+
+            # Blueprint semantic validation after PLANNING
+            if stage == PipelineStage.PLANNING:
+                bp = results.get("experiment_blueprint", {})
+                issues = validate_blueprint(bp)
+                if issues:
+                    for issue in issues:
+                        logger.warning("Blueprint issue: %s", issue)
+                    self.progress_emitter.substep(
+                        stage.value,
+                        f"Blueprint validation: {len(issues)} issue(s) found",
+                    )
+
+            self.progress_emitter.stage_complete(
+                stage.value, total_stages, stage_idx,
+                f"[{stage_idx+1}/{total_stages}] {stage.value} completed in {duration:.1f}s",
+            )
 
         self.state_machine.transition(PipelineStage.DONE)
         self.workspace.update_manifest(current_stage=PipelineStage.DONE)
+
+        # Save cost summary
+        cost_summary = self.cost_tracker.summary()
+        self.workspace.write_json("logs/cost_summary.json", cost_summary)
+        results["cost_summary"] = cost_summary
+        if cost_summary["total_tokens"] > 0:
+            logger.info(
+                "Cost summary: %d total tokens, %d calls, %.1fs total latency",
+                cost_summary["total_tokens"],
+                cost_summary["total_calls"],
+                cost_summary["total_latency_ms"] / 1000,
+            )
+
+        self.progress_emitter.pipeline_complete(True, "Deep pipeline completed")
         logger.info("Deep pipeline completed!")
 
         try:

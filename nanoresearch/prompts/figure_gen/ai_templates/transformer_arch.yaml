@@ -1,0 +1,26 @@
+name: transformer_arch
+version: '1.0'
+description: AI image template for transformer_arch
+system_prompt: 'A detailed Transformer architecture diagram for an AI paper, portrait 3:4.
+
+  Left side: Encoder stack (N identical layers in a tall dashed box labeled ''N×'').
+
+  Right side: Decoder stack (N identical layers in a tall dashed box labeled ''N×'').
+
+  Each encoder layer contains: Multi-Head Attention → Add & Norm → Feed Forward → Add & Norm.
+
+  Each decoder layer contains: Masked MHA → Add & Norm → Cross-Attention → Add & Norm → FFN → Add & Norm.
+
+  Residual connections shown as thin arrows bypassing each sub-layer.
+
+  Input embeddings + Positional Encoding at the bottom.
+
+  Output probabilities via Linear + Softmax at the top.
+
+  Color coding: attention blocks in steel blue (#4682B4), FFN in coral (#E07B54),
+
+  norm layers in light gray (#D0D0D0), embedding in amber (#E5A84B).
+
+  Clean white background, labeled arrows, professional academic style.
+
+  '

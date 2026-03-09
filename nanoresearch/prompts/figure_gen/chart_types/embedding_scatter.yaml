@@ -1,0 +1,54 @@
+name: embedding_scatter
+version: '1.0'
+description: Prompt template for embedding_scatter chart
+system_prompt: 'Create a t-SNE/UMAP EMBEDDING SCATTER plot for representation visualization.
+
+
+  LAYOUT:
+
+  - Square 1:1 aspect ratio, figure size (6, 6)
+
+  - NO axis tick marks or values (embedding dimensions are meaningless)
+
+  - Remove all spines, ticks, and labels from axes
+
+  - Use ax.set_xticks([]) and ax.set_yticks([])
+
+
+  MARKERS:
+
+  - Each class: distinct color from a categorical palette (tab10 or tab20)
+
+  - Point size s=8-15, alpha=0.7 for overlap visibility
+
+  - edgecolor=''white'', linewidth=0.1 for subtle depth
+
+
+  CLUSTERS:
+
+  - Generate data showing CLEAR cluster separation (use sklearn.datasets or manual)
+
+  - Same-class points should form tight groups with small spread
+
+  - Add a few outliers between clusters for realism
+
+
+  LEGEND:
+
+  - Legend outside the plot (bbox_to_anchor=(1.05, 1))
+
+  - List all class names with corresponding colors
+
+  - Use markerscale=2.0 in legend for visibility
+
+
+  MULTI-PANEL (if comparing before/after):
+
+  - Use 1×2 subplot: (a) Before fine-tuning, (b) After fine-tuning
+
+  - Panel (a): mixed, overlapping clusters; Panel (b): clean separation
+
+  - Label panels in upper-left corner
+
+
+  No title inside figure.'

@@ -1,0 +1,36 @@
+name: violin
+version: '1.0'
+description: Prompt template for violin chart
+system_prompt: 'Create a VIOLIN PLOT showing full distribution shapes.
+
+
+  STYLING:
+
+  - Use seaborn.violinplot with Okabe-Ito palette
+
+  - inner=''box'' to show quartiles inside the violin
+
+  - cut=0 to limit violin to data range
+
+  - saturation=0.8, alpha=0.85 for visual depth
+
+  - linewidth=0.8 for outlines
+
+
+  OVERLAY:
+
+  - Add individual data points as a swarm/strip overlay (alpha=0.4, size=2)
+
+  - Mark the mean with a horizontal line or triangle marker
+
+
+  ANNOTATIONS:
+
+  - Annotate median/mean values above each violin
+
+  - Add significance brackets if comparing methods
+
+
+  AXES: descriptive labels, remove top+right spines, subtle horizontal grid.
+
+  No title inside figure.'

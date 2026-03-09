@@ -254,6 +254,21 @@ class BaseResearchAgent(ABC):
             cfg, system_prompt, user_prompt, json_mode
         )
 
+    async def generate_with_image(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        json_mode: bool = False,
+        stage_override: StageModelConfig | None = None,
+    ) -> str:
+        """Call the LLM with an image attachment (vision)."""
+        cfg = stage_override if stage_override is not None else self.stage_config
+        return await self._dispatcher.generate_with_image(
+            cfg, system_prompt, user_prompt, image_bytes, mime_type, json_mode
+        )
+
     async def generate_json(
         self,
         system_prompt: str,

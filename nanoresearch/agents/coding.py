@@ -640,110 +640,16 @@ exit $EXIT_CODE
     async def _fix_import_mismatches(self, code_dir: Path, code_plan: dict) -> None:
         """Scan all generated files for cross-file import mismatches and fix them via LLM.
 
-        Checks two patterns:
+        Uses AST-based ImportChecker to detect:
         1. `from X import Y` where Y doesn't exist in X
         2. `import X` + `X.func()` where func doesn't exist in X
         """
-        import re as _re
+        from nanoresearch.agents.import_checker import ImportChecker
 
-        # Collect all defined classes/functions and all imports
-        definitions: dict[str, list[str]] = {}  # filename -> [class/func names]
-        imports: list[dict] = []  # [{importer, module, names}]
-        # Track module-level attribute access: import X; X.func()
-        module_accesses: list[dict] = []  # [{importer, module, attr, line}]
-
-        local_modules = {f.stem for f in code_dir.glob("*.py")}
-
-        for py_file in code_dir.glob("*.py"):
-            content = py_file.read_text(errors="replace")
-            module_name = py_file.stem
-
-            # Find class and top-level function definitions
-            defs = []
-            for m in _re.finditer(r"^(?:class|def)\s+(\w+)", content, _re.MULTILINE):
-                defs.append(m.group(1))
-            definitions[module_name] = defs
-
-            # Find cross-file imports: from X import Y, Z
-            for m in _re.finditer(
-                r"^from\s+(\w+)\s+import\s+(.+)$", content, _re.MULTILINE
-            ):
-                src_module = m.group(1)
-                imported_names = [
-                    n.strip().split(" as ")[0].strip()
-                    for n in m.group(2).split(",")
-                ]
-                imports.append({
-                    "importer": py_file.name,
-                    "module": src_module,
-                    "names": imported_names,
-                })
-
-            # Find `import X` for local modules, then scan for X.attr() calls
-            imported_modules: dict[str, str] = {}  # alias -> real module name
-            for m in _re.finditer(
-                r"^import\s+(\w+)(?:\s+as\s+(\w+))?$", content, _re.MULTILINE
-            ):
-                real_name = m.group(1)
-                alias = m.group(2) or real_name
-                if real_name in local_modules:
-                    imported_modules[alias] = real_name
-
-            # Scan for alias.attribute( calls
-            for alias, real_name in imported_modules.items():
-                for m in _re.finditer(
-                    rf"\b{_re.escape(alias)}\.(\w+)\s*\(", content
-                ):
-                    attr = m.group(1)
-                    # Find line number for better diagnostics
-                    line_no = content[:m.start()].count("\n") + 1
-                    module_accesses.append({
-                        "importer": py_file.name,
-                        "module": real_name,
-                        "attr": attr,
-                        "line": line_no,
-                    })
-
-        # Check for mismatches — Pattern 1: from X import Y
-        mismatches = []
-        for imp in imports:
-            module = imp["module"]
-            if module not in definitions:
-                continue  # external module
-            defined = set(definitions[module])
-            for name in imp["names"]:
-                if name and name not in defined:
-                    mismatches.append({
-                        "importer": imp["importer"],
-                        "module": module,
-                        "missing_name": name,
-                        "available": sorted(defined),
-                    })
-
-        # Check for mismatches — Pattern 2: X.func() where func not in X
-        seen_access = set()
-        for acc in module_accesses:
-            module = acc["module"]
-            if module not in definitions:
-                continue
-            attr = acc["attr"]
-            # Skip Python builtins that might be dynamically added
-            if attr.startswith("_"):
-                continue
-            defined = set(definitions[module])
-            key = (acc["importer"], module, attr)
-            if key in seen_access:
-                continue
-            seen_access.add(key)
-            if attr not in defined:
-                mismatches.append({
-                    "importer": acc["importer"],
-                    "module": module,
-                    "missing_name": attr,
-                    "available": sorted(defined),
-                    "usage_pattern": f"import {module}; {module}.{attr}()",
-                    "line": acc["line"],
-                })
+        checker = ImportChecker(code_dir)
+        mismatches = checker.check_imports()
+        # Filter out syntax_error entries (not actionable by LLM fix)
+        mismatches = [m for m in mismatches if m.get("type") != "syntax_error"]
 
         if not mismatches:
             self.log("Import consistency check passed")

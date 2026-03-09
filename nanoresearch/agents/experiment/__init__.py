@@ -74,145 +74,11 @@ def _decode_bytes(data: bytes | str, limit: int = 0) -> str:
     return text[:limit] if limit else text
 
 
-PROJECT_PLAN_SYSTEM_PROMPT = """You are an ML project architect. Given an experiment blueprint, design a complete, runnable Python project structure.
+from nanoresearch.prompts import load_prompt as _load_prompt
 
-Output a JSON object with:
-{
-  "project_name": "short_snake_case_name",
-  "description": "One-line project description",
-  "python_version": ">=3.9",
-  "dependencies": ["torch>=2.0", "numpy", ...],
-  "files": [
-    {
-      "path": "src/model.py",
-      "description": "Model architecture",
-      "interfaces": [
-        "class ProposedModel(nn.Module): __init__(self, config: dict), forward(self, x: Tensor) -> Tensor",
-        "def build_model(config: dict) -> ProposedModel"
-      ],
-      "depends_on": ["config/default.yaml"]
-    },
-    ...
-  ],
-  "interface_contract": "Full interface contract text listing every class/function signature across all files"
-}
+PROJECT_PLAN_SYSTEM_PROMPT = _load_prompt("experiment", "project_plan")
 
-The project MUST include these files:
-- README.md (with usage instructions)
-- requirements.txt
-- config/default.yaml (hyperparameters and paths, YAML format — use yaml.safe_load() to parse)
-- src/__init__.py
-- src/model.py (complete model architecture)
-- src/dataset.py (data loading and preprocessing)
-- src/trainer.py (training loop with logging)
-- src/evaluate.py (evaluation metrics and visualization)
-- src/utils.py (utility functions)
-- scripts/train.sh (training launch script)
-- scripts/run_ablation.sh (ablation experiment script)
-- main.py (entry point)
-
-IMPORTANT: main.py MUST accept a `--dry-run` flag (via argparse or sys.argv).
-When --dry-run is passed, main.py should:
-  1. Import all dependencies
-  2. Validate configuration / hyperparameters
-  3. Initialize model architecture (without loading pretrained weights)
-  4. Print "Dry run complete" and exit with code 0
-Do NOT perform actual training or data loading during --dry-run.
-
-IMPORTANT: main.py MUST also accept a `--quick-eval` flag for fast evaluation.
-When --quick-eval is passed, main.py should:
-  1. Use a SCALED-DOWN model: divide layers by 4, hidden_dim by 4 (minimum 1 layer, 16 dim)
-  2. Train for only 3-5 epochs
-  3. Use a small data subset: first 500-1000 samples, or generate synthetic data if real data unavailable
-  4. Run evaluation on a validation/test subset
-  5. Run a minimal ablation (at least 2 variants: full model + one ablation)
-  6. Write ALL results to `results/metrics.json` with this EXACT format:
-     {
-       "main_results": [
-         {"method_name": "Ours", "dataset": "DATASET_NAME", "is_proposed": true,
-          "metrics": [{"metric_name": "METRIC", "value": 85.4, "std": 0.3, "num_runs": 3}]},
-         {"method_name": "BASELINE", "dataset": "DATASET_NAME", "is_proposed": false,
-          "metrics": [{"metric_name": "METRIC", "value": 82.1, "std": 0.4, "num_runs": 3}]}
-       ],
-       "ablation_results": [
-         {"variant_name": "Full Model", "metrics": [{"metric_name": "METRIC", "value": 85.4}]},
-         {"variant_name": "w/o Component", "metrics": [{"metric_name": "METRIC", "value": 83.1}]}
-       ],
-       "training_log": [
-         {"epoch": 1, "train_loss": 2.5, "val_loss": 2.3, "metrics": {"METRIC": 78.2}},
-         {"epoch": 2, "train_loss": 1.8, "val_loss": 1.7, "metrics": {"METRIC": 84.5}}
-       ]
-     }
-  7. Use a helper function `save_metrics(results_dict, output_dir="results")` to write the JSON.
-  8. All numeric values MUST come from actual computation, NEVER hardcoded or fabricated.
-
-DEVICE REQUIREMENTS (critical):
-- config/default.yaml MUST include: device: "auto" (auto-detects CUDA/MPS/CPU)
-- main.py device selection: use "cuda" if torch.cuda.is_available(), else "cpu"
-- NEVER default to "cpu" — always prefer GPU when available
-
-WINDOWS COMPATIBILITY (critical):
-- config/default.yaml MUST set: num_workers: 0
-- All DataLoader calls MUST use num_workers=0 (Windows multiprocessing spawn breaks with >0)
-
-QUICK-EVAL PERFORMANCE:
-- --quick-eval MUST use num_runs: 1 (not 3) and at most 200 train samples
-- The goal is finishing in under 5 minutes on a single GPU
-
-REPRODUCIBILITY REQUIREMENTS (critical):
-- config/default.yaml MUST include: random_seed (default 42), num_runs (default 3)
-- main.py MUST set random seeds at startup:
-    random.seed(cfg.seed); np.random.seed(cfg.seed); torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available(): torch.cuda.manual_seed_all(cfg.seed)
-    torch.backends.cudnn.deterministic = True
-- src/trainer.py MUST support running experiments num_runs times with different seeds
-  and report mean ± std for all metrics
-- src/evaluate.py MUST compute per-run metrics and aggregate statistics
-- scripts/run_ablation.sh MUST run each ablation variant num_runs times
-
-Output ONLY valid JSON, no markdown formatting."""
-
-FILE_GEN_SYSTEM_PROMPT = """You are an expert ML engineer. Generate a complete, production-quality file for a research project.
-
-You MUST follow:
-1. The interface contract exactly (same class names, method signatures, types)
-2. Use PyTorch as the ML framework
-3. Include proper imports
-4. Include docstrings for public classes and functions
-5. Handle edge cases and include proper error messages
-6. Mark any truly unimplemented stubs with # TODO comments
-7. If this file is main.py, it MUST handle a --dry-run flag (via argparse or sys.argv).
-   When --dry-run is passed: import deps, validate config, init model, print "Dry run complete", exit 0.
-8. If this file is main.py, it MUST also handle a --quick-eval flag.
-   When --quick-eval is passed:
-   a. Scale down model (layers/4, hidden_dim/4, minimum 1 layer and 16 dim)
-   b. Train for 3-5 epochs on a small data subset (500-1000 samples or synthetic data)
-   c. Evaluate and run minimal ablation (full model + at least 1 variant)
-   d. Write results to results/metrics.json using a save_metrics() helper
-   e. All values MUST come from actual computation — NEVER hardcode or fabricate numbers
-9. REPRODUCIBILITY: Always set random seeds (random, numpy, torch) at program start.
-   Report results as mean ± std from multiple runs. Use deterministic mode for CUDA.
-10. In evaluate.py: compute per-class or per-sample breakdown, save top-5 best and worst
-    predictions for qualitative analysis. Generate confusion matrix if classification task.
-11. Include a save_metrics() utility function (in src/utils.py or main.py) that:
-    - Creates the results/ directory if needed
-    - Writes results/metrics.json with the exact schema required by --quick-eval
-    - Validates that all metric values are real numbers (not NaN or Inf)
-12. CRITICAL: Config files use YAML format (config/default.yaml). Use `yaml.safe_load()` to
-    parse them, NOT `json.load()`. Add `pyyaml` to requirements.txt if needed.
-13. Keep imports consistent: only import from modules that actually exist in the project.
-    The project structure is: main.py, src/{model,dataset,trainer,evaluate,utils}.py, config/default.yaml
-14. DEVICE: Always default to "cuda" when torch.cuda.is_available(), NOT "cpu".
-    Use `torch.device("cuda" if torch.cuda.is_available() else "cpu")`.
-    Never write `config.get("device", "cpu")` — always use `config.get("device", "cuda")`.
-    In config/default.yaml, set `device: auto` or `device: cuda`.
-15. WINDOWS COMPATIBILITY: Set `num_workers: 0` in config/default.yaml and DataLoader calls.
-    On Windows, multiprocessing spawn with num_workers > 0 causes FileNotFoundError in child processes.
-    Always use `num_workers=0` for DataLoader unless explicitly overridden.
-16. QUICK-EVAL SPEED: In --quick-eval mode, use num_runs=1 (not 3) and at most 200 training samples.
-    The goal is to finish in under 5 minutes on a single GPU. Keep the model scaled-down.
-
-Generate ONLY the file content, no markdown formatting, no explanation."""
+FILE_GEN_SYSTEM_PROMPT = _load_prompt("experiment", "file_gen")
 
 
 def _is_finite(value: Any) -> bool:
@@ -672,6 +538,12 @@ class ExperimentAgent(
                     self.log(f"Found {len(import_mismatches)} import mismatches, fixing...")
                     await self._fix_import_mismatches(code_dir, import_mismatches)
 
+                # Phase 2c: Auto-format generated code (optional, non-blocking)
+                await self._format_generated_code(code_dir)
+
+                # Phase 2d: Smoke test (import check, non-blocking)
+                self._generate_and_run_smoke_test(code_dir, generated_files)
+
                 # Legacy code_skeleton.py
                 main_path = code_dir / "main.py"
                 if main_path.exists():
@@ -909,169 +781,98 @@ class ExperimentAgent(
         return result
 
     # ------------------------------------------------------------------
-    # ReAct experiment mode
+    # ReAct experiment mode — prompt loaded from YAML
     # ------------------------------------------------------------------
 
-    _REACT_SYSTEM_PROMPT = """\
-You are an autonomous ML experiment agent. You have full access to the \
-filesystem and shell through your tools. Your job is to implement, run, \
-debug, and collect results for the experiment described in the blueprint.
+    _REACT_SYSTEM_TEMPLATE = _load_prompt("experiment", "react_system")
 
-## Your tools
-- **read_file(path)** — read any file (relative paths resolve against working dir)
-- **write_file(path, content)** — write / create a file
-- **list_dir(path)** — list directory contents
-- **run_command(command, timeout?, workdir?)** — run any shell command (default timeout 120s, max 1800s)
-- **search_files(pattern, path?)** — glob search for files
-- **grep_content(pattern, path?, file_glob?)** — search file contents
+    # ------------------------------------------------------------------
+    # Code quality helpers (Phase 2c/2d)
+    # ------------------------------------------------------------------
 
-## Workflow
+    async def _format_generated_code(self, code_dir: Path) -> None:
+        """Try to auto-format generated code with black. Silently skips on failure."""
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "black", "--quiet", "--line-length", "100",
+                 str(code_dir)],
+                capture_output=True, timeout=30,
+            )
+            self.log("Auto-formatted generated code with black")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            pass  # black not available or timed out — skip silently
 
-### Phase 0: Environment discovery (DO THIS FIRST)
-Run these commands to understand where you are:
-```
-whoami && hostname && pwd
-ldd --version 2>&1 | head -1   # check glibc version (CRITICAL)
-nvidia-smi                      # check GPU availability
-which python && python --version
-conda info --envs               # list conda environments
-sinfo 2>/dev/null               # check if SLURM is available
-which apptainer 2>/dev/null || which singularity 2>/dev/null   # container runtime
-```
+    def _generate_and_run_smoke_test(
+        self, code_dir: Path, file_list: list[str],
+    ) -> None:
+        """Generate and run a smoke test that imports every generated module.
 
-**CRITICAL: Check glibc version FIRST.** Many clusters have old glibc (e.g., 2.17 on CentOS 7).
-Modern PyTorch/CUDA requires glibc >= 2.28. If glibc is too old, you MUST use apptainer
-containers — direct `pip install torch` will fail with `GLIBC_2.xx not found`.
+        Failures are logged as warnings but do not block the pipeline.
+        """
+        # Collect importable module names (exclude test_ files, subdirs, invalid names)
+        modules = []
+        for f in file_list:
+            if not f.endswith(".py"):
+                continue
+            p = Path(f)
+            if p.name.startswith("test_"):
+                continue
+            # Only include top-level .py files (no subdirectory nesting)
+            if "/" in f or "\\" in f:
+                continue
+            mod_name = p.stem
+            # Validate it's a legal Python identifier
+            if not mod_name.isidentifier():
+                continue
+            modules.append(mod_name)
+        if not modules:
+            return
 
-Based on the results, decide:
-- **glibc < 2.28** → you MUST use apptainer container (see Phase 0.5)
-- **glibc >= 2.28** → conda/pip works directly, container optional
-- **SLURM available** → write SLURM batch scripts and `sbatch`
-- **No SLURM** → run training directly with `python`
-- **GPU available** → use CUDA. No GPU → CPU with smaller model/data.
-{conda_env_hint}
-### Phase 0.5: Container setup (when glibc < 2.28)
-{container_config}
+        # Generate test_smoke.py
+        import_lines = []
+        for mod in modules:
+            import_lines.append(
+                f"    try:\n"
+                f"        import {mod}\n"
+                f'        print(f"OK: {mod}")\n'
+                f"    except Exception as e:\n"
+                f'        print(f"FAIL: {mod}: {{e}}")\n'
+                f"        failures.append('{mod}')"
+            )
+        smoke_code = (
+            "#!/usr/bin/env python3\n"
+            '"""Auto-generated smoke test: verify all modules are importable."""\n'
+            "import sys, os\n"
+            f"sys.path.insert(0, {str(code_dir)!r})\n"
+            "os.chdir(sys.path[0])\n\n"
+            "failures = []\n"
+            + "\n".join(import_lines)
+            + "\n\nif failures:\n"
+            '    print(f"SMOKE TEST: {len(failures)} modules failed to import")\n'
+            "    sys.exit(1)\n"
+            "else:\n"
+            '    print("SMOKE TEST: all modules imported OK")\n'
+        )
 
-### Phase 1: Setup environment
-**Decision tree** (pick the FIRST that applies):
-1. **glibc < 2.28** → you MUST use container from Phase 0.5; ALL python/pip via `apptainer exec --nv`
-2. **glibc >= 2.28 + pre-configured conda env with PyTorch** → `conda activate ENV_NAME` (fast)
-3. **glibc >= 2.28 + other conda env** → activate + `pip install torch` (medium)
-4. **glibc >= 2.28 + nothing usable** → create new conda env (last resort)
+        smoke_path = code_dir / "test_smoke.py"
+        smoke_path.write_text(smoke_code, encoding="utf-8")
 
-After choosing:
-- Test that PyTorch imports: `python -c "import torch; print(torch.cuda.is_available())"`
-  (if container: `apptainer exec --nv CONTAINER.sif python -c "import torch; ..."`)
-- Install experiment-specific packages (`pip install -r requirements.txt`, `timeout=600`)
-- Create the experiment directory structure
-
-**IMPORTANT: If container mode, ALL subsequent python/pip commands must be wrapped in
-`apptainer exec --nv -B BINDS CONTAINER.sif bash -c "..."`**
-
-### Phase 2: Write experiment code
-Based on the blueprint, create all necessary files:
-- `main.py` — entry point with argparse (`--quick-eval` for fast run, `--dry-run` for import check)
-- `src/model.py` — model architecture
-- `src/trainer.py` — training loop
-- `src/dataset.py` — data loading
-- `src/evaluate.py` — evaluation metrics
-- `requirements.txt` — dependencies
-- If SLURM: a `.sh` batch script (see template below)
-
-IMPORTANT for `main.py`:
-- Add `--quick-eval` flag: use scaled-down model (layers/4, hidden_dim/4), train 3-5 epochs,
-  use 500-1000 data samples (or synthetic data), run ablation, save to results/metrics.json
-- All metric values MUST come from actual computation, NEVER hardcode
-- Set random seed at startup for reproducibility
-
-### Phase 3: Run the experiment
-- First do a dry-run to check imports: `python main.py --dry-run`
-- Then run quick-eval: `python main.py --quick-eval`
-- If using **container + SLURM**: wrap python command in `apptainer exec` inside sbatch script
-- If SLURM: `sbatch run.sh`, then poll with `squeue -u $(whoami)` every ~30s and read log files
-- If local: run directly or with `nohup` for long jobs
-- For SLURM jobs that take time, use `run_command` with `timeout=300` or higher to poll status
-
-### Phase 4: Debug if it fails
-- Read error logs carefully
-- Fix the bug in the source code
-- Re-run the experiment
-- Repeat until it succeeds or you've tried 5+ different fixes
-
-### Phase 5: Collect results
-- Read `results/metrics.json` (or however results are saved)
-- Report final metrics clearly
-- The experiment is done when you have real metric numbers
-
-## CRITICAL RULES
-1. **Always check your environment first** — don't assume anything
-2. **Start simple** — get a basic version running before adding complexity
-3. **Read error messages carefully** — fix the actual root cause, not symptoms
-4. **Don't give up** — if one approach fails, try another
-5. **Write complete files** — never write partial or placeholder code
-6. **Save results to `results/metrics.json`** — this is the standard output format:
-   ```json
-   {{"main_results": [{{"method_name": "...", "dataset": "...", "is_proposed": true, "metrics": [{{"metric_name": "accuracy", "value": 0.95}}]}}]}}
-   ```
-7. **When using SLURM**: after `sbatch`, use `squeue` to check status, and read the SLURM output file for logs
-8. **Be resourceful** — you can install packages, download data, check documentation, etc.
-9. **Use `timeout` parameter** for long commands: `pip install` (timeout=600), training (timeout=1800), `apptainer pull` (timeout=1800)
-10. **Device**: use CUDA if available, else CPU. NEVER default to CPU when GPU exists.
-11. **Windows**: if on Windows, use `num_workers=0` in DataLoader.
-
-## SLURM batch script template (without container)
-```bash
-#!/bin/bash
-#SBATCH --job-name=experiment
-#SBATCH --partition={{PARTITION}}
-#SBATCH --gres=gpu:1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=4:00:00
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
-
-source activate YOUR_ENV  # or: conda activate YOUR_ENV
-cd $SLURM_SUBMIT_DIR
-
-python main.py --quick-eval
-```
-
-## SLURM batch script template (with apptainer container)
-```bash
-#!/bin/bash
-#SBATCH --job-name=experiment
-#SBATCH --partition={{PARTITION}}
-#SBATCH --gres=gpu:1
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=32G
-#SBATCH --time=4:00:00
-#SBATCH --output=slurm-%j.out
-#SBATCH --error=slurm-%j.err
-
-cd $SLURM_SUBMIT_DIR
-apptainer exec --nv --writable-tmpfs -B {{BIND_MOUNTS}} {{CONTAINER_SIF}} \
-    bash -c "pip install -r requirements.txt -q 2>/dev/null; cd $SLURM_SUBMIT_DIR && python main.py --quick-eval"
-```
-Notes:
-- `--writable-tmpfs` allows pip install inside read-only .sif (writes go to tmpfs)
-- For a pre-built .sif with PyTorch already inside, you can omit `--writable-tmpfs` and `pip install`
-- Adjust `--partition`, `--gres`, `--time`, bind mounts as needed.
-
-## SLURM configuration
-{slurm_config}
-
-## End condition
-You are DONE when you have:
-1. Successfully run the experiment (training completed without errors)
-2. Collected real metric numbers (accuracy, loss, etc.)
-3. Saved results to `results/metrics.json`
-
-When finished, output a FINAL SUMMARY with:
-- What you did
-- Final metrics (exact numbers)
-- Path to results file
-"""
+        # Run smoke test
+        try:
+            result = subprocess.run(
+                [sys.executable, str(smoke_path)],
+                capture_output=True, text=True, timeout=30,
+                cwd=str(code_dir),
+            )
+            if result.returncode == 0:
+                self.log("Smoke test passed: all modules importable")
+            else:
+                stdout = (result.stdout or "").strip()
+                stderr = (result.stderr or "").strip()
+                self.log(f"Smoke test WARNING: {stdout[-200:]}")
+                if stderr:
+                    logger.warning("Smoke test stderr: %s", stderr[:300])
+        except subprocess.TimeoutExpired:
+            self.log("Smoke test WARNING: timed out (30s)")
+        except (OSError, FileNotFoundError) as e:
+            logger.warning("Smoke test failed to run: %s", e)

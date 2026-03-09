@@ -401,6 +401,30 @@ class WritingAgent(
             if label == "sec:method":
                 # Architecture / framework / pipeline figure → top of Method section
                 arch_keywords = ("overview", "framework", "pipeline", "architecture", "model")
+
+                # First: if LLM placed an arch figure but NOT at the top, move it
+                for fk in list(figure_blocks.keys()):
+                    if fk not in placed_figures:
+                        continue
+                    if not any(kw in fk for kw in arch_keywords):
+                        continue
+                    # This arch figure was already placed by LLM — check position
+                    # Extract the figure block from content and move to top
+                    fig_pattern = re.compile(
+                        r'\n*\\begin\{figure\*?\}.*?\\label\{fig:'
+                        + re.escape(fk)
+                        + r'\}.*?\\end\{figure\*?\}\n*',
+                        re.DOTALL,
+                    )
+                    match = fig_pattern.search(content)
+                    if match and match.start() > 200:
+                        # Figure is not near the top — move it
+                        content = content[:match.start()] + content[match.end():]
+                        content = figure_blocks[fk] + "\n\n" + content.lstrip("\n")
+                        self.log(f"  Moved LLM-placed fig:{fk} to top of Method")
+                    break  # only handle one arch figure
+
+                # Then: place unplaced arch figure at top
                 for fk in list(figure_blocks.keys()):
                     if fk in placed_figures:
                         continue

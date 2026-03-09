@@ -652,10 +652,22 @@ class _GroundingMixin:
                 png_name = f"{fig_key}.png"
                 include_name = pdf_name if fig_data.get("pdf_path") else png_name
 
+                # Architecture/framework figures use full width;
+                # result/ablation/chart figures use 0.75 width for better layout
+                _full_width_kws = ("overview", "framework", "pipeline",
+                                   "architecture", "model", "workflow", "diagram")
+                suffix_lower = label_suffix.lower()
+                if any(kw in suffix_lower for kw in _full_width_kws):
+                    fig_width = r"\textwidth"
+                else:
+                    fig_width = r"0.75\textwidth"
+
                 block = (
                     "\\begin{figure}[t!]\n"
                     "\\centering\n"
-                    f"\\includegraphics[width=\\textwidth]{{{include_name}}}\n"
+                    f"\\includegraphics[width={fig_width}, "
+                    f"height=0.32\\textheight, keepaspectratio]"
+                    f"{{{include_name}}}\n"
                     f"\\caption{{{caption}}}\n"
                     f"\\label{{{label}}}\n"
                     "\\end{figure}"
@@ -675,7 +687,7 @@ class _GroundingMixin:
             blocks["results"] = (
                 "\\begin{figure}[t!]\n"
                 "\\centering\n"
-                "\\includegraphics[width=\\textwidth]{fig2_results.pdf}\n"
+                "\\includegraphics[width=0.75\\textwidth]{fig2_results.pdf}\n"
                 "\\caption{Performance comparison.}\n"
                 "\\label{fig:results}\n"
                 "\\end{figure}"
@@ -683,7 +695,7 @@ class _GroundingMixin:
             blocks["ablation"] = (
                 "\\begin{figure}[t!]\n"
                 "\\centering\n"
-                "\\includegraphics[width=\\textwidth]{fig3_ablation.pdf}\n"
+                "\\includegraphics[width=0.75\\textwidth]{fig3_ablation.pdf}\n"
                 "\\caption{Ablation study.}\n"
                 "\\label{fig:ablation}\n"
                 "\\end{figure}"

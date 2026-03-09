@@ -1,0 +1,43 @@
+name: confusion_matrix
+version: '1.0'
+description: Prompt template for confusion_matrix chart
+system_prompt: 'Create a CONFUSION MATRIX heatmap for classification evaluation.
+
+
+  LAYOUT:
+
+  - Square 1:1 aspect ratio, use figure size (7, 6)
+
+  - X-axis: ''Predicted Label'', Y-axis: ''True Label''
+
+  - Class names on both axes, rotated 30-45° on x-axis with ha=''right''
+
+
+  COLORMAP:
+
+  - Use ''Blues'' colormap (white=0%, dark blue=100%)
+
+  - Normalize each row to show percentages (row-wise normalization)
+
+
+  ANNOTATIONS:
+
+  - Each cell: show count or percentage (fontsize=8)
+
+  - Diagonal cells (correct): fontweight=''bold''
+
+  - High off-diagonal values (confusions >5%): highlight with red text
+
+  - Low values (<2%): use light gray text to reduce visual clutter
+
+
+  STYLING:
+
+  - Use seaborn.heatmap with linewidths=0.5, linecolor=''white''
+
+  - Colorbar on right labeled ''Accuracy (%)'' or ''Count''
+
+  - Add overall accuracy annotation: ''Overall: XX.X%'' in upper-right corner
+
+
+  No title inside figure.'

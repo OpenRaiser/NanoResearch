@@ -31,7 +31,7 @@ def test_run_uses_unified_deep_workspace() -> None:
             patch("nanoresearch.cli._load_config_safe", return_value=config),
             patch("nanoresearch.cli.Workspace.create", return_value=workspace) as create_mock,
             patch("nanoresearch.cli.UnifiedPipelineOrchestrator", return_value=fake_orchestrator) as orchestrator_cls,
-            patch("nanoresearch.cli._run_deep_pipeline", AsyncMock(return_value={"ok": True})),
+            patch("nanoresearch.cli._run_deep_pipeline", MagicMock(return_value={"ok": True})),
             patch("nanoresearch.cli.asyncio.run", return_value={"ok": True}),
             patch("nanoresearch.cli._print_result"),
         ):

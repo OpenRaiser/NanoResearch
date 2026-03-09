@@ -14,6 +14,8 @@ class SectionReview(BaseModel):
     score: int = Field(ge=1, le=10, description="Quality score 1-10")
     issues: list[str] = Field(default_factory=list, description="Identified issues")
     suggestions: list[str] = Field(default_factory=list, description="Improvement suggestions")
+    strengths: list[str] = Field(default_factory=list, description="Section strengths to preserve during revision")
+    score_justification: str = Field(default="", description="Brief justification for the score")
 
     @field_validator("section", mode="before")
     @classmethod
