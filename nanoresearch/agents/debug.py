@@ -153,8 +153,8 @@ class DebugAgent(BaseResearchAgent):
                 if f.is_file() and f.stat().st_size < 100_000:  # skip huge files
                     try:
                         sources[f.name] = f.read_text(errors="replace")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed to read source snapshot %s: %s", f, exc)
         return sources
 
     async def _diagnose_and_patch(

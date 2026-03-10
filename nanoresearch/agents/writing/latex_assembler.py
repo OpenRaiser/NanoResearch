@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,122 @@ from nanoresearch.schemas.paper import PaperSkeleton
 from . import _escape_latex_text
 
 MAX_LATEX_FIX_ATTEMPTS = 3
+
+_TEXT_ARGUMENT_COMMANDS = (
+    "title",
+    "caption",
+    "section",
+    "subsection",
+    "subsubsection",
+    "paragraph",
+    "author",
+)
+
+_SYNTAX_HEAVY_ENVIRONMENTS = {
+    "tabular",
+    "tabular*",
+    "array",
+    "align",
+    "align*",
+    "equation",
+    "equation*",
+    "gather",
+    "gather*",
+    "multline",
+    "multline*",
+    "eqnarray",
+    "eqnarray*",
+    "verbatim",
+    "lstlisting",
+    "minted",
+    "tikzpicture",
+}
+
+
+def _find_matching_brace(text: str, open_brace_index: int) -> int | None:
+    """Find the matching closing brace for ``text[open_brace_index] == '{'``."""
+    if open_brace_index < 0 or open_brace_index >= len(text) or text[open_brace_index] != "{":
+        return None
+
+    depth = 0
+    escape = False
+    for index in range(open_brace_index, len(text)):
+        ch = text[index]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return index
+    return None
+
+
+def _sanitize_command_text_argument(text: str, command: str) -> str:
+    """Escape plain-text special chars inside a command's main text argument."""
+    pattern = re.compile(rf"\\{command}(?:\[[^\]]*\])?\{{")
+    result: list[str] = []
+    cursor = 0
+
+    while True:
+        match = pattern.search(text, cursor)
+        if not match:
+            result.append(text[cursor:])
+            break
+
+        open_brace_index = match.end() - 1
+        close_brace_index = _find_matching_brace(text, open_brace_index)
+        if close_brace_index is None:
+            result.append(text[cursor:])
+            break
+
+        result.append(text[cursor:match.end()])
+        body = text[match.end():close_brace_index]
+        result.append(_escape_latex_text(body))
+        result.append("}")
+        cursor = close_brace_index + 1
+
+    return "".join(result)
+
+
+def _update_environment_stack(line: str, env_stack: list[str]) -> None:
+    """Track LaTeX environments while scanning document lines."""
+    for match in re.finditer(r"\\begin\{([^}]+)\}", line):
+        env_stack.append(match.group(1))
+    for match in re.finditer(r"\\end\{([^}]+)\}", line):
+        env_name = match.group(1)
+        for idx in range(len(env_stack) - 1, -1, -1):
+            if env_stack[idx] == env_name:
+                del env_stack[idx]
+                break
+
+
+def _sanitize_prose_line(line: str, env_stack: list[str]) -> str:
+    """Escape unsafe prose characters without touching syntax-heavy blocks."""
+    result = line
+    for command in _TEXT_ARGUMENT_COMMANDS:
+        result = _sanitize_command_text_argument(result, command)
+
+    stripped = result.lstrip()
+    if not stripped or stripped.startswith("%"):
+        return result
+    if any(env in _SYNTAX_HEAVY_ENVIRONMENTS for env in env_stack):
+        return result
+
+    item_match = re.match(r"^(\s*\\item(?:\[[^\]]*\])?\s*)(.*)$", result)
+    if item_match:
+        prefix, body = item_match.groups()
+        return f"{prefix}{_escape_latex_text(body)}"
+
+    if not stripped.startswith("\\"):
+        return _escape_latex_text(result)
+
+    return result
 
 
 class _LaTeXAssemblerMixin:
@@ -134,13 +251,9 @@ class _LaTeXAssemblerMixin:
 
             if attempt >= max_fix_attempts:
                 self.log(f"PDF compilation failed after {max_fix_attempts} fix attempts")
-                # Restore backup on total failure
-                if backup_path.exists():
-                    try:
-                        shutil.copy2(backup_path, tex_path)
-                        self.log("  Restored original tex from backup")
-                    except OSError:
-                        pass
+                # Keep the partially-fixed version rather than restoring backup.
+                # The backup (original) also can't compile, so restoring it
+                # would just lose any successful intermediate fixes.
                 return result
 
             # Ask LLM to fix the LaTeX
@@ -240,6 +353,7 @@ class _LaTeXAssemblerMixin:
                 return None
             return latex_fixer.apply_edits(
                 tex_source, edits, log_fn=self.log,
+                search_window=(win_start, win_end),
             )
         except Exception as exc:
             self.log(f"  Level 2 search-replace fix failed: {exc}")
@@ -310,9 +424,20 @@ class _LaTeXAssemblerMixin:
             if stripped.startswith("%"):
                 fixed_lines.append(line)
                 continue
-            fixed_line = re.sub(r'(?<!\\)(\d)%', r'\1\\%', line)
-            fixed_lines.append(fixed_line)
+            if r'\url{' in line or r'\href{' in line:
+                fixed_lines.append(line)
+            else:
+                fixed_line = re.sub(r'(?<!\\)(\d)%', r'\1\\%', line)
+                fixed_lines.append(fixed_line)
         text = "\n".join(fixed_lines)
+
+        # ── 2b. Escape prose-only special chars in lines / captions / titles ──
+        env_stack: list[str] = []
+        sanitized_lines: list[str] = []
+        for line in text.split("\n"):
+            sanitized_lines.append(_sanitize_prose_line(line, env_stack))
+            _update_environment_stack(line, env_stack)
+        text = "\n".join(sanitized_lines)
 
         # ── 3. Normalize figure placement ──
         # Use [t!] instead of [H] to let LaTeX optimize float placement.

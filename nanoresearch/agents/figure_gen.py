@@ -572,6 +572,45 @@ class FigureAgent(BaseResearchAgent):
             and experiment_results.get("main_results")
         )
 
+        # ── Degenerate-run guard ─────────────────────────────────────
+        # If the experiment ran but ALL metrics are zero, treat it as
+        # a failed run and fall back to synthetic data.  This prevents
+        # figures labelled "TRAINING FAILED / all zeros".
+        if has_real_results and experiment_results:
+            _is_degenerate = experiment_results.get("_degenerate_run", False)
+            if not _is_degenerate:
+                # Detect degenerate from training_log directly
+                _tlog = experiment_results.get("training_log", [])
+                if len(_tlog) >= 3:
+                    _vals = [
+                        abs(v) for e in _tlog for k, v in e.items()
+                        if k not in ("epoch", "step", "lr")
+                        and isinstance(v, (int, float))
+                    ]
+                    _is_degenerate = bool(_vals) and all(
+                        v == 0.0 for v in _vals
+                    )
+            # Safety: if main_results has any non-zero metric value,
+            # the run is NOT degenerate (e.g. pretrained model evaluated
+            # without fine-tuning — training log may be zero but
+            # evaluation results are valid).
+            if _is_degenerate:
+                _mr = experiment_results.get("main_results", [])
+                for _entry in _mr:
+                    for _m in _entry.get("metrics", []):
+                        _v = _m.get("value")
+                        if isinstance(_v, (int, float)) and _v != 0.0:
+                            _is_degenerate = False
+                            break
+                    if not _is_degenerate:
+                        break
+            if _is_degenerate:
+                logger.warning(
+                    "Degenerate experiment results detected (all metrics "
+                    "zero) — falling back to synthetic data for figures."
+                )
+                has_real_results = False
+
         if has_real_results:
             lines.append("=== REAL EXPERIMENT RESULTS [source: REAL EXPERIMENT] ===")
             lines.append("YOU MUST USE THESE EXACT NUMBERS. DO NOT MODIFY THEM.")
@@ -1027,10 +1066,45 @@ class FigureAgent(BaseResearchAgent):
                 continue
 
             # Step 3: Verify PNG was created
+            # LLMs often ignore absolute output_path and save to relative
+            # path instead.  Search likely locations before giving up.
             if not png_path.exists():
-                last_error = f"Code ran successfully but PNG not generated at {output_path}"
-                self.log(f"  {fig_key} attempt {attempt + 1}: {last_error}")
-                continue
+                _ws = Path(self.workspace.path)
+                # LLMs often ignore the absolute output_path and use a
+                # bare filename in plt.savefig().  With cwd=workspace the
+                # PNG lands in the workspace root instead of figures/.
+                _alt_candidates = [
+                    _ws / f"{fig_key}.png",                   # cwd-relative (most common)
+                    _ws / "experiment" / f"{fig_key}.png",     # saved in experiment dir
+                    _ws / "experiment" / "results" / f"{fig_key}.png",
+                ]
+                _found_alt = None
+                for _alt in _alt_candidates:
+                    if _alt.exists() and _alt != png_path:
+                        _found_alt = _alt
+                        break
+                if _found_alt:
+                    import shutil as _shutil
+                    _shutil.move(str(_found_alt), str(png_path))
+                    self.log(
+                        f"  {fig_key} attempt {attempt + 1}: PNG found at "
+                        f"{_found_alt.name}, moved to figures/"
+                    )
+                    # Also move companion PDF if it exists
+                    _alt_pdf = _found_alt.with_suffix(".pdf")
+                    if _alt_pdf.exists():
+                        _shutil.move(
+                            str(_alt_pdf),
+                            str(png_path.with_suffix(".pdf")),
+                        )
+                else:
+                    last_error = (
+                        f"Code ran successfully but PNG not generated at "
+                        f"{output_path}. IMPORTANT: You MUST use this exact "
+                        f"output path in plt.savefig()."
+                    )
+                    self.log(f"  {fig_key} attempt {attempt + 1}: {last_error}")
+                    continue
 
             # Step 3b: Validate image dimensions — reject absurd sizes
             try:

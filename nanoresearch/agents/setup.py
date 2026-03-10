@@ -474,8 +474,8 @@ Return a JSON object with:
                     try:
                         content = Path(f).read_text(errors="replace")[:2000]
                         key_snippets.append({"file": f, "content": content})
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        logger.debug("Failed to read repo snippet %s: %s", f, exc)
                     if len(key_snippets) >= 5:
                         break
 

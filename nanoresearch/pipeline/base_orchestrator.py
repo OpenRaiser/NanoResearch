@@ -53,10 +53,9 @@ class BaseOrchestrator(ABC):
         self.cost_tracker = CostTracker()
         self.progress_emitter = ProgressEmitter(workspace.path / "progress.json")
 
-        sm_mode = self._PIPELINE_MODE or PipelineMode.STANDARD
-        sm_kwargs: dict[str, Any] = {"mode": sm_mode} if self._PIPELINE_MODE else {}
         self.state_machine = PipelineStateMachine(
-            workspace.manifest.current_stage, **sm_kwargs
+            workspace.manifest.current_stage,
+            mode=self._PIPELINE_MODE or PipelineMode.STANDARD,
         )
 
         self._agents: dict[PipelineStage, BaseResearchAgent] = self._build_agents()
@@ -147,6 +146,16 @@ class BaseOrchestrator(ABC):
                 # Skip stages configured to be skipped
                 if stage.value in self.config.skip_stages:
                     logger.info("Skipping stage %s (configured in skip_stages)", stage.value)
+                    if self.state_machine.current != stage:
+                        if self.state_machine.can_transition(stage):
+                            self.state_machine.transition(stage)
+                        else:
+                            logger.warning(
+                                "Skipping stage %s from non-adjacent state %s",
+                                stage.value,
+                                self.state_machine.current.value,
+                            )
+                    self.workspace.update_manifest(current_stage=stage)
                     self._report_progress(
                         stage.value, "skipped",
                         f"[{stage_idx+1}/{len(stages)}] {stage.value} skipped by config",

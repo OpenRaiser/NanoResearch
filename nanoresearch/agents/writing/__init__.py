@@ -158,27 +158,208 @@ PAPER_SECTIONS = [
 ]
 
 
+_LATEX_TEXT_ESCAPES = {
+    "&": r"\&",
+    "%": r"\%",
+    "#": r"\#",
+    "_": r"\_",
+    "^": r"\^{}",
+    "~": r"\~{}",
+}
+
+
+_IDENTIFIER_COMMANDS = frozenset({
+    "ref", "eqref", "autoref", "nameref", "pageref",
+    "label",
+    "cite", "citet", "citep", "citealp", "citeauthor", "citeyear",
+    "bibliography", "bibliographystyle",
+    "input", "include", "includegraphics",
+    "url",
+})
+
+
 def _escape_latex_text(text: str) -> str:
     """Escape LaTeX special characters in plain text (captions, method names, etc.).
 
-    If the text already contains LaTeX commands (backslash + alpha sequence),
-    it is returned as-is to avoid double-escaping things like ``$\\alpha$-Net``.
+    Preserves existing LaTeX commands and already-escaped sequences while still
+    escaping bare special characters in surrounding prose.
+    Reference-type commands (\\ref, \\label, \\cite, etc.) have their braced
+    arguments preserved verbatim since they contain identifiers, not prose.
     """
     if not isinstance(text, str):
         text = str(text)
-    # If text already looks like it contains LaTeX commands, leave it alone
-    if '\\' in text and re.search(r'\\[a-zA-Z]+', text):
-        return text
-    # Order matters: backslash first, then others
-    text = text.replace("\\", "\\textbackslash{}")
-    for ch, esc in [
-        ("&", "\\&"), ("%", "\\%"), ("$", "\\$"),
-        ("#", "\\#"), ("_", "\\_"), ("^", "\\^{}"),
-        ("~", "\\~{}"),
-    ]:
-        text = text.replace(ch, esc)
-    return text
 
+    result: list[str] = []
+    i = 0
+    in_math = False
+    preservable_after_backslash = set(r"\$%#&_{}~^()[]")
+
+    while i < len(text):
+        ch = text[i]
+
+        if ch == "\\":
+            if i + 1 >= len(text):
+                result.append(r"\textbackslash{}")
+                break
+
+            next_char = text[i + 1]
+            if next_char.isalpha():
+                j = i + 2
+                while j < len(text) and text[j].isalpha():
+                    j += 1
+                cmd_name = text[i + 1:j]
+                result.append(text[i:j])
+                i = j
+
+                # For identifier commands, preserve {…} arguments verbatim
+                # (underscores in \ref{fig:my_fig} are identifiers, not prose)
+                if cmd_name in _IDENTIFIER_COMMANDS:
+                    # Skip optional [...]
+                    while i < len(text) and text[i] == '[':
+                        close_bracket = text.find(']', i)
+                        if close_bracket == -1:
+                            break
+                        result.append(text[i:close_bracket + 1])
+                        i = close_bracket + 1
+                    # Preserve {…} argument
+                    if i < len(text) and text[i] == '{':
+                        depth = 0
+                        k = i
+                        while k < len(text):
+                            if text[k] == '{':
+                                depth += 1
+                            elif text[k] == '}':
+                                depth -= 1
+                                if depth == 0:
+                                    result.append(text[i:k + 1])
+                                    i = k + 1
+                                    break
+                            k += 1
+                        else:
+                            # Unmatched brace — just append what we have
+                            result.append(text[i:])
+                            i = len(text)
+                continue
+
+            if next_char in preservable_after_backslash:
+                result.append(text[i:i + 2])
+                i += 2
+                continue
+
+            result.append(r"\textbackslash{}")
+            i += 1
+            continue
+
+        if ch == "$":
+            if in_math:
+                result.append(ch)
+                in_math = False
+            else:
+                has_closing_dollar = False
+                j = i + 1
+                escaped = False
+                while j < len(text):
+                    lookahead = text[j]
+                    if escaped:
+                        escaped = False
+                    elif lookahead == "\\":
+                        escaped = True
+                    elif lookahead == "$":
+                        has_closing_dollar = True
+                        break
+                    j += 1
+                if has_closing_dollar:
+                    result.append(ch)
+                    in_math = True
+                else:
+                    result.append(r"\$")
+            i += 1
+            continue
+
+        if in_math:
+            result.append(ch)
+            i += 1
+            continue
+
+        result.append(_LATEX_TEXT_ESCAPES.get(ch, ch))
+        i += 1
+
+    return "".join(result)
+
+
+
+def _check_global_consistency(
+    latex_content: str,
+    abstract: str,
+    sections: list[Section],
+) -> list[str]:
+    """Post-generation consistency check across all sections.
+
+    Returns list of issue strings.  Non-blocking — issues are logged
+    and passed to REVIEW for optional fixing.
+    """
+    issues: list[str] = []
+
+    # ── 1. Broken cross-references (\ref without matching \label) ──
+    refs = set(re.findall(r'\\(?:ref|eqref|autoref)\{([^}]+)\}', latex_content))
+    labels = set(re.findall(r'\\label\{([^}]+)\}', latex_content))
+    for ref in sorted(refs - labels):
+        issues.append(f"\\ref{{{ref}}} has no matching \\label (will show '??' in PDF)")
+
+    # ── 2. Duplicate labels (causes LaTeX error) ──
+    all_labels = re.findall(r'\\label\{([^}]+)\}', latex_content)
+    seen: set[str] = set()
+    for lbl in all_labels:
+        if lbl in seen:
+            issues.append(f"Duplicate \\label{{{lbl}}} — LaTeX will error or mis-link")
+        seen.add(lbl)
+
+    # ── 3. Abstract percentage numbers must appear somewhere in body ──
+    if abstract:
+        abstract_pcts = set(re.findall(r'(\d+\.?\d*)\s*\\?%', abstract))
+        # Get body text (everything except abstract)
+        body_text = "\n".join(sec.content for sec in sections)
+        for num in sorted(abstract_pcts):
+            if num not in body_text:
+                issues.append(
+                    f"Abstract claims {num}\\% but this number does not appear "
+                    f"in any body section — possible fabrication"
+                )
+
+    # ── 4. Contribution bullet count sanity ──
+    for sec in sections:
+        if sec.label == "sec:intro":
+            itemize_blocks = re.findall(
+                r'\\begin\{itemize\}(.*?)\\end\{itemize\}',
+                sec.content, re.DOTALL,
+            )
+            for block in itemize_blocks:
+                n_items = len(re.findall(r'\\item', block))
+                if n_items > 5:
+                    issues.append(
+                        f"Introduction has {n_items} \\item entries — "
+                        f"consider merging to 2-4 contributions"
+                    )
+            break
+
+    # ── 5. Floats (figure/table) without \label are unreferenceable ──
+    for env in ("figure", "figure*", "table", "table*"):
+        escaped = re.escape(env)
+        blocks = re.findall(
+            rf'\\begin\{{{escaped}\}}(.*?)\\end\{{{escaped}\}}',
+            latex_content, re.DOTALL,
+        )
+        for block in blocks:
+            if r'\label{' not in block:
+                # Extract caption for identification
+                cap = re.search(r'\\caption\{([^}]{0,60})', block)
+                hint = cap.group(1) if cap else "(no caption)"
+                issues.append(
+                    f"A {env} environment has no \\label — cannot be cross-referenced: "
+                    f"{hint}..."
+                )
+
+    return issues
 
 
 from .context_builder import _ContextBuilderMixin
@@ -616,6 +797,15 @@ class WritingAgent(
         # Log citation quality report
         self._log_citation_report(citation_report)
 
+        # Step 6e: Global consistency check
+        consistency_issues = _check_global_consistency(
+            latex_content, abstract, sections,
+        )
+        if consistency_issues:
+            self.log(f"Consistency check: {len(consistency_issues)} issue(s) found")
+            for issue in consistency_issues:
+                self.log(f"  - {issue}")
+
         # Save outputs
         tex_path = self.workspace.write_text("drafts/paper.tex", latex_content)
         bib_content = self._sanitize_bibtex(bibtex)
@@ -636,6 +826,7 @@ class WritingAgent(
             "tex_path": str(tex_path),
             "bib_path": str(bib_path),
             "grounding": grounding.to_output_dict(),
+            "consistency_issues": consistency_issues,
         }
         if "pdf_path" in pdf_result:
             result["pdf_path"] = pdf_result["pdf_path"]

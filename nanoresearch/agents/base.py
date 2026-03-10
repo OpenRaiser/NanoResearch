@@ -127,31 +127,17 @@ def _fix_json_escapes(text: str) -> str:
     return ''.join(result)
 
 
-def _repair_truncated_json(text: str) -> str | None:
-    """Attempt to repair JSON that was truncated by output token limit.
-
-    Strategy: close any open strings, arrays, and objects from the end.
-    """
-    # Only try if it looks like it starts as valid JSON
-    stripped = text.strip()
-    if not stripped or stripped[0] not in ('{', '['):
+def _extract_balanced_json_segment(text: str, start: int) -> str | None:
+    """Extract a balanced JSON object/array substring starting at ``start``."""
+    if start < 0 or start >= len(text) or text[start] not in "{[":
         return None
 
-    # Remove trailing incomplete key-value or comma
-    import re
-    stripped = re.sub(r',\s*$', '', stripped)
-    # Remove trailing incomplete string (unmatched quote)
-    if stripped.count('"') % 2 != 0:
-        # Find last quote and truncate everything after it
-        last_quote = stripped.rfind('"')
-        if last_quote > 0:
-            stripped = stripped[:last_quote + 1]
-
-    # Count unmatched brackets/braces
-    stack = []
+    stack: list[str] = []
     in_string = False
     escape = False
-    for ch in stripped:
+
+    for index in range(start, len(text)):
+        ch = text[index]
         if escape:
             escape = False
             continue
@@ -163,22 +149,144 @@ def _repair_truncated_json(text: str) -> str | None:
             continue
         if in_string:
             continue
-        if ch in ('{', '['):
+        if ch in "{[":
             stack.append(ch)
         elif ch == '}' and stack and stack[-1] == '{':
             stack.pop()
         elif ch == ']' and stack and stack[-1] == '[':
             stack.pop()
+        elif ch in '}]':
+            return None
+        if not stack:
+            return text[start:index + 1].strip()
+    return None
 
-    if not stack:
-        return stripped  # Already balanced
 
-    # Close in reverse order
+def _extract_json_candidates(text: str) -> list[str]:
+    """Return likely JSON substrings from raw LLM output."""
+    stripped = text.strip()
+    if not stripped:
+        return []
+
+    candidates: list[str] = []
+
+    def _add(candidate: str | None) -> None:
+        if candidate is None:
+            return
+        value = candidate.strip()
+        if value and value not in candidates:
+            candidates.append(value)
+
+    _add(stripped)
+
+    for match in re.finditer(r"```(?:json|JSON|javascript|js)?\s*([\s\S]*?)```", stripped):
+        block = match.group(1).strip()
+        if block.startswith("{") or block.startswith("["):
+            _add(block)
+
+    start_count = 0
+    for index, ch in enumerate(stripped):
+        if ch not in "{[":
+            continue
+        start_count += 1
+        if start_count > 20:
+            break
+        _add(_extract_balanced_json_segment(stripped, index))
+        tail = stripped[index:].strip()
+        if tail.startswith("{") or tail.startswith("["):
+            _add(tail)
+
+    return candidates
+
+
+def _scan_json_fragment(
+    text: str,
+) -> tuple[list[tuple[str, int]], bool, bool, int | None]:
+    """Scan a possibly truncated JSON fragment."""
+    stack: list[tuple[str, int]] = []
+    in_string = False
+    escape = False
+    last_comma_index: int | None = None
+
+    for index, ch in enumerate(text):
+        if escape:
+            escape = False
+            continue
+        if ch == '\\' and in_string:
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch in "{[":
+            stack.append((ch, index))
+        elif ch == '}' and stack and stack[-1][0] == '{':
+            stack.pop()
+        elif ch == ']' and stack and stack[-1][0] == '[':
+            stack.pop()
+        elif ch == ',':
+            last_comma_index = index
+
+    return stack, in_string, escape, last_comma_index
+
+
+def _close_json_fragment(text: str) -> str:
+    """Close open string/bracket state for a truncated JSON fragment."""
+    candidate = re.sub(r',\s*$', '', text.strip())
+    stack, in_string, escape, _ = _scan_json_fragment(candidate)
+
+    if escape and in_string:
+        candidate += '\\'
+        stack, in_string, _, _ = _scan_json_fragment(candidate)
+    if in_string:
+        candidate += '"'
+        stack, _, _, _ = _scan_json_fragment(candidate)
+
     closers = {'[': ']', '{': '}'}
-    for bracket in reversed(stack):
-        stripped += closers.get(bracket, '')
+    for opener, _ in reversed(stack):
+        candidate += closers[opener]
 
-    return stripped
+    return re.sub(r',\s*([}\]])', r'\1', candidate)
+
+
+def _trim_json_fragment(text: str) -> str | None:
+    """Trim the last incomplete JSON element from a fragment."""
+    candidate = text.rstrip()
+    if not candidate:
+        return None
+
+    stack, _, _, last_comma_index = _scan_json_fragment(candidate)
+    if last_comma_index is not None:
+        return candidate[:last_comma_index]
+    if stack:
+        return candidate[:stack[-1][1] + 1]
+    return None
+
+
+def _repair_truncated_json(text: str) -> str | None:
+    """Attempt to repair JSON that was truncated by output token limit.
+
+    Strategy: close any open strings, arrays, and objects from the end.
+    """
+    # Only try if it looks like it starts as valid JSON
+    stripped = text.strip()
+    if not stripped or stripped[0] not in ('{', '['):
+        return None
+
+    candidate = stripped
+    for _ in range(12):
+        repaired = _close_json_fragment(candidate)
+        try:
+            json.loads(repaired, strict=False)
+            return repaired
+        except json.JSONDecodeError:
+            trimmed = _trim_json_fragment(candidate)
+            if not trimmed or trimmed == candidate:
+                return repaired
+            candidate = trimmed
+    return _close_json_fragment(candidate)
 
 
 def _json_error_msg(text: str) -> str:
@@ -283,47 +391,37 @@ class BaseResearchAgent(ABC):
             system_prompt, user_prompt, json_mode=True,
             stage_override=stage_override,
         )
-        # Try to extract JSON from markdown code blocks if present
-        text = raw.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            # Remove opening fence (e.g. ```json, ```python, ```)
-            lines = lines[1:]
-            # Remove only the last closing fence (not all triple-backtick lines)
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
-        # First try strict parsing
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # Fix LaTeX backslash escapes and retry with strict=False
-        # (strict=False allows raw control characters like \n \t inside strings)
-        fixed = _fix_json_escapes(text)
-        try:
-            return json.loads(fixed, strict=False)
-        except json.JSONDecodeError:
-            pass
-
-        # Attempt to repair truncated JSON (output cut off by token limit)
-        repaired = _repair_truncated_json(fixed)
-        if repaired is not None:
+        last_attempt = raw.strip()
+        for text in _extract_json_candidates(raw):
+            last_attempt = text
             try:
-                return json.loads(repaired, strict=False)
+                return json.loads(text)
             except json.JSONDecodeError:
                 pass
+
+            fixed = _fix_json_escapes(text)
+            last_attempt = fixed
+            try:
+                return json.loads(fixed, strict=False)
+            except json.JSONDecodeError:
+                pass
+
+            repaired = _repair_truncated_json(fixed)
+            if repaired is not None and repaired != fixed:
+                last_attempt = repaired
+                try:
+                    return json.loads(repaired, strict=False)
+                except json.JSONDecodeError:
+                    pass
 
         # All attempts failed
         logger.error(
             "JSON parse failed even after escape fixing. First 500 chars: %s",
-            fixed[:500],
+            last_attempt[:500],
         )
         raise LLMError(
             f"LLM output is not valid JSON: "
-            f"{_json_error_msg(fixed)}. "
+            f"{_json_error_msg(last_attempt)}. "
             f"Raw output starts with: {raw[:200]!r}"
         ) from None
 

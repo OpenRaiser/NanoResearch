@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -384,6 +385,10 @@ class Workspace:
         fig_dest = dest / "figures"
         if self.figures_dir.exists() and any(self.figures_dir.iterdir()):
             shutil.copytree(self.figures_dir, fig_dest, dirs_exist_ok=True)
+        _prepare_exported_paper_tex(
+            dest / "paper.tex",
+            has_figures=fig_dest.exists() and any(fig_dest.iterdir()),
+        )
 
         # Copy code (skip .venv, __pycache__, node_modules to avoid long paths on Windows)
         code_dest = dest / "code"
@@ -441,6 +446,56 @@ def _copy_if_exists(src: Path, dst: Path) -> None:
             shutil.copy2(src, dst)
         except OSError as exc:
             logger.warning("Failed to copy %s -> %s: %s", src, dst, exc)
+
+
+def _prepare_exported_paper_tex(tex_path: Path, has_figures: bool) -> None:
+    """Make exported ``paper.tex`` self-contained relative to the export root."""
+    if not tex_path.is_file():
+        return
+
+    try:
+        tex = tex_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to read exported LaTeX %s: %s", tex_path, exc)
+        return
+
+    updated = tex
+    uses_graphics = r"\includegraphics" in updated
+    has_graphicspath = r"\graphicspath" in updated
+    has_graphicx = re.search(
+        r"\\usepackage(?:\[[^\]]*\])?\{[^}]*\bgraphicx\b[^}]*\}",
+        updated,
+    ) is not None
+
+    if uses_graphics and not has_graphicx:
+        updated = _insert_into_preamble(updated, r"\usepackage{graphicx}")
+    if uses_graphics and has_figures and not has_graphicspath:
+        updated = _insert_into_preamble(updated, r"\graphicspath{{figures/}}")
+
+    if updated == tex:
+        return
+
+    try:
+        tex_path.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Failed to update exported LaTeX %s: %s", tex_path, exc)
+
+
+def _insert_into_preamble(tex: str, snippet: str) -> str:
+    """Insert a LaTeX preamble snippet before ``\\begin{document}``."""
+    if snippet in tex:
+        return tex
+
+    marker = r"\begin{document}"
+    index = tex.find(marker)
+    line = f"{snippet}\n"
+    if index == -1:
+        return f"{line}{tex}"
+
+    prefix = tex[:index]
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    return f"{prefix}{line}{tex[index:]}"
 
 
 def _count_lines(path: Path) -> int:

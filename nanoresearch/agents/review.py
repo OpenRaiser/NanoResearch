@@ -2099,6 +2099,7 @@ Return JSON:
                 return None
             return latex_fixer.apply_edits(
                 tex_source, edits, log_fn=self.log,
+                search_window=(win_start, win_end),
             )
         except Exception as exc:
             self.log(f"  Level 2 search-replace fix failed: {exc}")

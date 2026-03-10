@@ -36,6 +36,29 @@ def analyze_training_dynamics(training_log: list[dict]) -> dict:
         )
         return result
 
+    # ── Degenerate-run detection ──────────────────────────────────
+    # All-zero metrics across ALL epochs = silent training failure.
+    _all_zero = (
+        all(v == 0.0 for v in val_losses)
+        and all(v == 0.0 for v in train_losses)
+    )
+    if _all_zero:
+        result["degenerate_run"] = True
+        result["degenerate_reason"] = (
+            "All train_loss and val_loss values are exactly 0.0 across "
+            f"{len(val_losses)} epochs. This almost certainly indicates a "
+            "silent training failure — e.g. every batch raised an exception "
+            "that was caught and silently skipped (common cause: key-name "
+            "mismatch between dataset __getitem__ output and model.forward() "
+            "signature). The model did NOT learn anything."
+        )
+        result["convergence_epoch"] = -1
+        result["best_epoch"] = -1
+        result["best_val_loss"] = 0.0
+        result["overfitting_detected"] = False
+        result["loss_stability"] = "degenerate"
+        return result
+
     # 1. Convergence speed
     initial = val_losses[0]
     final_best = min(val_losses)

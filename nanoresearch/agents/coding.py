@@ -351,8 +351,8 @@ Design a runnable project. Return JSON:
                 try:
                     content = Path(source_file).read_text(errors="replace")[:3000]
                     reference_code += f"\n# Reference from {source_file}:\n{content}\n"
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to read reference code from %s: %s", source_file, exc)
         if len(reference_code) > 8000:
             reference_code = reference_code[:8000]
 

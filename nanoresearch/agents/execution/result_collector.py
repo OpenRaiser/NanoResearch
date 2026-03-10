@@ -488,8 +488,8 @@ class _ResultCollectorMixin:
                 try:
                     content = results_file.read_text(errors="replace")[:5000]
                     results[f"result_file_{results_file.name}"] = content
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Failed to read result artifact %s: %s", results_file, exc)
 
         checkpoints = (
             list((code_dir / "checkpoints").glob("*.pt"))

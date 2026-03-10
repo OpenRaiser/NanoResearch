@@ -287,8 +287,9 @@ class _QuickEvalMixin:
             converted: dict = {}
             for item in variants:
                 if isinstance(item, dict):
-                    name = item.pop("name", item.pop("variant_name", f"variant_{len(converted)}"))
-                    converted[str(name)] = item
+                    item_copy = dict(item)
+                    name = item_copy.pop("name", item_copy.pop("variant_name", f"variant_{len(converted)}"))
+                    converted[str(name)] = item_copy
             variants = converted if converted else None
             logger.debug("Converted list-format variants to dict (%d entries)", len(converted))
         if not isinstance(variants, dict) or not variants:
@@ -521,6 +522,36 @@ class _QuickEvalMixin:
             # After sanitization, re-check that something non-empty remains
             if not any(data.get(k) for k in expected_keys):
                 return {}
+
+            # ── Degenerate-run detection ──────────────────────────────
+            # Flag training logs where ALL numeric metrics are zero
+            # across ALL epochs — this indicates a silent failure (e.g.
+            # all batches skipped due to key-name mismatch / shape error).
+            tlog = data.get("training_log", [])
+            if len(tlog) >= 3:
+                _numeric_vals: list[float] = []
+                for entry in tlog:
+                    for k, v in entry.items():
+                        if k in ("epoch", "step", "lr"):
+                            continue
+                        if isinstance(v, (int, float)) and v != float("inf"):
+                            _numeric_vals.append(abs(v))
+                if _numeric_vals and all(v == 0.0 for v in _numeric_vals):
+                    logger.warning(
+                        "DEGENERATE RUN DETECTED: all %d numeric metric "
+                        "values across %d training log entries are exactly "
+                        "0.0 — this likely indicates a silent training "
+                        "failure (e.g. every batch threw an exception that "
+                        "was silently caught).",
+                        len(_numeric_vals), len(tlog),
+                    )
+                    data["_degenerate_run"] = True
+                    data["_degenerate_reason"] = (
+                        "All training metrics are exactly 0.0 across all "
+                        f"{len(tlog)} epochs. Probable cause: silent batch "
+                        "errors (key-name mismatch between dataset and model, "
+                        "or shape errors caught by broad except clauses)."
+                    )
 
             return data
         except (json.JSONDecodeError, OSError, TypeError, AttributeError) as exc:

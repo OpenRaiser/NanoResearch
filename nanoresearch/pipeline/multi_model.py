@@ -88,6 +88,101 @@ class ModelDispatcher:
         return any(pat in msg for pat in _RETRYABLE_PATTERNS)
 
     @staticmethod
+    def _is_thinking_model(model_name: str) -> bool:
+        model_name = model_name.lower()
+        return (
+            "thinking" in model_name
+            or model_name == "o1"
+            or model_name.startswith("o1-")
+            or model_name == "o3"
+            or model_name.startswith("o3-")
+        )
+
+    @staticmethod
+    def _normalize_messages_for_model(
+        messages: list[dict[str, Any]],
+        is_thinking: bool,
+    ) -> list[dict[str, Any]]:
+        if not is_thinking:
+            return messages
+
+        system_chunks: list[str] = []
+        normalized: list[dict[str, Any]] = []
+        merged = False
+
+        for msg in messages:
+            role = msg.get("role")
+            if role == "system":
+                content = msg.get("content")
+                if isinstance(content, str) and content.strip():
+                    system_chunks.append(content.strip())
+                elif content:
+                    system_chunks.append(str(content).strip())
+                continue
+
+            cloned = dict(msg)
+            if not merged and system_chunks and role == "user":
+                prefix = "\n\n".join(chunk for chunk in system_chunks if chunk).strip()
+                content = cloned.get("content")
+                if isinstance(content, str) or content is None:
+                    body = (content or "").strip()
+                    cloned["content"] = f"{prefix}\n\n{body}" if body else prefix
+                elif isinstance(content, list):
+                    new_content = [
+                        dict(item) if isinstance(item, dict) else item
+                        for item in content
+                    ]
+                    injected = False
+                    for item in new_content:
+                        if isinstance(item, dict) and item.get("type") == "text":
+                            body = item.get("text", "")
+                            item["text"] = f"{prefix}\n\n{body}" if body else prefix
+                            injected = True
+                            break
+                    if not injected:
+                        new_content.insert(0, {"type": "text", "text": prefix})
+                    cloned["content"] = new_content
+                else:
+                    cloned["content"] = f"{prefix}\n\n{content}"
+                merged = True
+            normalized.append(cloned)
+
+        if system_chunks and not merged:
+            prefix = "\n\n".join(chunk for chunk in system_chunks if chunk).strip()
+            if prefix:
+                normalized.insert(0, {"role": "user", "content": prefix})
+        return normalized
+
+    @staticmethod
+    def _apply_completion_limit(
+        kwargs: dict[str, Any],
+        config: StageModelConfig,
+        is_thinking: bool,
+    ) -> None:
+        if is_thinking:
+            kwargs["max_completion_tokens"] = config.max_tokens
+        else:
+            kwargs["max_tokens"] = config.max_tokens
+
+    @staticmethod
+    def _json_mode_fallback_supported(
+        exc: Exception,
+        kwargs: dict[str, Any],
+    ) -> bool:
+        if "response_format" not in kwargs:
+            return False
+        msg = str(exc).lower()
+        return (
+            "response_format" in msg
+            and (
+                "not supported" in msg
+                or "unsupported" in msg
+                or "unknown parameter" in msg
+                or "invalid parameter" in msg
+            )
+        )
+
+    @staticmethod
     def _extract_usage(response: Any) -> dict[str, int]:
         """Extract token usage dict from an OpenAI response object."""
         if hasattr(response, "usage") and response.usage is not None:
@@ -136,20 +231,19 @@ class ModelDispatcher:
         timeout = config.timeout or self._config.timeout
         client = self._get_client(timeout, config.base_url, config.api_key)
 
-        _m = config.model.lower()
-        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+        is_thinking = self._is_thinking_model(config.model)
 
         kwargs: dict[str, Any] = {
             "model": config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            "messages": self._normalize_messages_for_model(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                is_thinking,
+            ),
         }
-        if is_thinking:
-            kwargs["max_completion_tokens"] = config.max_tokens
-        else:
-            kwargs["max_tokens"] = config.max_tokens
+        self._apply_completion_limit(kwargs, config, is_thinking)
         if config.temperature is not None and not is_thinking:
             kwargs["temperature"] = config.temperature
         if json_mode:
@@ -181,6 +275,12 @@ class ModelDispatcher:
                 last_exc = exc
                 if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
                     kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                if self._json_mode_fallback_supported(exc, kwargs):
+                    logger.info(
+                        "Proxy doesn't support response_format=json_object, falling back to prompt-only JSON mode"
+                    )
+                    kwargs.pop("response_format", None)
                     continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
@@ -220,23 +320,22 @@ class ModelDispatcher:
         timeout = config.timeout or self._config.timeout
         client = self._get_client(timeout, config.base_url, config.api_key)
 
-        _m = config.model.lower()
-        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+        is_thinking = self._is_thinking_model(config.model)
 
         kwargs: dict[str, Any] = {
             "model": config.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": [
-                    {"type": "text", "text": user_prompt},
-                    {"type": "image_url", "image_url": {"url": data_url}},
-                ]},
-            ],
+            "messages": self._normalize_messages_for_model(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": user_prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ]},
+                ],
+                is_thinking,
+            ),
         }
-        if is_thinking:
-            kwargs["max_completion_tokens"] = config.max_tokens
-        else:
-            kwargs["max_tokens"] = config.max_tokens
+        self._apply_completion_limit(kwargs, config, is_thinking)
         if config.temperature is not None and not is_thinking:
             kwargs["temperature"] = config.temperature
         if json_mode:
@@ -266,6 +365,12 @@ class ModelDispatcher:
                 last_exc = exc
                 if "max_completion_tokens" in str(exc) and "max_completion_tokens" in kwargs:
                     kwargs["max_tokens"] = kwargs.pop("max_completion_tokens")
+                    continue
+                if self._json_mode_fallback_supported(exc, kwargs):
+                    logger.info(
+                        "Vision backend doesn't support response_format=json_object, falling back to prompt-only JSON mode"
+                    )
+                    kwargs.pop("response_format", None)
                     continue
                 if attempt < MAX_API_RETRIES and self._is_retryable(exc):
                     delay = RETRY_BASE_DELAY * (RETRY_BACKOFF ** attempt)
@@ -304,17 +409,13 @@ class ModelDispatcher:
         timeout = config.timeout or self._config.timeout
         client = self._get_client(timeout, config.base_url, config.api_key)
 
-        _m = config.model.lower()
-        is_thinking = "thinking" in _m or _m.startswith("o1") or _m.startswith("o3-")
+        is_thinking = self._is_thinking_model(config.model)
 
         kwargs: dict[str, Any] = {
             "model": config.model,
-            "messages": messages,
+            "messages": self._normalize_messages_for_model(messages, is_thinking),
         }
-        if is_thinking:
-            kwargs["max_completion_tokens"] = config.max_tokens
-        else:
-            kwargs["max_tokens"] = config.max_tokens
+        self._apply_completion_limit(kwargs, config, is_thinking)
         if config.temperature is not None and not is_thinking:
             kwargs["temperature"] = config.temperature
         if tools:
@@ -322,7 +423,7 @@ class ModelDispatcher:
 
         logger.debug(
             "Calling model=%s with %d messages, %d tools",
-            config.model, len(messages), len(tools or []),
+            config.model, len(kwargs["messages"]), len(tools or []),
         )
 
         loop = asyncio.get_running_loop()
@@ -393,7 +494,7 @@ class ModelDispatcher:
     ) -> list[str]:
         """Generate images via OpenAI /v1/images/generations (DALL-E)."""
         timeout = config.timeout or self._config.timeout
-        client = self._get_client(timeout)
+        client = self._get_client(timeout, config.base_url, config.api_key)
 
         logger.debug("Generating image (openai) model=%s size=%s", config.model, size)
 

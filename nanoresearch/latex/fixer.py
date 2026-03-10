@@ -47,7 +47,7 @@ _PACKAGE_FIXES: dict[str, tuple[str, str]] = {
 # ── Environment list for mismatch detection ───────────────────────────────
 
 _ENV_NAMES = ("figure", "figure*", "table", "table*", "align", "equation",
-              "tabular", "tabular*")
+              "tabular", "tabular*", "abstract")
 
 
 # ============================================================================
@@ -124,7 +124,37 @@ def deterministic_fix(
                     preamble = modified[:preamble_end]
                     _log(f"  Deterministic: added {use_line}")
 
-    # 5. Mismatched environments at the error line
+    # 5a. Duplicate consecutive \begin{env}\n\begin{env} or \end{env}\n\end{env}
+    _ALL_ENVS = (*_ENV_NAMES, "document", "itemize", "enumerate")
+    for env in _ALL_ENVS:
+        dup_begin = f"\\begin{{{env}}}\n\\begin{{{env}}}"
+        while dup_begin in modified:
+            modified = modified.replace(dup_begin, f"\\begin{{{env}}}", 1)
+            _log(f"  Deterministic: removed duplicate \\begin{{{env}}}")
+        dup_end = f"\\end{{{env}}}\n\\end{{{env}}}"
+        while dup_end in modified:
+            modified = modified.replace(dup_end, f"\\end{{{env}}}", 1)
+            _log(f"  Deterministic: removed duplicate \\end{{{env}}}")
+
+    # 5b. Escaped underscores inside \ref{}, \eqref{}, \label{} etc.
+    # e.g. \ref{fig:framework\_overview} → \ref{fig:framework_overview}
+    def _unescape_identifier_args(src: str) -> str:
+        _ID_CMD_PATTERN = re.compile(
+            r'(\\(?:ref|eqref|autoref|nameref|pageref|label'
+            r'|cite[tp]?|citealp|citeauthor|citeyear))\{([^}]*)\}'
+        )
+        def _fix(m: re.Match) -> str:
+            cmd = m.group(1)
+            arg = m.group(2).replace('\\_', '_')
+            return f"{cmd}{{{arg}}}"
+        return _ID_CMD_PATTERN.sub(_fix, src)
+
+    prev = modified
+    modified = _unescape_identifier_args(modified)
+    if modified != prev:
+        _log("  Deterministic: unescaped underscores in \\ref/\\label/\\cite arguments")
+
+    # 5c. Mismatched environments at the error line
     modified_lines = modified.split('\n')
     if error_line and error_line <= len(modified_lines):
         err_line_text = modified_lines[error_line - 1]
@@ -304,6 +334,7 @@ def apply_edits(
     tex_source: str,
     edits: list[dict],
     log_fn: Callable[[str], None] | None = None,
+    search_window: tuple[int, int] | None = None,
 ) -> str | None:
     """Apply search-replace edits to LaTeX source.
 
@@ -317,6 +348,57 @@ def apply_edits(
         if log_fn:
             log_fn(msg)
 
+    def _window_span(text: str) -> tuple[int, int] | None:
+        if search_window is None:
+            return None
+        start_line, end_line = search_window
+        start_line = max(0, start_line)
+        end_line = max(start_line, end_line)
+        lines = text.splitlines(keepends=True)
+        if not lines:
+            return (0, len(text))
+        start_char = sum(len(line) for line in lines[:start_line])
+        end_char = sum(len(line) for line in lines[:end_line])
+        return (start_char, end_char)
+
+    def _replace_exact(source: str, old: str, new: str, local_only: bool) -> tuple[str, bool]:
+        span = _window_span(source) if local_only else None
+        if span is not None:
+            start_char, end_char = span
+            local = source[start_char:end_char]
+            local_index = local.find(old)
+            if local_index == -1:
+                return source, False
+            abs_start = start_char + local_index
+            abs_end = abs_start + len(old)
+            return source[:abs_start] + new + source[abs_end:], True
+        if old not in source:
+            return source, False
+        return source.replace(old, new, 1), True
+
+    def _replace_ws_normalized(source: str, old: str, new: str, local_only: bool) -> tuple[str, bool]:
+        old_tokens = old.split()
+        if not old_tokens:
+            return source, False
+
+        ws_pattern = re.compile(r'\s+'.join(re.escape(token) for token in old_tokens))
+        span = _window_span(source) if local_only else None
+
+        if span is not None:
+            start_char, end_char = span
+            local = source[start_char:end_char]
+            match = ws_pattern.search(local)
+            if match is None:
+                return source, False
+            abs_start = start_char + match.start()
+            abs_end = start_char + match.end()
+            return source[:abs_start] + new + source[abs_end:], True
+
+        match = ws_pattern.search(source)
+        if match is None:
+            return source, False
+        return source[:match.start()] + new + source[match.end():], True
+
     result = tex_source
     applied = 0
 
@@ -325,26 +407,26 @@ def apply_edits(
         new = edit.get("new", "")
         if not old or old == new:
             continue
-        if old in result:
-            result = result.replace(old, new, 1)
-            applied += 1
-            _log(f"  Level 2: applied edit ({len(old)} chars → {len(new)} chars)")
-        else:
-            # Whitespace-normalized fallback
-            old_tokens = old.split()
-            if old_tokens:
-                ws_pattern = r'\s+'.join(re.escape(t) for t in old_tokens)
-                ws_match = re.search(ws_pattern, result)
-                if ws_match:
-                    result = (result[:ws_match.start()]
-                              + new
-                              + result[ws_match.end():])
-                    applied += 1
-                    _log("  Level 2: applied edit with whitespace normalization")
-                else:
-                    _log("  Level 2: old text not found, skipping edit")
+        for local_only, mode in (
+            (True, "local exact"),
+            (True, "local whitespace-normalized"),
+            (False, "global exact"),
+            (False, "global whitespace-normalized"),
+        ):
+            if local_only and search_window is None:
+                continue
+
+            if "whitespace" in mode:
+                result, matched = _replace_ws_normalized(result, old, new, local_only)
             else:
-                _log("  Level 2: old text empty after split, skipping edit")
+                result, matched = _replace_exact(result, old, new, local_only)
+
+            if matched:
+                applied += 1
+                _log(f"  Level 2: applied edit with {mode} match")
+                break
+        else:
+            _log("  Level 2: old text not found, skipping edit")
 
     if applied > 0 and result != tex_source:
         _log(f"  Level 2: {applied} edit(s) applied successfully")

@@ -650,12 +650,11 @@ Return JSON:
     def _check_syntax(filepath: Path) -> bool:
         """Check if a Python file has valid syntax via py_compile."""
         try:
-            result = subprocess.run(
-                [sys.executable, "-c",
-                 f"import py_compile; py_compile.compile(r'{filepath}', doraise=True)"],
-                capture_output=True, text=True, timeout=10,
-            )
-            return result.returncode == 0
+            import py_compile
+            py_compile.compile(str(filepath), doraise=True)
+            return True
+        except py_compile.PyCompileError:
+            return False
         except Exception:
             return True  # assume OK if check itself fails
 

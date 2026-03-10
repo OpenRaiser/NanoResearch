@@ -52,7 +52,7 @@ def setup_logging(
         try:
             h.close()
         except Exception:
-            pass
+            pass  # closing old handlers — safe to ignore
     root.handlers.clear()
 
     # Console handler — human-readable
