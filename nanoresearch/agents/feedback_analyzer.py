@@ -61,7 +61,7 @@ class FeedbackAnalyzer:
         if previous_rounds:
             prev_summary = self._extract_metric_summary(previous_rounds[-1].metrics)
             for key, val in metric_summary.items():
-                if key in prev_summary and prev_summary[key] != 0:
+                if key in prev_summary and abs(prev_summary[key]) > 1e-9:
                     improvement_delta[key] = val - prev_summary[key]
 
         # --- Step 3: Heuristic training dynamics ---

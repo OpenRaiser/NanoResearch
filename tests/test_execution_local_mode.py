@@ -232,10 +232,19 @@ async def test_run_subprocess_falls_back_to_sync_on_permission_error(monkeypatch
 
 
 def test_run_subprocess_sync_maps_timeout_to_standard_payload(monkeypatch) -> None:
-    def fake_run(*_args, **_kwargs):
-        raise subprocess.TimeoutExpired(cmd=["python"], timeout=3)
+    class FakePopen:
+        def __init__(self, *_args, **_kwargs):
+            self.pid = 99999
+            self._calls = 0
+        def communicate(self, timeout=None):
+            self._calls += 1
+            if self._calls == 1:
+                raise subprocess.TimeoutExpired(cmd=["python"], timeout=3)
+            return b"", b""  # reap call
+        def kill(self):
+            pass
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", FakePopen)
 
     result = ExecutionAgent._run_subprocess_sync(["python"], timeout=3)
 

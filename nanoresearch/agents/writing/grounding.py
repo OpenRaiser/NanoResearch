@@ -168,6 +168,13 @@ class _GroundingMixin:
                 packet.ablation_table_latex = cls._build_ablation_table_latex(
                     ablation_results, blueprint,
                 )
+        else:
+            # No real results — build scaffold tables from blueprint so the
+            # Experiments section still has Table 1/Table 2 structure.
+            # The LLM fills cells with literature-reported baseline numbers
+            # and marks the proposed method row with "--" (to be updated later).
+            packet.main_table_latex = cls._build_scaffold_main_table(blueprint)
+            packet.ablation_table_latex = cls._build_scaffold_ablation_table(blueprint)
 
         return packet
 
@@ -382,6 +389,173 @@ class _GroundingMixin:
         return "\n".join(lines)
 
     @staticmethod
+    def _build_scaffold_main_table(blueprint: dict) -> str:
+        """Build a table scaffold from blueprint when no real results exist.
+
+        The scaffold contains baseline method names and metric columns
+        extracted from the blueprint.  Cell values are left as ``--``
+        for baselines (LLM will fill from literature) and the proposed
+        method row is clearly marked.  This ensures the Experiments
+        section always has Table 1 structure even without real data.
+        """
+        baselines = blueprint.get("baselines", [])
+        if not isinstance(baselines, list):
+            baselines = []
+        metrics_spec = blueprint.get("metrics", [])
+        if not isinstance(metrics_spec, list):
+            metrics_spec = []
+
+        # Extract metric names from blueprint
+        metric_names: list[str] = []
+        for m in metrics_spec:
+            if isinstance(m, dict):
+                name = m.get("name", "") or m.get("metric_name", "")
+            elif isinstance(m, str):
+                name = m
+            else:
+                continue
+            if name and name not in metric_names:
+                metric_names.append(name)
+
+        if not metric_names:
+            # Fallback — can't build meaningful table without metric columns
+            return ""
+
+        # Baseline names
+        baseline_names: list[str] = []
+        for b in baselines:
+            if isinstance(b, dict):
+                name = b.get("name", "") or b.get("method", "")
+            elif isinstance(b, str):
+                name = b
+            else:
+                continue
+            if name:
+                baseline_names.append(name)
+
+        if not baseline_names:
+            baseline_names = ["Baseline 1", "Baseline 2"]
+
+        # Proposed method name
+        proposed = (
+            blueprint.get("proposed_method", {}).get("name", "")
+            or blueprint.get("method_name", "")
+            or "Ours"
+        )
+
+        n = len(metric_names)
+        col_spec = "@{}l" + "c" * n + "@{}"
+        header = " & ".join(metric_names)
+
+        lines = [
+            "\\begin{table}[t!]",
+            "\\centering",
+            "\\small",
+            "\\setlength{\\tabcolsep}{4pt}",
+            "\\caption{Main experimental results. Best results are in \\textbf{bold}. "
+            "Results for the proposed method are pending due to execution issues.}",
+            "\\label{tab:main_results}",
+            f"\\begin{{tabular}}{{{col_spec}}}",
+            "\\toprule",
+            f"Method & {header} \\\\",
+            "\\midrule",
+        ]
+
+        for bname in baseline_names:
+            cells = " & ".join(["--"] * n)
+            lines.append(f"{_escape_latex_text(bname)} & {cells} \\\\")
+
+        lines.append("\\midrule")
+        cells = " & ".join(["--"] * n)
+        lines.append(f"{_escape_latex_text(proposed)} (Ours) & {cells} \\\\")
+
+        lines.extend([
+            "\\bottomrule",
+            "\\end{tabular}",
+            "\\end{table}",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_scaffold_ablation_table(blueprint: dict) -> str:
+        """Build an ablation table scaffold from blueprint (no real data).
+
+        Rows are derived from blueprint ``contributions`` or ``components``.
+        """
+        metrics_spec = blueprint.get("metrics", [])
+        if not isinstance(metrics_spec, list):
+            metrics_spec = []
+
+        metric_names: list[str] = []
+        for m in metrics_spec:
+            if isinstance(m, dict):
+                name = m.get("name", "") or m.get("metric_name", "")
+            elif isinstance(m, str):
+                name = m
+            else:
+                continue
+            if name and name not in metric_names:
+                metric_names.append(name)
+
+        if not metric_names:
+            return ""
+
+        # Derive ablation variants from contributions / components
+        contributions = blueprint.get("contributions", [])
+        if not isinstance(contributions, list):
+            contributions = []
+
+        variants: list[str] = []
+        for c in contributions:
+            if isinstance(c, str) and len(c) < 60:
+                variants.append(f"w/o {c}")
+            elif isinstance(c, dict):
+                name = c.get("name", "") or c.get("component", "")
+                if name:
+                    variants.append(f"w/o {name}")
+
+        if not variants:
+            variants = ["w/o Component A", "w/o Component B"]
+
+        proposed = (
+            blueprint.get("proposed_method", {}).get("name", "")
+            or blueprint.get("method_name", "")
+            or "Full Model"
+        )
+
+        n = len(metric_names)
+        col_spec = "@{}l" + "c" * n + "@{}"
+        header = " & ".join(metric_names)
+
+        lines = [
+            "\\begin{table}[t!]",
+            "\\centering",
+            "\\small",
+            "\\setlength{\\tabcolsep}{4pt}",
+            "\\caption{Ablation study. Each row removes one component. "
+            "Results are pending due to execution issues.}",
+            "\\label{tab:ablation}",
+            f"\\begin{{tabular}}{{{col_spec}}}",
+            "\\toprule",
+            f"Variant & {header} \\\\",
+            "\\midrule",
+        ]
+
+        cells = " & ".join(["--"] * n)
+        for v in variants[:5]:
+            lines.append(f"{_escape_latex_text(v)} & {cells} \\\\")
+
+        lines.append("\\midrule")
+        lines.append(f"{_escape_latex_text(proposed)} (Full) & {cells} \\\\")
+
+        lines.extend([
+            "\\bottomrule",
+            "\\end{tabular}",
+            "\\end{table}",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
     def _build_real_results_context(
         experiment_results: dict, experiment_status: str
     ) -> str:
@@ -444,20 +618,20 @@ class _GroundingMixin:
         else:
             return (
                 "=== EXPERIMENT RESULTS: NOT AVAILABLE ===\n"
-                "Real experiment results are NOT available. The experiment either failed,\n"
-                "did not run, or produced no metrics.\n\n"
-                "STRICT RULES:\n"
-                "- Do NOT fabricate, invent, or generate ANY experimental numbers.\n"
-                "- Do NOT create fake accuracy, AUC, F1, loss, or any other metrics.\n"
-                "- Do NOT fill tables with made-up numbers.\n"
-                "- In the Experiments section, describe the experimental SETUP (datasets,\n"
-                "  baselines, metrics, hyperparameters) but clearly state that results\n"
-                "  could not be obtained due to execution failure.\n"
-                "- Write: 'Due to technical issues during execution, we were unable to\n"
-                "  obtain experimental results in this draft. We present our methodology\n"
-                "  and experimental design; empirical validation is left for the final version.'\n"
-                "- Omit results tables entirely. Do NOT include tables with '--' placeholders.\n"
-                "- Focus on describing the experimental setup, methodology, and expected behavior.\n"
+                "The proposed method's experiment did not produce results due to execution issues.\n\n"
+                "RULES FOR EXPERIMENTS SECTION:\n"
+                "- Do NOT fabricate results for the PROPOSED METHOD. Use '--' in its table cells.\n"
+                "- For BASELINE methods, you SHOULD fill in numbers from their original papers\n"
+                "  (cite the source). This is standard practice — reproducing published numbers.\n"
+                "- Use the PRE-BUILT TABLE scaffold provided below. Fill baseline cells with\n"
+                "  literature-reported numbers and keep proposed method cells as '--'.\n"
+                "- Write a full Experiments section: datasets, metrics, baselines, setup,\n"
+                "  implementation details, and analysis of baseline landscape.\n"
+                "- Add one sentence noting that proposed method results are pending:\n"
+                "  'Due to technical issues during execution, results for our method could not\n"
+                "   be obtained in this version. We report baseline results from the literature\n"
+                "   for reference.'\n"
+                "- Do NOT skip the tables. Do NOT omit the ablation table.\n"
                 "=== END EXPERIMENT RESULTS ==="
             )
 
@@ -626,10 +800,14 @@ class _GroundingMixin:
         """Pre-build LaTeX figure/table blocks to embed inline.
 
         Dynamically builds blocks from whatever figures the FigureAgent produced.
-        Falls back to hardcoded names when figure_output is not available.
+        Falls back to scanning the figures/ directory when figure_output is
+        not available (BUG-2 fix: no more hardcoded filenames).
         """
         blocks: dict[str, str] = {}
         figures = (figure_output or {}).get("figures", {})
+
+        # Resolve figures directory for file-existence checks (BUG-1 fix)
+        figures_dir = self.workspace.path / "figures" if hasattr(self, "workspace") else None
 
         if figures:
             # Dynamic: iterate over all figures produced by the FigureAgent.
@@ -637,6 +815,10 @@ class _GroundingMixin:
             # to prevent the same block being placed twice.
             for fig_key, fig_data in figures.items():
                 if "error" in fig_data and "png_path" not in fig_data:
+                    logger.warning(
+                        "Skipping failed figure %s: %s",
+                        fig_key, fig_data.get("error", "unknown error"),
+                    )
                     continue  # skip failed figures with no output
 
                 caption = _escape_latex_text(fig_data.get("caption", f"Figure: {fig_key}"))
@@ -647,10 +829,16 @@ class _GroundingMixin:
                 label_suffix = parts[1] if len(parts) > 1 else fig_key
                 label = f"fig:{label_suffix}"
 
-                # Check for PDF first, then PNG
-                pdf_name = f"{fig_key}.pdf"
-                png_name = f"{fig_key}.png"
-                include_name = pdf_name if fig_data.get("pdf_path") else png_name
+                # BUG-1 fix: verify file existence before choosing format.
+                # Prefer PDF > PNG > JPG, but only if the file actually exists.
+                include_name = self._resolve_figure_include(
+                    fig_key, fig_data, figures_dir,
+                )
+                if include_name is None:
+                    logger.warning(
+                        "Figure %s: no valid file found on disk, skipping", fig_key,
+                    )
+                    continue
 
                 # Architecture/framework figures use full width;
                 # result/ablation/chart figures use 0.75 width for better layout
@@ -675,33 +863,51 @@ class _GroundingMixin:
 
                 blocks[label_suffix] = block
         else:
-            # Fallback: assume standard 3-figure layout
-            blocks["architecture"] = (
-                "\\begin{figure}[t!]\n"
-                "\\centering\n"
-                "\\includegraphics[width=\\textwidth]{fig1_architecture.pdf}\n"
-                "\\caption{Overview of the proposed model architecture.}\n"
-                "\\label{fig:architecture}\n"
-                "\\end{figure}"
-            )
-            blocks["results"] = (
-                "\\begin{figure}[t!]\n"
-                "\\centering\n"
-                "\\includegraphics[width=0.75\\textwidth]{fig2_results.pdf}\n"
-                "\\caption{Performance comparison.}\n"
-                "\\label{fig:results}\n"
-                "\\end{figure}"
-            )
-            blocks["ablation"] = (
-                "\\begin{figure}[t!]\n"
-                "\\centering\n"
-                "\\includegraphics[width=0.75\\textwidth]{fig3_ablation.pdf}\n"
-                "\\caption{Ablation study.}\n"
-                "\\label{fig:ablation}\n"
-                "\\end{figure}"
-            )
+            # BUG-2 fix: scan actual figures/ directory instead of
+            # hardcoding 3 filenames that may not exist.
+            if figures_dir and figures_dir.exists():
+                for img in sorted(figures_dir.iterdir()):
+                    if img.suffix.lower() in (".pdf", ".png", ".jpg", ".jpeg"):
+                        stem = img.stem
+                        readable = stem.replace("_", " ").replace("-", " ").title()
+                        blocks[stem] = (
+                            "\\begin{figure}[t!]\n"
+                            "\\centering\n"
+                            f"\\includegraphics[width=0.75\\textwidth]{{{img.name}}}\n"
+                            f"\\caption{{{_escape_latex_text(readable)}.}}\n"
+                            f"\\label{{fig:{stem}}}\n"
+                            "\\end{figure}"
+                        )
+            if not blocks:
+                logger.warning("No figures available — paper will have no figure blocks")
 
         return blocks
+
+    @staticmethod
+    def _resolve_figure_include(
+        fig_key: str, fig_data: dict, figures_dir: Path | None,
+    ) -> str | None:
+        """Resolve the actual filename to use in \\includegraphics.
+
+        BUG-1 fix: checks physical file existence, preferring PDF > PNG > JPG.
+        Returns None if no valid file is found.
+        """
+        # Candidate paths ordered by preference
+        candidates = [
+            (fig_data.get("pdf_path"), f"{fig_key}.pdf"),
+            (fig_data.get("png_path"), f"{fig_key}.png"),
+            (None, f"{fig_key}.jpg"),
+        ]
+        for meta_path, default_name in candidates:
+            # 1. Check metadata path
+            if meta_path:
+                p = Path(meta_path)
+                if p.exists():
+                    return p.name
+            # 2. Check figures_dir
+            if figures_dir and (figures_dir / default_name).exists():
+                return default_name
+        return None
 
     # ---- tool-augmented search for writing -----------------------------------
 

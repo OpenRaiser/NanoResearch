@@ -70,7 +70,7 @@ class _CitationManagerMixin:
         """Resolve a single missing citation key to a bib entry.
 
         Parses the key pattern (e.g., 'gu2022', 'child2019b') to extract
-        author surname and year, then searches Semantic Scholar.
+        author surname and year, then searches OpenAlex.
         Falls back to a stub entry if search fails.
         """
         # Parse key: letters = surname, digits = year, optional trailing letter
@@ -85,10 +85,10 @@ class _CitationManagerMixin:
             year = ""
             query = key
 
-        # Try Semantic Scholar search
+        # Try OpenAlex search (free, no API key application needed)
         try:
-            from mcp_server.tools.semantic_scholar import search_semantic_scholar
-            results = await search_semantic_scholar(query, max_results=5)
+            from mcp_server.tools.openalex import search_openalex
+            results = await search_openalex(query, max_results=5)
             # Find best match: title/author containing surname, year matching
             best = None
             for r in results:
@@ -123,16 +123,17 @@ class _CitationManagerMixin:
                     f"}}\n"
                 )
         except Exception as exc:
-            logger.debug("S2 search failed for citation key '%s': %s", key, exc)
+            logger.debug("OpenAlex search failed for citation key '%s': %s", key, exc)
 
-        # Fallback: generate a stub so LaTeX compiles
-        self.log(f"  Stub entry for '{key}' (search failed)")
+        # BUG-22 fix: instead of a fake stub with title={Surname et al.},
+        # generate an honest @misc entry without a fabricated title.
+        self.log(f"  Unresolved entry for '{key}' (search failed)")
         return (
             f"@misc{{{key},\n"
-            f"  title={{{surname} et al.}},\n"
             f"  author={{{surname}}},\n"
             f"  year={{{year or 2024}}},\n"
-            f"  note={{Citation auto-generated}},\n"
+            f"  note={{Could not retrieve full metadata. "
+            f"Please replace with the correct reference.}},\n"
             f"}}\n"
         )
 

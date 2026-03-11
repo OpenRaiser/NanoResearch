@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import configparser
 import json
+import logging
+import os
 import platform
 import re
 import shutil
@@ -14,6 +16,8 @@ import venv
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 from nanoresearch.config import ResearchConfig
 
@@ -32,8 +36,126 @@ PACKAGE_IMPORT_ALIASES = {
     "python-dateutil": "dateutil",
     "beautifulsoup4": "bs4",
 }
-MAX_RUNTIME_IMPORT_PROBES = 5
-MAX_RUNTIME_VALIDATION_REPAIR_PACKAGES = 3
+MAX_RUNTIME_IMPORT_PROBES = 50
+MAX_RUNTIME_VALIDATION_REPAIR_PACKAGES = 50
+
+# PyTorch-family packages that need special index URL handling for CUDA support
+_TORCH_FAMILY_PACKAGES = {"torch", "torchvision", "torchaudio", "torchtext"}
+
+# CUDA driver version → best available PyTorch CUDA wheel tag
+# nvidia-smi reports the max CUDA version the driver supports.
+# PyTorch ships wheels for specific CUDA toolkit versions (cuXYZ).
+# We map driver-reported CUDA version to the newest compatible wheel tag.
+_CUDA_DRIVER_TO_TORCH_TAG: list[tuple[tuple[int, int], str]] = [
+    # (min_cuda_version, torch_index_tag)
+    # Ordered newest → oldest so we pick the best match.
+    ((12, 8), "cu128"),
+    ((12, 6), "cu126"),
+    ((12, 4), "cu124"),
+    ((12, 1), "cu121"),
+    ((11, 8), "cu118"),
+]
+
+# CUDA driver version → conda pytorch-cuda metapackage version (e.g. "12.4")
+_CUDA_DRIVER_TO_CONDA_CUDA: list[tuple[tuple[int, int], str]] = [
+    ((12, 8), "12.8"),
+    ((12, 6), "12.6"),
+    ((12, 4), "12.4"),
+    ((12, 1), "12.1"),
+    ((11, 8), "11.8"),
+]
+
+
+def _find_conda() -> str | None:
+    """Return ``"conda"`` if conda is installed, else ``None``."""
+    return "conda" if shutil.which("conda") else None
+
+
+def _detect_gpu_cuda() -> dict[str, Any] | None:
+    """Detect NVIDIA GPU and CUDA driver version via nvidia-smi.
+
+    Returns a dict with keys: gpu_name, driver_version, cuda_version (tuple),
+    cuda_version_str, torch_index_url.  Returns None if no NVIDIA GPU is found.
+    """
+    nvidia_smi = shutil.which("nvidia-smi")
+    if not nvidia_smi:
+        return None
+
+    try:
+        result = subprocess.run(
+            [nvidia_smi, "--query-gpu=name,driver_version", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return None
+        gpu_line = (result.stdout or "").strip().splitlines()[0]
+        parts = [p.strip() for p in gpu_line.split(",")]
+        gpu_name = parts[0] if parts else "Unknown"
+        driver_version = parts[1] if len(parts) > 1 else ""
+    except Exception:
+        return None
+
+    # Parse CUDA version from nvidia-smi header output
+    cuda_version: tuple[int, int] | None = None
+    try:
+        result2 = subprocess.run(
+            [nvidia_smi],
+            capture_output=True, text=True, timeout=10,
+        )
+        # Look for "CUDA Version: X.Y" in the table header
+        m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", result2.stdout or "")
+        if m:
+            cuda_version = (int(m.group(1)), int(m.group(2)))
+    except Exception:
+        pass
+
+    if cuda_version is None:
+        return None
+
+    # Find best matching torch CUDA wheel tag
+    torch_tag = ""
+    for min_ver, tag in _CUDA_DRIVER_TO_TORCH_TAG:
+        if cuda_version >= min_ver:
+            torch_tag = tag
+            break
+
+    if not torch_tag:
+        # CUDA version too old for any known PyTorch CUDA build
+        logger.warning(
+            "GPU detected (%s, CUDA %s.%s) but CUDA version is too old for "
+            "any known PyTorch CUDA wheel. Falling back to CPU-only torch.",
+            gpu_name, cuda_version[0], cuda_version[1],
+        )
+        return None
+
+    return {
+        "gpu_name": gpu_name,
+        "driver_version": driver_version,
+        "cuda_version": cuda_version,
+        "cuda_version_str": f"{cuda_version[0]}.{cuda_version[1]}",
+        "torch_tag": torch_tag,
+        "torch_index_url": f"https://download.pytorch.org/whl/{torch_tag}",
+    }
+
+
+def _split_torch_requirements(requirements: list[str]) -> tuple[list[str], list[str]]:
+    """Split a list of requirement specifiers into torch-family and non-torch.
+
+    Returns (torch_specs, other_specs).  torch_specs are raw specifier strings
+    like 'torch>=2.0' that should be installed from the CUDA index URL.
+    """
+    torch_specs: list[str] = []
+    other_specs: list[str] = []
+    for line in requirements:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        canonical = _canonicalize_dependency_name(stripped)
+        if canonical and canonical in _TORCH_FAMILY_PACKAGES:
+            torch_specs.append(stripped)
+        else:
+            other_specs.append(stripped)
+    return torch_specs, other_specs
 
 
 def _canonicalize_dependency_name(raw_value: str) -> str | None:
@@ -197,16 +319,253 @@ class RuntimeEnvironmentManager:
         self,
         config: ResearchConfig,
         log_fn: Callable[[str], None] | None = None,
+        session_label: str = "",
     ) -> None:
         self.config = config
         self._log = log_fn or (lambda _message: None)
+        self._session_label = session_label
 
-    async def prepare(self, code_dir: Path) -> dict[str, Any]:
+    # ------------------------------------------------------------------
+    # Backend resolution
+    # ------------------------------------------------------------------
+
+    def _resolve_backend(self) -> tuple[str, bool]:
+        """Decide between 'conda' and 'venv' based on config + system state.
+
+        Returns ``(backend, forced)`` where *forced* is True when the user
+        explicitly set ``environment_backend`` to ``"conda"`` or ``"venv"``
+        (as opposed to ``"auto"`` detection).
+        """
+        backend = (self.config.environment_backend or "auto").strip().lower()
+
+        if backend == "venv":
+            return "venv", True
+
+        if backend == "conda":
+            cmd = _find_conda()
+            if cmd is None:
+                raise RuntimeError(
+                    "environment_backend='conda' but conda "
+                    "is not installed.\n"
+                    "Install Miniconda: https://docs.conda.io/en/latest/miniconda.html\n"
+                    "Or set environment_backend='venv' in config.json."
+                )
+            return "conda", True
+
+        # "auto" — prefer conda when available
+        if _find_conda() is not None:
+            self._log("Auto-detected conda — using conda backend")
+            return "conda", False
+        return "venv", False
+
+    def _per_session_env_name(self) -> str:
+        """Deterministic conda env name for the current session.
+
+        Uses ``nanoresearch_{sanitized_label}`` so that resume reuses the
+        same env (idempotent).
+        """
+        import hashlib as _hl
+
+        label = re.sub(r'[^A-Za-z0-9_-]', '_', self._session_label)[:30].strip('_')
+        if not label:
+            label = (
+                _hl.md5(self._session_label.encode()).hexdigest()[:10]
+                if self._session_label else "default"
+            )
+        return f"nanoresearch_{label}"
+
+    # ------------------------------------------------------------------
+    # Per-session conda environment
+    # ------------------------------------------------------------------
+
+    async def _create_per_session_conda_env(
+        self,
+        code_dir: Path,
+        execution_policy: "ExperimentExecutionPolicy",
+    ) -> dict[str, Any]:
+        """Create (or reuse) a per-session conda env and return env_info dict.
+
+        Steps:
+        1. Check if env already exists (resume idempotency).
+        2. Create bare env with Python 3.11.
+        3. If GPU detected → ``_install_torch_conda()``.
+        4. ``install_requirements()`` for remaining pip deps.
+        5. ``validate_runtime()``.
+        """
+        env_name = self._per_session_env_name()
+        cmd = _find_conda() or "conda"
+        requirements_path = code_dir / "requirements.txt"
+        environment_file = self._find_environment_file(code_dir)
+
+        # 1. Check if already exists
+        freshly_created = False
+        conda_python = self.find_conda_python(env_name)
+        if conda_python:
+            self._log(f"Reusing existing conda env '{env_name}': {conda_python}")
+        else:
+            # 2. Create bare env
+            self._log(f"Creating per-session conda env '{env_name}' via {cmd} ...")
+            loop = asyncio.get_running_loop()
+            try:
+                proc = await loop.run_in_executor(
+                    None,
+                    lambda: subprocess.run(
+                        [cmd, "create", "-y", "-n", env_name, "python=3.11"],
+                        capture_output=True, text=True, timeout=600,
+                    ),
+                )
+                if proc.returncode != 0:
+                    stderr = (proc.stderr or "").strip()[:500]
+                    self._log(f"Conda env creation failed: {stderr}")
+                    return {}  # signal failure — caller falls back to venv
+            except Exception as exc:
+                self._log(f"Conda env creation error: {exc}")
+                return {}
+
+            conda_python = self.find_conda_python(env_name)
+            if not conda_python:
+                self._log(f"Could not locate Python in new conda env '{env_name}'")
+                return {}
+            freshly_created = True
+            self._log(f"Conda env '{env_name}' created (python: {conda_python})")
+
+        # 3. GPU-aware torch installation via conda
+        gpu_info = _detect_gpu_cuda()
+        if gpu_info:
+            await self._install_torch_conda(env_name, cmd, gpu_info)
+
+        # 4. Install remaining deps via pip
+        install_info = await self.install_requirements(conda_python, code_dir)
+
+        # 5. Verify torch CUDA if GPU present
+        if gpu_info:
+            await self._verify_torch_cuda(conda_python, code_dir, gpu_info)
+
+        # 6. Validate runtime
+        runtime_validation = await self.validate_runtime(
+            conda_python, code_dir, execution_policy=execution_policy,
+        )
+
+        return {
+            "kind": "conda",
+            "python": conda_python,
+            "env_name": env_name,
+            "created": freshly_created,
+            "per_session": True,
+            "requirements_path": str(requirements_path) if requirements_path.exists() else "",
+            "environment_file": str(environment_file) if environment_file else "",
+            "dependency_install": install_info,
+            "runtime_validation": runtime_validation,
+            "runtime_validation_repair": {"status": "skipped", "actions": []},
+            "execution_policy": execution_policy.to_dict(),
+        }
+
+    async def _install_torch_conda(
+        self,
+        env_name: str,
+        cmd: str,
+        gpu_info: dict[str, Any],
+    ) -> bool:
+        """Install PyTorch with CUDA via conda into a named env.
+
+        Uses ``conda install pytorch torchvision torchaudio pytorch-cuda=XX.X
+        -c pytorch -c nvidia``.  Returns True on success.
+        """
+        cuda_ver = gpu_info.get("cuda_version")
+        if not cuda_ver:
+            return False
+
+        # Find best conda pytorch-cuda version
+        conda_cuda = ""
+        for min_ver, tag in _CUDA_DRIVER_TO_CONDA_CUDA:
+            if cuda_ver >= min_ver:
+                conda_cuda = tag
+                break
+        if not conda_cuda:
+            self._log(f"CUDA {cuda_ver} too old for conda pytorch-cuda packages")
+            return False
+
+        self._log(
+            f"Installing PyTorch with CUDA via {cmd}: "
+            f"GPU={gpu_info['gpu_name']}, pytorch-cuda={conda_cuda}"
+        )
+
+        loop = asyncio.get_running_loop()
+        try:
+            proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [
+                        cmd, "install", "-y", "-n", env_name,
+                        "pytorch", "torchvision", "torchaudio",
+                        f"pytorch-cuda={conda_cuda}",
+                        "-c", "pytorch", "-c", "nvidia",
+                    ],
+                    capture_output=True, text=True, timeout=1800,
+                ),
+            )
+            if proc.returncode == 0:
+                self._log("PyTorch CUDA conda install OK")
+                return True
+            stderr = (proc.stderr or "").strip()[:500]
+            self._log(f"PyTorch CUDA conda install failed: {stderr}")
+        except Exception as exc:
+            self._log(f"PyTorch CUDA conda install error: {exc}")
+
+        return False
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def list_nanoresearch_conda_envs() -> list[dict[str, str]]:
+        """List all ``nanoresearch_*`` conda environments.
+
+        Returns list of ``{"name": str, "path": str}``.
+        """
+        cmd = _find_conda()
+        if cmd is None:
+            return []
+        try:
+            proc = subprocess.run(
+                [cmd, "env", "list", "--json"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                return []
+            import json as _json
+            data = _json.loads(proc.stdout)
+            envs = []
+            for env_path in data.get("envs", []):
+                name = Path(env_path).name
+                if name.startswith("nanoresearch_"):
+                    envs.append({"name": name, "path": env_path})
+            return envs
+        except Exception:
+            return []
+
+    @staticmethod
+    def remove_conda_env(env_name: str) -> bool:
+        """Remove a conda environment by name. Returns True on success."""
+        cmd = _find_conda() or "conda"
+        try:
+            proc = subprocess.run(
+                [cmd, "env", "remove", "-y", "-n", env_name],
+                capture_output=True, text=True, timeout=120,
+            )
+            return proc.returncode == 0
+        except Exception:
+            return False
+
+    async def prepare(self, code_dir: Path, *, force_isolated: bool = False) -> dict[str, Any]:
         requirements_path = code_dir / "requirements.txt"
         environment_file = self._find_environment_file(code_dir)
         execution_policy = self.build_execution_policy(code_dir)
+
+        # ----- Priority 1: explicit named conda env from config ----------
         conda_env = self.config.experiment_conda_env.strip()
-        if conda_env:
+        if conda_env and not force_isolated:
             conda_python = self.find_conda_python(conda_env)
             if conda_python:
                 self._log(f"Using existing conda env '{conda_env}': {conda_python}")
@@ -216,10 +575,6 @@ class RuntimeEnvironmentManager:
                     code_dir,
                     execution_policy=execution_policy,
                 )
-                runtime_validation_repair = {
-                    "status": "skipped",
-                    "actions": [],
-                }
                 return {
                     "kind": "conda",
                     "python": conda_python,
@@ -228,24 +583,18 @@ class RuntimeEnvironmentManager:
                     "environment_file": str(environment_file) if environment_file else "",
                     "dependency_install": install_info,
                     "runtime_validation": runtime_validation,
-                    "runtime_validation_repair": runtime_validation_repair,
+                    "runtime_validation_repair": {"status": "skipped", "actions": []},
                     "execution_policy": execution_policy.to_dict(),
                 }
-            if self.config.auto_create_env and shutil.which("conda"):
+            if self.config.auto_create_env and _find_conda() is not None:
                 created = await self.create_conda_env(conda_env, code_dir)
                 if created:
                     conda_python = self.find_conda_python(conda_env)
                     if conda_python:
                         install_info = await self.install_requirements(conda_python, code_dir)
                         runtime_validation = await self.validate_runtime(
-                            conda_python,
-                            code_dir,
-                            execution_policy=execution_policy,
+                            conda_python, code_dir, execution_policy=execution_policy,
                         )
-                        runtime_validation_repair = {
-                            "status": "skipped",
-                            "actions": [],
-                        }
                         return {
                             "kind": "conda",
                             "python": conda_python,
@@ -255,38 +604,33 @@ class RuntimeEnvironmentManager:
                             "environment_file": str(environment_file) if environment_file else "",
                             "dependency_install": install_info,
                             "runtime_validation": runtime_validation,
-                            "runtime_validation_repair": runtime_validation_repair,
+                            "runtime_validation_repair": {"status": "skipped", "actions": []},
                             "execution_policy": execution_policy.to_dict(),
                         }
             self._log(f"Conda env '{conda_env}' not found, falling back to venv")
 
-        if not self.config.auto_create_env:
-            self._log("Automatic env creation disabled, using system Python")
-            install_info = await self.install_requirements(sys.executable, code_dir)
-            runtime_validation = await self.validate_runtime(
-                sys.executable,
-                code_dir,
-                execution_policy=execution_policy,
-            )
-            validation_repair = await self._repair_runtime_validation(
-                kind="system",
-                python=sys.executable,
-                code_dir=code_dir,
-                execution_policy=execution_policy,
-                validation=runtime_validation,
-            )
-            runtime_validation = validation_repair["validation"]
-            return {
-                "kind": "system",
-                "python": sys.executable,
-                "requirements_path": str(requirements_path) if requirements_path.exists() else "",
-                "environment_file": str(environment_file) if environment_file else "",
-                "dependency_install": install_info,
-                "runtime_validation": runtime_validation,
-                "runtime_validation_repair": validation_repair["repair"],
-                "execution_policy": execution_policy.to_dict(),
-            }
+        # ----- Priority 2: auto / forced backend selection ---------------
+        if not force_isolated:
+            backend, backend_forced = self._resolve_backend()
+        else:
+            backend, backend_forced = "venv", False
 
+        if backend == "conda":
+            env_info = await self._create_per_session_conda_env(code_dir, execution_policy)
+            if env_info:
+                return env_info
+            if backend_forced:
+                raise RuntimeError(
+                    "environment_backend='conda' but conda env creation failed.\n"
+                    "Check that conda is working correctly, or set "
+                    "environment_backend='auto' to allow venv fallback."
+                )
+            # Auto-detected conda failed — graceful degradation to venv
+            self._log("Per-session conda env failed, falling back to venv")
+
+        # ----- venv path (default / fallback) ----------------------------
+        # Never fall back to sys.executable to avoid polluting the CLI
+        # Python with experiment dependencies.
         venv_dir = code_dir / ".venv"
         is_windows = platform.system() == "Windows"
         python_path = venv_dir / ("Scripts/python.exe" if is_windows else "bin/python")
@@ -303,32 +647,29 @@ class RuntimeEnvironmentManager:
                 )
                 created = True
                 self._log(f"Venv created (python: {python_path})")
-            except (OSError, subprocess.CalledProcessError) as exc:
-                self._log(f"Venv creation failed: {exc}, falling back to system Python")
-                install_info = await self.install_requirements(sys.executable, code_dir)
-                runtime_validation = await self.validate_runtime(
-                    sys.executable,
-                    code_dir,
-                    execution_policy=execution_policy,
+            except (OSError, subprocess.CalledProcessError) as venv_exc:
+                # ── Auto-repair: venv failed, try conda create ──
+                self._log(
+                    f"Venv creation failed: {venv_exc}. "
+                    "Attempting auto-repair via conda..."
                 )
-                validation_repair = await self._repair_runtime_validation(
-                    kind="system",
-                    python=sys.executable,
-                    code_dir=code_dir,
-                    execution_policy=execution_policy,
-                    validation=runtime_validation,
+                repaired = await self._auto_repair_env(
+                    code_dir, venv_dir, execution_policy,
+                    requirements_path, environment_file,
                 )
-                runtime_validation = validation_repair["validation"]
-                return {
-                    "kind": "system",
-                    "python": sys.executable,
-                    "requirements_path": str(requirements_path) if requirements_path.exists() else "",
-                    "environment_file": str(environment_file) if environment_file else "",
-                    "dependency_install": install_info,
-                    "runtime_validation": runtime_validation,
-                    "runtime_validation_repair": validation_repair["repair"],
-                    "execution_policy": execution_policy.to_dict(),
-                }
+                if repaired is not None:
+                    return repaired
+                # All repair strategies exhausted
+                diag = self._diagnose_env_failure(venv_dir, venv_exc)
+                raise RuntimeError(
+                    f"Environment creation failed and auto-repair exhausted.\n"
+                    f"Diagnosis: {diag}\n"
+                    f"Original venv error: {venv_exc}\n"
+                    "Solutions:\n"
+                    "  1. Set 'experiment_conda_env' to a valid conda env name in config.json\n"
+                    "  2. Install python3-venv: sudo apt install python3-venv\n"
+                    "  3. Ensure sufficient disk space and write permissions"
+                ) from venv_exc
         else:
             self._log(f"Reusing existing venv at {venv_dir}")
 
@@ -917,9 +1258,10 @@ class RuntimeEnvironmentManager:
     @staticmethod
     def find_conda_python(env_name: str) -> str | None:
         """Find the Python executable for a named conda env."""
+        conda_cmd = _find_conda() or "conda"
         try:
             result = subprocess.run(
-                ["conda", "run", "-n", env_name, "python", "-c", "import sys; print(sys.executable)"],
+                [conda_cmd, "run", "-n", env_name, "python", "-c", "import sys; print(sys.executable)"],
                 capture_output=True,
                 text=True,
                 timeout=30,
@@ -931,26 +1273,72 @@ class RuntimeEnvironmentManager:
         except Exception:
             pass
 
+        # Fallback: query conda for env directories, then look for python
         is_windows = platform.system() == "Windows"
-        for base in [
-            Path.home() / "anaconda3",
-            Path.home() / "miniconda3",
-            Path("D:/anaconda"),
-            Path("C:/anaconda3"),
-        ]:
-            python_path = (
-                base / "envs" / env_name / ("python.exe" if is_windows else "bin/python")
+        python_bin = "python.exe" if is_windows else "bin/python"
+        envs_dirs: list[Path] = []
+        try:
+            info_result = subprocess.run(
+                [conda_cmd, "info", "--json"],
+                capture_output=True, text=True, timeout=15,
             )
+            if info_result.returncode == 0:
+                info_data = json.loads(info_result.stdout)
+                # envs_dirs contains directories that hold conda envs
+                # e.g. ["/home/user/anaconda3/envs", "/data/conda_envs"]
+                for ed in info_data.get("envs_dirs", []):
+                    p = Path(ed)
+                    if p not in envs_dirs:
+                        envs_dirs.append(p)
+                # Also derive from root_prefix
+                root_prefix = info_data.get("root_prefix", "")
+                if root_prefix:
+                    default_envs = Path(root_prefix) / "envs"
+                    if default_envs not in envs_dirs:
+                        envs_dirs.append(default_envs)
+        except Exception:
+            pass
+
+        # Static fallbacks (only if dynamic query failed)
+        if not envs_dirs:
+            envs_dirs = [
+                Path.home() / "anaconda3" / "envs",
+                Path.home() / "miniconda3" / "envs",
+                Path("D:/anaconda") / "envs",
+                Path("C:/anaconda3") / "envs",
+            ]
+
+        for envs_dir in envs_dirs:
+            python_path = envs_dir / env_name / python_bin
             if python_path.exists():
                 return str(python_path)
         return None
 
     async def install_requirements(self, python: str, code_dir: Path) -> dict[str, Any]:
-        """Install dependencies from the best available project manifest."""
+        """Install dependencies from the best available project manifest.
+
+        If the project requires PyTorch-family packages and an NVIDIA GPU is
+        detected, installs them from the official PyTorch CUDA wheel index
+        *before* installing the rest of the requirements.  This avoids the
+        common Windows issue where the default PyPI torch wheel doesn't match
+        the system's CUDA/driver configuration and fails with DLL load errors.
+        """
         install_plan = self._select_install_plan(code_dir)
         if install_plan is None:
             self._log("No dependency manifest found, skipping pip install")
             return {"status": "skipped", "source": "", "manifest": ""}
+
+        # ── Pre-install: CUDA-aware PyTorch installation ──
+        gpu_info: dict[str, Any] | None = None
+        torch_pre_installed = False
+        try:
+            gpu_info = _detect_gpu_cuda()
+        except Exception:
+            pass  # GPU detection is best-effort; fall through to normal install
+        if gpu_info is not None:
+            torch_pre_installed = await self._preinstall_torch_cuda(
+                python, code_dir, install_plan, gpu_info,
+            )
 
         self._log(f"Installing dependencies from {install_plan.source} ...")
         loop = asyncio.get_running_loop()
@@ -970,7 +1358,7 @@ class RuntimeEnvironmentManager:
                         cwd=str(code_dir),
                         capture_output=True,
                         text=True,
-                        timeout=600,
+                        timeout=1800,  # 30 min — torch+transformers+datasets can be large
                     ),
                 )
             except Exception as exc:
@@ -986,12 +1374,23 @@ class RuntimeEnvironmentManager:
 
             if proc_result.returncode == 0:
                 self._log(f"Dependency install OK via {install_plan.source} ({strategy})")
-                return {
+                result: dict[str, Any] = {
                     "status": "installed",
                     "source": install_plan.source,
                     "manifest": install_plan.manifest_path,
                     "strategy": strategy,
                 }
+                if torch_pre_installed and gpu_info:
+                    result["torch_cuda"] = {
+                        "gpu": gpu_info["gpu_name"],
+                        "cuda_version": gpu_info["cuda_version_str"],
+                        "torch_tag": gpu_info["torch_tag"],
+                        "index_url": gpu_info["torch_index_url"],
+                    }
+                # ── Post-install: verify torch CUDA actually works ──
+                if torch_pre_installed:
+                    await self._verify_torch_cuda(python, code_dir, gpu_info)
+                return result
 
             stderr = (proc_result.stderr or "").strip()
             self._log(
@@ -1013,17 +1412,283 @@ class RuntimeEnvironmentManager:
             "manifest": install_plan.manifest_path,
         }
 
+    async def _preinstall_torch_cuda(
+        self,
+        python: str,
+        code_dir: Path,
+        install_plan: DependencyInstallPlan,
+        gpu_info: dict[str, Any],
+    ) -> bool:
+        """Install PyTorch-family packages from the official CUDA wheel index.
+
+        Parses the project manifest to find torch-family dependencies, then
+        installs them from ``https://download.pytorch.org/whl/<cuda_tag>``
+        *before* the main pip install runs.  Returns True if any torch packages
+        were pre-installed.
+        """
+        # Read requirements to find torch-family packages
+        torch_specs: list[str] = []
+        manifest_path = Path(install_plan.manifest_path)
+        if manifest_path.suffix == ".txt" and manifest_path.exists():
+            lines = manifest_path.read_text(encoding="utf-8").splitlines()
+            torch_specs, _ = _split_torch_requirements(lines)
+        elif install_plan.source in ("pyproject.toml", "setup.py", "setup.cfg"):
+            # For project installs, just pre-install torch with CUDA
+            torch_specs = ["torch"]
+        else:
+            # environment.yml — check pip deps
+            env_file = Path(install_plan.manifest_path)
+            if env_file.exists():
+                try:
+                    import yaml
+                    data = yaml.safe_load(env_file.read_text(encoding="utf-8"))
+                    for dep_block in (data or {}).get("dependencies", []):
+                        if isinstance(dep_block, dict) and "pip" in dep_block:
+                            pip_deps = dep_block["pip"]
+                            torch_specs, _ = _split_torch_requirements(pip_deps)
+                except Exception:
+                    pass
+            if not torch_specs:
+                # Fallback: check if torch is likely needed
+                torch_specs = ["torch"]
+
+        if not torch_specs:
+            return False
+
+        index_url = gpu_info["torch_index_url"]
+        self._log(
+            f"Pre-installing PyTorch with CUDA support: "
+            f"GPU={gpu_info['gpu_name']}, "
+            f"CUDA={gpu_info['cuda_version_str']}, "
+            f"index={index_url}"
+        )
+        self._log(f"  torch packages: {torch_specs}")
+
+        loop = asyncio.get_running_loop()
+        try:
+            proc = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [
+                        python, "-m", "pip", "install",
+                        *torch_specs,
+                        "--index-url", index_url,
+                        "--quiet",
+                    ],
+                    cwd=str(code_dir),
+                    capture_output=True,
+                    text=True,
+                    timeout=1800,
+                ),
+            )
+            if proc.returncode == 0:
+                self._log("PyTorch CUDA pre-install OK")
+                return True
+            else:
+                stderr = (proc.stderr or "").strip()[:500]
+                self._log(f"PyTorch CUDA pre-install failed (rc={proc.returncode}): {stderr}")
+                # Try without version pin (just 'torch')
+                if torch_specs != ["torch"]:
+                    self._log("Retrying with unversioned 'torch' ...")
+                    proc2 = await loop.run_in_executor(
+                        None,
+                        lambda: subprocess.run(
+                            [
+                                python, "-m", "pip", "install",
+                                "torch", "torchvision", "torchaudio",
+                                "--index-url", index_url,
+                                "--quiet",
+                            ],
+                            cwd=str(code_dir),
+                            capture_output=True,
+                            text=True,
+                            timeout=1800,
+                        ),
+                    )
+                    if proc2.returncode == 0:
+                        self._log("PyTorch CUDA pre-install OK (unversioned)")
+                        return True
+                    stderr2 = (proc2.stderr or "").strip()[:500]
+                    self._log(f"PyTorch CUDA pre-install retry failed: {stderr2}")
+        except Exception as exc:
+            self._log(f"PyTorch CUDA pre-install error: {exc}")
+
+        return False
+
+    async def _verify_torch_cuda(
+        self,
+        python: str,
+        code_dir: Path,
+        gpu_info: dict[str, Any] | None,
+    ) -> None:
+        """Verify that torch imports and CUDA is available post-install."""
+        loop = asyncio.get_running_loop()
+        check_script = (
+            "import torch; "
+            "print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} '  "
+            "f'device_count={torch.cuda.device_count() if torch.cuda.is_available() else 0}')"
+        )
+        try:
+            result = await loop.run_in_executor(
+                None,
+                lambda: subprocess.run(
+                    [python, "-c", check_script],
+                    capture_output=True, text=True, timeout=30,
+                    cwd=str(code_dir),
+                ),
+            )
+            output = (result.stdout or "").strip()
+            if result.returncode == 0:
+                self._log(f"Torch CUDA verification: {output}")
+            else:
+                stderr = (result.stderr or "").strip()[:300]
+                self._log(f"Torch CUDA verification FAILED: {stderr}")
+        except Exception as exc:
+            self._log(f"Torch CUDA verification error: {exc}")
+
+    async def _auto_repair_env(
+        self,
+        code_dir: Path,
+        failed_venv_dir: Path,
+        execution_policy: "ExecutionPolicy",
+        requirements_path: Path,
+        environment_file: Path | None,
+    ) -> dict[str, Any] | None:
+        """Try to repair environment creation after venv failure.
+
+        Strategies (tried in order):
+        1. If conda is available, create a fresh conda env
+        2. If venv dir is corrupted, remove and retry
+
+        Returns env_info dict on success, None if all strategies failed.
+        """
+        # Strategy 1: Try conda — reuse existing or create new
+        # Name is deterministic per session, so resume won't create duplicates.
+        if _find_conda() is not None:
+            auto_env_name = self._per_session_env_name()
+
+            # Check if this env already exists (idempotent on resume)
+            conda_python = self.find_conda_python(auto_env_name)
+            if conda_python:
+                self._log(f"Auto-repair: reusing existing conda env '{auto_env_name}'")
+            else:
+                self._log(f"Auto-repair: creating conda env '{auto_env_name}'")
+                conda_ok = await self.create_conda_env(auto_env_name, code_dir)
+                if conda_ok:
+                    conda_python = self.find_conda_python(auto_env_name)
+
+            if conda_python:
+                self._log(f"Auto-repair SUCCESS: using conda env '{auto_env_name}'")
+                install_info = await self.install_requirements(conda_python, code_dir)
+                runtime_validation = await self.validate_runtime(
+                    conda_python,
+                    code_dir,
+                    execution_policy=execution_policy,
+                )
+                return {
+                    "kind": "conda",
+                    "python": conda_python,
+                    "env_name": auto_env_name,
+                    "created": True,
+                    "auto_repaired": True,
+                    "requirements_path": str(requirements_path) if requirements_path.exists() else "",
+                    "environment_file": str(environment_file) if environment_file else "",
+                    "dependency_install": install_info,
+                    "runtime_validation": runtime_validation,
+                    "runtime_validation_repair": {"status": "skipped", "actions": []},
+                    "execution_policy": execution_policy.to_dict(),
+                }
+            self._log("Auto-repair: conda create also failed")
+
+        # Strategy 2: If venv dir exists but is corrupted, remove and retry
+        if failed_venv_dir.exists():
+            self._log("Auto-repair: removing corrupted venv and retrying")
+            try:
+                shutil.rmtree(str(failed_venv_dir), ignore_errors=True)
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: venv.create(str(failed_venv_dir), with_pip=True),
+                )
+                is_windows = platform.system() == "Windows"
+                python_path = failed_venv_dir / (
+                    "Scripts/python.exe" if is_windows else "bin/python"
+                )
+                if python_path.exists():
+                    self._log("Auto-repair SUCCESS: venv recreated after cleanup")
+                    install_info = await self.install_requirements(str(python_path), code_dir)
+                    runtime_validation = await self.validate_runtime(
+                        str(python_path),
+                        code_dir,
+                        execution_policy=execution_policy,
+                    )
+                    return {
+                        "kind": "venv",
+                        "python": str(python_path),
+                        "env_path": str(failed_venv_dir),
+                        "created": True,
+                        "auto_repaired": True,
+                        "requirements_path": str(requirements_path) if requirements_path.exists() else "",
+                        "environment_file": str(environment_file) if environment_file else "",
+                        "dependency_install": install_info,
+                        "runtime_validation": runtime_validation,
+                        "runtime_validation_repair": {"status": "skipped", "actions": []},
+                        "execution_policy": execution_policy.to_dict(),
+                    }
+            except Exception as retry_exc:
+                self._log(f"Auto-repair: venv retry also failed: {retry_exc}")
+
+        return None
+
+    @staticmethod
+    def _diagnose_env_failure(venv_dir: Path, exc: Exception) -> str:
+        """Produce a human-readable diagnosis for environment creation failure."""
+        reasons = []
+        err_str = str(exc).lower()
+
+        # Check disk space
+        try:
+            import shutil as _shutil
+            usage = _shutil.disk_usage(str(venv_dir.parent))
+            free_gb = usage.free / (1024 ** 3)
+            if free_gb < 1.0:
+                reasons.append(f"Low disk space: {free_gb:.1f} GB free")
+        except Exception:
+            pass
+
+        # Check permissions
+        parent = venv_dir.parent
+        if parent.exists() and not os.access(str(parent), os.W_OK):
+            reasons.append(f"No write permission to {parent}")
+
+        # Check python3-venv package
+        if "ensurepip" in err_str or "no module named" in err_str:
+            reasons.append(
+                "python3-venv package likely missing (install via: "
+                "sudo apt install python3-venv)"
+            )
+
+        # Check if venv module is broken
+        if "permission denied" in err_str:
+            reasons.append("Permission denied — check file system permissions")
+
+        if not reasons:
+            reasons.append(f"Unknown cause: {str(exc)[:200]}")
+
+        return "; ".join(reasons)
+
     async def create_conda_env(self, env_name: str, code_dir: Path) -> bool:
         """Create a conda environment when requested and missing."""
         env_file = self._find_environment_file(code_dir)
-        self._log(f"Creating conda env '{env_name}' ...")
+        conda_cmd = _find_conda() or "conda"
+        self._log(f"Creating conda env '{env_name}' via {conda_cmd} ...")
         loop = asyncio.get_running_loop()
         try:
             if env_file is not None:
                 proc_result = await loop.run_in_executor(
                     None,
                     lambda: subprocess.run(
-                        ["conda", "env", "create", "-n", env_name, "-f", str(env_file)],
+                        [conda_cmd, "env", "create", "-n", env_name, "-f", str(env_file)],
                         cwd=str(code_dir),
                         capture_output=True,
                         text=True,
@@ -1034,7 +1699,7 @@ class RuntimeEnvironmentManager:
                 proc_result = await loop.run_in_executor(
                     None,
                     lambda: subprocess.run(
-                        ["conda", "create", "-y", "-n", env_name, "python=3.10"],
+                        [conda_cmd, "create", "-y", "-n", env_name, "python=3.10"],
                         cwd=str(code_dir),
                         capture_output=True,
                         text=True,

@@ -137,12 +137,11 @@ PAPER_SECTIONS = [
      "If the context contains REAL EXPERIMENT RESULTS (marked as such above), you MUST use\n"
      "those exact numbers in Table~\\ref{tab:main_results} and Table~\\ref{tab:ablation}.\n"
      "Do NOT round, adjust, or modify them.\n"
-     "If results are marked SYNTHETIC or come from figure data, use those numbers in the tables.\n"
-     "NEVER leave the proposed method rows as '--'. Always fill tables with concrete numbers.\n"
-     "If no results are available because the experiment FAILED or did not run,\n"
-     "you MUST clearly state this in the text. Write: 'Due to [reason], we were unable to\n"
-     "obtain experimental results. We present our methodology and leave empirical validation\n"
-     "for future work.' Do NOT fabricate or invent any experimental numbers.\n\n"
+     "If no results are available for the PROPOSED METHOD because the experiment FAILED,\n"
+     "use '--' in the proposed method's table cells. For BASELINE methods, fill in\n"
+     "published numbers from their original papers (cite the source).\n"
+     "Add a note: 'Results for our method are pending due to execution issues.'\n"
+     "Do NOT skip or omit the tables — always include Table 1 and Table 2.\n\n"
      "Do NOT include \\begin{figure} blocks yourself --- figures are inserted automatically "
      "near their \\ref{fig:...} references.",
      []),
@@ -244,6 +243,12 @@ def _escape_latex_text(text: str) -> str:
             if next_char in preservable_after_backslash:
                 result.append(text[i:i + 2])
                 i += 2
+                # BUG-39 fix: track \(...\) inline math mode so that
+                # special chars inside (e.g. x_i) are not escaped.
+                if next_char == '(':
+                    in_math = True
+                elif next_char == ')':
+                    in_math = False
                 continue
 
             result.append(r"\textbackslash{}")
@@ -480,18 +485,36 @@ class WritingAgent(
                     f"{placed_list}\n"
                 )
             # Inject pre-built tables for Experiments section
+            # Tables are injected whether results are real or scaffold (no-data).
+            # Scaffold tables ensure the section always has Table 1/2 structure.
             table_injection = ""
-            if label == "sec:experiments" and grounding.has_real_results:
+            if label == "sec:experiments":
                 table_parts = []
                 if grounding.main_table_latex:
+                    if grounding.has_real_results:
+                        header = "=== PRE-BUILT MAIN RESULTS TABLE (use this EXACTLY, do NOT rebuild) ==="
+                    else:
+                        header = (
+                            "=== SCAFFOLD MAIN RESULTS TABLE ===\n"
+                            "Use this table structure. Fill baseline cells with numbers from "
+                            "their original papers (cite sources). Keep proposed method cells as '--'."
+                        )
                     table_parts.append(
-                        "=== PRE-BUILT MAIN RESULTS TABLE (use this EXACTLY, do NOT rebuild) ===\n"
+                        header + "\n"
                         + grounding.main_table_latex
                         + "\n=== END PRE-BUILT TABLE ==="
                     )
                 if grounding.ablation_table_latex:
+                    if grounding.has_real_results:
+                        header = "=== PRE-BUILT ABLATION TABLE (use this EXACTLY, do NOT rebuild) ==="
+                    else:
+                        header = (
+                            "=== SCAFFOLD ABLATION TABLE ===\n"
+                            "Use this table structure. Keep all cells as '--' since no "
+                            "ablation data is available."
+                        )
                     table_parts.append(
-                        "=== PRE-BUILT ABLATION TABLE (use this EXACTLY, do NOT rebuild) ===\n"
+                        header + "\n"
                         + grounding.ablation_table_latex
                         + "\n=== END PRE-BUILT TABLE ==="
                     )
@@ -533,7 +556,9 @@ class WritingAgent(
             )
 
             # ── Post-generation table verification for Experiments ──
-            if label == "sec:experiments" and grounding.has_real_results:
+            if label == "sec:experiments" and (
+                grounding.main_table_latex or grounding.ablation_table_latex
+            ):
                 content = self._verify_and_inject_tables(
                     content, grounding, heading,
                 )

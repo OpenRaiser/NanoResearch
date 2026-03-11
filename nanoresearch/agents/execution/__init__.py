@@ -11,7 +11,7 @@ from nanoresearch.agents.debug import DebugAgent, MAX_DEBUG_ROUNDS
 from nanoresearch.agents.repair_journal import REPAIR_SNAPSHOT_JOURNAL_PATH
 from nanoresearch.schemas.manifest import PipelineStage
 
-from .cluster_runner import _ClusterRunnerMixin
+from .cluster_runner import _ClusterRunnerMixin, _kill_process_tree
 from .local_runner import _LocalRunnerMixin
 from .repair import _RepairMixin, REMEDIATION_LEDGER_PATH
 from .result_collector import _ResultCollectorMixin

@@ -63,7 +63,16 @@ class _LocalRunnerMixin:
                     files=list(refreshed_runner),
                 )
 
-        runtime_manager = RuntimeEnvironmentManager(self.config, self.log)
+        # Build session label for deterministic conda env naming on auto-repair
+        session_label = ""
+        if hasattr(self, "workspace") and self.workspace:
+            m = self.workspace.manifest
+            sid = m.session_id[:8]
+            slug = m.topic[:20].replace(" ", "_") if m.topic else ""
+            session_label = f"{slug}_{sid}" if slug else sid
+        runtime_manager = RuntimeEnvironmentManager(
+            self.config, self.log, session_label=session_label,
+        )
         runtime_env = await runtime_manager.prepare(code_dir)
         self._record_runtime_env_ledger(runtime_env, remediation_ledger)
         runtime_python = str(runtime_env.get("python", "python"))
@@ -429,10 +438,14 @@ class _LocalRunnerMixin:
         fix_history: list[dict[str, Any]] = []
 
         for cycle in range(1, max_fix_cycles + 1):
+            # Use local_execution_timeout (default 1800s) instead of the
+            # previous hardcoded 120s.  Dataset downloads + model init can
+            # easily exceed 2 minutes on first run.
+            dry_run_timeout = max(120, int(self.config.local_execution_timeout))
             result = await self._run_subprocess(
                 self._command_with_mode(base_command, "--dry-run"),
                 cwd=code_dir,
-                timeout=120,
+                timeout=dry_run_timeout,
             )
             last_result = result
             if result["returncode"] == 0:

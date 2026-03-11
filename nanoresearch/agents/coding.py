@@ -231,15 +231,19 @@ class CodingAgent(BaseResearchAgent):
             "You are a senior ML research engineer designing a runnable experiment project. "
             "Based on the experiment blueprint and analysis of existing codebases, "
             "design a complete, runnable training project. The code must:\n"
-            "1. Actually run on a GPU cluster via SLURM\n"
+            "1. Actually run on a GPU cluster via SLURM or locally\n"
             "2. Use PyTorch and standard ML libraries\n"
             "3. Include proper training loop, evaluation, checkpointing\n"
             "4. Log metrics to a results file (JSON or CSV)\n"
             "5. Support command-line arguments for hyperparameters\n"
-            "6. Use the EXACT data/model paths provided below (data is already downloaded)\n"
-            "7. ONLY use data files listed as AVAILABLE below — never reference NOT AVAILABLE resources\n"
-            "8. If a dataset you need is NOT AVAILABLE, SIMPLIFY your approach to work without it\n"
-            "9. All file paths must be ABSOLUTE paths from the AVAILABLE list, never relative like ./data/\n"
+            "6. If a dataset is listed as AVAILABLE below, use its exact path\n"
+            "7. If a dataset is NOT AVAILABLE, the code MUST download it at runtime "
+            "using `datasets.load_dataset()`, `torchvision.datasets`, `urllib`, `requests`, "
+            "or `git clone` — whichever is appropriate. NEVER generate synthetic/random/fake data.\n"
+            "8. All runtime downloads MUST go to the Data directory path below (use as root/cache_dir)\n"
+            "9. All file paths must be ABSOLUTE, never relative like ./data/\n"
+            "10. NEVER fall back to synthetic data. If a dataset truly cannot be downloaded, "
+            "use a publicly available alternative dataset for the same task from HuggingFace Hub.\n"
             "Return JSON only."
         )
 
@@ -262,14 +266,17 @@ Code Analysis from Cloned Repos:
 
 Available cloned repos: {json.dumps([r['name'] for r in cloned_repos])}
 
-IMPORTANT: The data and models listed above are ALREADY downloaded. Your code must load them from those exact paths. Do NOT write download logic — data is already there.
-
-CRITICAL CONSTRAINT: Your code must ONLY load data from paths listed as AVAILABLE above.
-- If a dataset is listed as NOT AVAILABLE, do NOT use it. Adapt the method to work without it.
-- Do NOT invent or guess file paths. Only use exact absolute paths from the AVAILABLE list.
-- Do NOT write any download logic (wget, requests.get, urllib) for datasets.
-- Every data loading operation must use a path from the AVAILABLE list.
-- Use ABSOLUTE paths (starting with /) as argparse defaults, never relative paths like ./data/.
+IMPORTANT — DATA HANDLING:
+- For AVAILABLE datasets above: load them from their exact paths.
+- For NOT AVAILABLE datasets: your code MUST download them at runtime using
+  `datasets.load_dataset()`, `torchvision.datasets`, `urllib`, or `requests`.
+  Save ALL downloads to the Data directory listed above (as root/cache_dir).
+  Example: `datasets.load_dataset('dataset_name', cache_dir=args.data_dir)`
+  Example: `torchvision.datasets.CIFAR10(root=args.data_dir, download=True)`
+  NEVER use default cache like `~/.cache/` or `./data/`.
+- NEVER generate synthetic/random/fake data as a substitute. If the exact dataset
+  is unavailable from any public source, use a real alternative from HuggingFace Hub.
+- Use ABSOLUTE paths as argparse defaults, never relative paths like ./data/.
 - CROSS-FILE CONSISTENCY: If train.py calls `model.create_model()`, then model.py MUST define `def create_model()`.
   Every module.function() call must correspond to an actual function defined in that module.
   Every `from X import Y` must import a name that exists in X.
@@ -398,11 +405,17 @@ IMPORTANT:
   For example, if train.py does `from dataset import MyDataset`, then dataset.py MUST define `class MyDataset`.
   If train.py does `import model; model.create_model(...)`, then model.py MUST define `def create_model(...)`.
   Double-check every cross-file import AND every module.function() call before writing the code.
-- DO NOT write download logic for data/models — they are already downloaded at the paths above.
-- Use the EXACT file paths listed above as argparse defaults.
-- ONLY use file paths from the AVAILABLE list above. If a path is not listed, it does NOT exist.
+- For AVAILABLE datasets: use their exact file paths as argparse defaults.
+- For NOT AVAILABLE datasets: write code to DOWNLOAD them at runtime.
+  * Prefer `datasets.load_dataset('dataset_name', cache_dir=args.data_dir)` from HuggingFace Hub.
+  * Or use `torchvision.datasets.XXX(root=args.data_dir, download=True)`.
+  * Or use `urllib.request.urlretrieve()` / `requests.get()` for direct URLs.
+  * Or use `subprocess.run(['git', 'clone', url, target_dir])` for GitHub repos.
+  * Save ALL downloads to args.data_dir (the Data directory path above).
+  * NEVER generate synthetic/random/fake data. NEVER use `torch.randn` as training data.
+  * If the exact dataset is unavailable on any public source, find a real alternative
+    dataset for the same task on HuggingFace Hub and use that instead.
 - Do NOT use relative paths like ./data/ or ./models/. Use the exact absolute paths provided.
-- If the blueprint mentions a dataset that was NOT downloaded (listed as NOT AVAILABLE), do NOT use it. Adapt your code to work without it.
 - COMMON ML PITFALLS — you MUST handle these:
   * When loading pretrained models with a different number of classes, use `ignore_mismatched_sizes=True` in from_pretrained().
   * If data files are archives (.tar.gz, .zip, .tar), decompress them before use. Add decompression logic in dataset loading.
@@ -454,15 +467,21 @@ Return ONLY the Python code, no markdown fences."""
             num_gpus = 1
         project_name = code_plan.get("project_name", "experiment")
 
+        # BUG-16 fix: read SLURM partition from config instead of hardcoding
+        partition = getattr(self.config, "slurm_partition", "gpu")
+        # Use estimated time from blueprint, default to 1 day
+        estimated_time = compute.get("estimated_time", "1-00:00:00")
+        # BUG-17 fix: read conda env from config instead of hardcoding
+        conda_env = getattr(self.config, "experiment_conda_env", None)
+
         script = f"""#!/bin/bash
 #SBATCH --job-name={project_name[:15]}
-#SBATCH --partition=belt_road
-#SBATCH --quotatype=reserved
+#SBATCH --partition={partition}
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=16
 #SBATCH --gres=gpu:{num_gpus}
-#SBATCH --time=7-00:00:00
+#SBATCH --time={estimated_time}
 #SBATCH --output={code_dir}/logs/slurm_%j.out
 #SBATCH --error={code_dir}/logs/slurm_%j.err
 
@@ -473,9 +492,25 @@ echo "GPUs: $CUDA_VISIBLE_DEVICES"
 echo "Start: $(date)"
 echo "========================================"
 
-# Setup environment
-source ~/anaconda3/etc/profile.d/conda.sh
-conda activate torch
+# Setup environment — auto-detect conda location
+CONDA_SH="$HOME/anaconda3/etc/profile.d/conda.sh"
+[ ! -f "$CONDA_SH" ] && CONDA_SH="$HOME/miniconda3/etc/profile.d/conda.sh"
+[ ! -f "$CONDA_SH" ] && CONDA_SH="$(conda info --base 2>/dev/null)/etc/profile.d/conda.sh"
+source "$CONDA_SH" 2>/dev/null || true
+"""
+        if conda_env:
+            script += f'conda activate {conda_env}\n'
+        else:
+            # Try common env names
+            script += """if conda env list 2>/dev/null | grep -q "^torch "; then
+    conda activate torch
+elif conda env list 2>/dev/null | grep -q "^nanoresearch "; then
+    conda activate nanoresearch
+else
+    echo "Warning: no suitable conda env found, using base"
+fi
+"""
+        script += f"""
 
 # Enable proxy for downloading models/data (read from environment)
 export https_proxy="${{HTTPS_PROXY:-}}"
@@ -515,7 +550,7 @@ exit $EXIT_CODE
         """
         lines = []
         if data_dir:
-            lines.append(f"Data directory: {data_dir}")
+            lines.append(f"Data directory (for ALL dataset downloads): {data_dir}")
         if models_dir:
             lines.append(f"Models directory: {models_dir}")
         lines.append("")
@@ -542,7 +577,7 @@ exit $EXIT_CODE
         lines.append("=== AVAILABLE (you may ONLY use these) ===")
         lines.extend(available if available else ["  (none)"])
         lines.append("")
-        lines.append("=== NOT AVAILABLE (do NOT reference these in code) ===")
+        lines.append("=== NOT AVAILABLE (must be DOWNLOADED at runtime in code — NEVER use synthetic data) ===")
         lines.extend(unavailable if unavailable else ["  (none)"])
 
         return "\n".join(lines)
@@ -553,13 +588,27 @@ exit $EXIT_CODE
         if not deps:
             deps = ["torch", "numpy", "pandas", "scikit-learn", "matplotlib", "tqdm"]
 
-        # Ensure core deps are present
-        essential = {"torch", "numpy"}
+        # BUG-23 fix: compare base package names (stripping version specifiers)
+        # to avoid duplicates like "torch" and "torch>=2.0.0"
+        def _pkg_base(spec: str) -> str:
+            return _re.split(r'[>=<!~\[]', spec)[0].strip().lower()
+
+        existing_bases = {_pkg_base(d) for d in deps}
+        essential = {"torch", "numpy", "datasets", "requests", "Pillow"}
         for d in essential:
-            if d not in deps:
+            if d.lower() not in existing_bases:
                 deps.append(d)
 
-        return "\n".join(sorted(set(deps))) + "\n"
+        # Deduplicate by base name (keep first occurrence / version-pinned variant)
+        seen_bases: set[str] = set()
+        deduped: list[str] = []
+        for d in deps:
+            base = _pkg_base(d)
+            if base not in seen_bases:
+                seen_bases.add(base)
+                deduped.append(d)
+
+        return "\n".join(sorted(deduped)) + "\n"
 
     def _generate_environment_yaml(self, code_plan: dict) -> str:
         """Generate a lightweight conda environment file from the code plan."""
@@ -613,14 +662,16 @@ exit $EXIT_CODE
 
         issues = []
         seen: set[tuple[str, str]] = set()
-        for py_file in code_dir.glob("*.py"):
+        for py_file in code_dir.rglob("*.py"):
             content = py_file.read_text(errors="replace")
+            # Use path relative to code_dir for readable diagnostics
+            rel_name = str(py_file.relative_to(code_dir))
             for pattern in path_patterns:
                 for match in _re.finditer(pattern, content):
                     ref_path = match.group(1)
                     if not ref_path or not ref_path.startswith("/"):
                         continue
-                    key = (py_file.name, ref_path)
+                    key = (rel_name, ref_path)
                     if key in seen:
                         continue
                     seen.add(key)
@@ -631,7 +682,7 @@ exit $EXIT_CODE
                     if any(ref_path.startswith(vp) for vp in valid_paths if vp):
                         continue
                     issues.append({
-                        "file": py_file.name,
+                        "file": rel_name,
                         "path": ref_path,
                     })
 
@@ -657,10 +708,11 @@ exit $EXIT_CODE
 
         self.log(f"Found {len(mismatches)} import mismatches, asking LLM to fix")
 
-        # Read all source files
+        # Read all source files (recursive to catch subpackages)
         all_sources = {}
-        for py_file in code_dir.glob("*.py"):
-            all_sources[py_file.name] = py_file.read_text(errors="replace")
+        for py_file in code_dir.rglob("*.py"):
+            rel_name = str(py_file.relative_to(code_dir))
+            all_sources[rel_name] = py_file.read_text(errors="replace")
 
         source_listing = ""
         for fname, content in sorted(all_sources.items()):

@@ -62,7 +62,19 @@ def _compact_messages_if_needed(messages: list[dict]) -> None:
     the threshold, truncate tool results in older messages (keeping the last
     N turns intact). Modifies messages in-place.
     """
-    total_chars = sum(len(m.get("content", "") or "") for m in messages)
+    # BUG-12 fix: handle multimodal messages where content is a list
+    # of dicts (e.g. [{"type":"text","text":"..."}, {"type":"image_url",...}]).
+    def _content_len(content: Any) -> int:
+        if isinstance(content, str):
+            return len(content)
+        if isinstance(content, list):
+            return sum(
+                len(item.get("text", ""))
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return 0
+    total_chars = sum(_content_len(m.get("content")) for m in messages)
     if total_chars < _CONTEXT_COMPACT_THRESHOLD_CHARS:
         return
 
@@ -602,7 +614,10 @@ class BaseResearchAgent(ABC):
                     "gathered from tools to write high-quality content. "
                     "Do NOT continue searching indefinitely."
                 )
-                messages.append({"role": "user", "content": _reminder})
+                # BUG-11 fix: use "system" role for reminders so models
+                # don't interpret it as a new conversation turn that
+                # overrides tool results.
+                messages.append({"role": "system", "content": _reminder})
 
         # Exceeded max rounds — do a final summary call without tools
         self.log(f"Exceeded {max_tool_rounds} tool rounds, forcing final answer")
@@ -622,3 +637,20 @@ class BaseResearchAgent(ABC):
 
     def save_log(self, filename: str, content: str) -> None:
         self.workspace.write_text(f"logs/{filename}", content)
+
+    def _resolve_experiment_python(self) -> str:
+        """Return the experiment venv Python path if available, else sys.executable.
+
+        Chart/analysis scripts may need packages installed in the experiment
+        venv (matplotlib, seaborn, etc.) rather than the orchestrator's Python.
+        """
+        import os
+        import sys
+        exp_dir = self.workspace.path / "experiment"
+        if os.name == "nt":
+            venv_py = exp_dir / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_py = exp_dir / ".venv" / "bin" / "python"
+        if venv_py.exists():
+            return str(venv_py)
+        return sys.executable

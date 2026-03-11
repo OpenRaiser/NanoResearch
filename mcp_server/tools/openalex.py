@@ -245,6 +245,121 @@ async def enrich_citation_counts_openalex(
     return papers
 
 
+async def get_openalex_references(
+    papers: list[dict[str, Any]],
+    top_k: int = 5,
+    max_new: int = 20,
+) -> list[dict[str, Any]]:
+    """Snowball sampling via OpenAlex: get referenced works for top-cited papers.
+
+    For each paper, looks up its OpenAlex record to get `referenced_works`
+    (list of OpenAlex IDs), then batch-fetches those works.
+
+    Args:
+        papers: Papers to expand from.
+        top_k: How many top-cited papers to expand.
+        max_new: Max new papers to return.
+
+    Returns:
+        List of new paper dicts found via reference expansion.
+    """
+    # Pick top-K papers that have an openalex_id or DOI for lookup
+    candidates = []
+    for p in papers:
+        oa_id = (p.get("openalex_id") or "").strip()
+        doi = (p.get("doi") or "").strip()
+        title = (p.get("title") or "").strip()
+        if oa_id or doi or len(title) >= 10:
+            candidates.append(p)
+    candidates.sort(key=lambda p: p.get("citation_count", 0) or 0, reverse=True)
+    candidates = candidates[:top_k]
+
+    if not candidates:
+        return []
+
+    # Step 1: Resolve each candidate to an OpenAlex work with referenced_works
+    all_ref_ids: list[str] = []
+    existing_titles = {(p.get("title") or "").lower().strip() for p in papers}
+
+    for p in candidates:
+        oa_id = (p.get("openalex_id") or "").strip()
+        doi = (p.get("doi") or "").strip()
+
+        # Build lookup URL
+        lookup_id = ""
+        if oa_id:
+            lookup_id = oa_id
+        elif doi:
+            lookup_id = f"doi:{doi}"
+
+        ref_ids: list[str] = []
+        if lookup_id:
+            ref_ids = await _fetch_referenced_works(lookup_id)
+        else:
+            # Try title search to find the OpenAlex ID
+            title = (p.get("title") or "").strip()
+            match = await search_openalex_by_title(title)
+            if match and match.get("openalex_id"):
+                p["openalex_id"] = match["openalex_id"]
+                ref_ids = await _fetch_referenced_works(match["openalex_id"])
+
+        all_ref_ids.extend(ref_ids)
+
+    if not all_ref_ids:
+        return []
+
+    # Deduplicate reference IDs
+    unique_ref_ids = list(dict.fromkeys(all_ref_ids))  # preserve order, dedup
+
+    # Step 2: Batch fetch referenced works
+    new_papers = await get_openalex_papers_batch(unique_ref_ids)
+
+    # Filter out papers we already have
+    result = []
+    for p in new_papers:
+        title_lower = (p.get("title") or "").lower().strip()
+        if title_lower and title_lower not in existing_titles:
+            existing_titles.add(title_lower)
+            result.append(p)
+        if len(result) >= max_new * 3:  # over-fetch, caller will filter by citation count
+            break
+
+    return result
+
+
+async def _fetch_referenced_works(openalex_id: str) -> list[str]:
+    """Fetch the referenced_works list for a single OpenAlex work.
+
+    Returns list of short OpenAlex IDs (e.g. ["W123", "W456"]).
+    """
+    await _limiter.acquire()
+    params = _common_params()
+    params["select"] = "id,referenced_works"
+
+    try:
+        async with get_http_client() as client:
+            resp = await fetch_with_retry(
+                client.get, f"{OA_API_URL}/works/{openalex_id}",
+                params=params,
+                max_retries=4,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("OpenAlex referenced_works failed for %s: %s", openalex_id, exc)
+        return []
+
+    refs = data.get("referenced_works", []) or []
+    # Convert full URLs to short IDs: "https://openalex.org/W123" → "W123"
+    result = []
+    for ref_url in refs:
+        if isinstance(ref_url, str) and "/" in ref_url:
+            result.append(ref_url.rsplit("/", 1)[-1])
+        elif isinstance(ref_url, str):
+            result.append(ref_url)
+    return result
+
+
 def _reconstruct_abstract(inverted_index: dict | None) -> str:
     """Reconstruct abstract from OpenAlex inverted index format."""
     if not inverted_index or not isinstance(inverted_index, dict):

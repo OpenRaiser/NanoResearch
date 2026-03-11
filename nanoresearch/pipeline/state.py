@@ -68,6 +68,18 @@ class PipelineStateMachine:
         self._current = target
         return self._current
 
+    def force_set(self, stage: PipelineStage) -> None:
+        """Force state to a specific stage, bypassing transition validation.
+
+        BUG-21 fix: used during checkpoint resume where we know the stage
+        was previously completed. Logs a warning for auditability.
+        """
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "Force-setting state to %s (was %s)", stage.value, self._current.value,
+        )
+        self._current = stage
+
     def fail(self) -> PipelineStage:
         """Shortcut to transition to FAILED from any non-terminal stage."""
         if self.is_terminal:

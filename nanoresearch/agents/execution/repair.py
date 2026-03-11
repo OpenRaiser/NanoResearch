@@ -995,6 +995,19 @@ class _RepairMixin:
             unique.append(candidate)
         if len(unique) == 1:
             return unique[0]
+        if len(unique) > 1:
+            # Heuristic: prefer most recently modified file (same logic as
+            # _choose_latest_path) so callers don't silently get None.
+            logger.debug(
+                "_choose_single_path: %d candidates, picking most recent: %s",
+                len(unique), [str(p) for p in unique],
+            )
+            def _mtime(p: Path) -> float:
+                try:
+                    return p.stat().st_mtime
+                except OSError:
+                    return -1.0
+            return max(unique, key=_mtime)
         return None
 
     @staticmethod
@@ -1995,7 +2008,7 @@ class _RepairMixin:
             )
             return actions
 
-        for module_name in missing_modules[:3]:
+        for module_name in missing_modules:
             allowed_candidates = [
                 package_name
                 for package_name in self._candidate_package_names(module_name, code_dir)

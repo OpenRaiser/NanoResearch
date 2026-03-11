@@ -128,7 +128,7 @@ class _QuickEvalMixin:
             # Check if metrics.json was written/updated DURING this run (not stale from previous round)
             if metrics_path.exists():
                 mtime_after = metrics_path.stat().st_mtime
-                if mtime_before is None or mtime_after > mtime_before:
+                if mtime_before is not None and mtime_after > mtime_before:
                     metrics = self._parse_metrics_json(code_dir)
                     if metrics:
                         self.log("Quick-eval timed out BUT metrics.json was updated during run — treating as success")

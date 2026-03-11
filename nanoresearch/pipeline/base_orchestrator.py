@@ -140,7 +140,9 @@ class BaseOrchestrator(ABC):
                     )
                     output = self._load_stage_output(stage, require=True)
                     results.update(output)
-                    self.state_machine._current = stage
+                    # BUG-21 fix: use force_set() with logging instead of
+                    # directly mutating private _current attribute.
+                    self.state_machine.force_set(stage)
                     continue
 
                 # Skip stages configured to be skipped
@@ -151,10 +153,12 @@ class BaseOrchestrator(ABC):
                             self.state_machine.transition(stage)
                         else:
                             logger.warning(
-                                "Skipping stage %s from non-adjacent state %s",
+                                "Skipping stage %s from non-adjacent state %s; "
+                                "forcing state machine to match",
                                 stage.value,
                                 self.state_machine.current.value,
                             )
+                            self.state_machine.force_set(stage)
                     self.workspace.update_manifest(current_stage=stage)
                     self._report_progress(
                         stage.value, "skipped",
@@ -247,6 +251,19 @@ class BaseOrchestrator(ABC):
 
             return results
         except Exception:
+            # Save cost summary even on failure so users can see token usage
+            try:
+                cost_summary = self.cost_tracker.summary()
+                self.workspace.write_json("logs/cost_summary.json", cost_summary)
+                if cost_summary["total_tokens"] > 0:
+                    logger.info(
+                        "Cost summary (on failure): %d total tokens, %d calls, %.1fs total latency",
+                        cost_summary["total_tokens"],
+                        cost_summary["total_calls"],
+                        cost_summary["total_latency_ms"] / 1000,
+                    )
+            except Exception as cost_exc:
+                logger.debug("Failed to save cost summary on failure: %s", cost_exc)
             self.progress_emitter.pipeline_complete(False, f"{mode_label.capitalize()} pipeline failed")
             raise
 

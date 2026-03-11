@@ -387,7 +387,9 @@ class _ResultCollectorMixin:
                 candidates.extend(sorted((code_dir / "logs").glob(pattern)))
 
             for log_file in candidates:
-                if job_id in log_file.name:
+                # BUG-34 fix: use word-boundary match instead of substring
+                # to avoid "123" matching "slurm_1234.out".
+                if re.search(rf'(?:^|[_\-])({re.escape(job_id)})(?:$|[_\-.])', log_file.name):
                     return log_file.read_text(errors="replace")[-limit:]
 
             for log_file in candidates:

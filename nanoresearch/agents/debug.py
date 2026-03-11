@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re as _re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -82,10 +84,22 @@ class DebugAgent(BaseResearchAgent):
                 }
             # Download failed — fall through, but tell LLM to simplify
 
+        # Step 1c: Collect environment context for infrastructure-aware diagnosis
+        env_context = ""
+        if self._looks_like_infra_error(stderr_log, stdout_log) or debug_round >= 3:
+            # Probe environment when error looks like infra, or after 2 failed
+            # code-fix rounds (maybe we've been fixing the wrong thing)
+            self.log("Collecting environment diagnostics for infrastructure-aware diagnosis")
+            try:
+                env_context = self._probe_env_sync(code_dir)
+            except Exception as exc:
+                logger.debug("Environment probe failed: %s", exc)
+                env_context = "(environment probe failed)"
+
         # Step 2: Ask LLM to diagnose and generate patches
         diagnosis, patches = await self._diagnose_and_patch(
             source_files, stdout_log, stderr_log, job_status,
-            debug_round, previous_fixes,
+            debug_round, previous_fixes, env_context=env_context,
         )
         self.log(f"Diagnosis: {diagnosis[:200]}")
         self.log(f"Generated {len(patches)} patches")
@@ -145,6 +159,95 @@ class DebugAgent(BaseResearchAgent):
         self.workspace.write_json(f"plans/debug_round_{debug_round}.json", result)
         return result
 
+    # ------------------------------------------------------------------
+    # Environment probing (infrastructure-level diagnostics)
+    # ------------------------------------------------------------------
+
+    def _probe_env_sync(self, code_dir: Path) -> str:
+        """Collect environment info synchronously for inclusion in LLM context.
+
+        Returns a formatted string with GPU, Python, torch, pip info so the LLM
+        can distinguish infrastructure errors from code bugs.
+        """
+        lines: list[str] = []
+
+        def _run(cmd: str, timeout: int = 10) -> str:
+            try:
+                r = subprocess.run(
+                    cmd, shell=True, capture_output=True, text=True,
+                    timeout=timeout, cwd=str(code_dir),
+                )
+                return (r.stdout.strip() or r.stderr.strip())[:500]
+            except Exception:
+                return "(unavailable)"
+
+        # Find the right python — prefer venv inside code_dir
+        python_cmd = "python"
+        if os.name == "nt":
+            venv_py = code_dir / ".venv" / "Scripts" / "python.exe"
+        else:
+            venv_py = code_dir / ".venv" / "bin" / "python"
+        if venv_py.exists():
+            python_cmd = str(venv_py)
+
+        lines.append(f"Python: {_run(f'{python_cmd} --version')}")
+        lines.append(f"Python path: {_run(f'{python_cmd} -c \"import sys; print(sys.executable)\"')}")
+
+        # GPU / CUDA
+        if shutil.which("nvidia-smi"):
+            lines.append(f"GPU: {_run('nvidia-smi --query-gpu=name,memory.total,memory.used,driver_version --format=csv,noheader,nounits')}")
+            # Extract CUDA version from nvidia-smi header
+            smi_header = _run("nvidia-smi 2>&1 | head -3")
+            import re as _re2
+            m = _re2.search(r"CUDA Version:\s*([\d.]+)", smi_header)
+            if m:
+                lines.append(f"CUDA Driver Version: {m.group(1)}")
+        else:
+            lines.append("GPU: nvidia-smi not found")
+
+        # torch status
+        torch_script = (
+            "import torch; "
+            "print('torch=' + torch.__version__); "
+            "print('cuda_avail=' + str(torch.cuda.is_available())); "
+            "print('cuda_ver=' + str(torch.version.cuda)); "
+            "print('devices=' + str(torch.cuda.device_count()))"
+        )
+        torch_info = _run(f'{python_cmd} -c "{torch_script}"')
+        lines.append(f"Torch: {torch_info}")
+
+        # Key packages (short list)
+        pkg_check = _run(
+            f"{python_cmd} -m pip list --format=columns 2>/dev/null "
+            "| grep -iE 'torch|transformers|datasets|numpy|scipy|scikit|tensorflow|jax' "
+            "| head -15"
+        )
+        if pkg_check and pkg_check != "(unavailable)":
+            lines.append(f"Key packages:\n{pkg_check}")
+
+        return "\n".join(lines)
+
+    _INFRA_ERROR_PATTERNS = [
+        "dll load failed",
+        "winerror",
+        "oserror: libcu",
+        "cuda",
+        "glibc",
+        "modulenotfounderror",
+        "no module named",
+        "command timed out",
+        "timed out after",
+        "out of memory",
+        "oom",
+        "permission denied",
+        "torch.cuda.is_available",
+    ]
+
+    def _looks_like_infra_error(self, stderr_log: str, stdout_log: str) -> bool:
+        """Heuristic: does the error look like an infrastructure problem?"""
+        combined = (stderr_log + stdout_log).lower()
+        return any(pat in combined for pat in self._INFRA_ERROR_PATTERNS)
+
     def _read_all_sources(self, code_dir: Path) -> dict[str, str]:
         """Read all Python and shell files in the experiment directory."""
         sources = {}
@@ -165,6 +268,7 @@ class DebugAgent(BaseResearchAgent):
         job_status: str,
         debug_round: int,
         previous_fixes: list[dict],
+        env_context: str = "",
     ) -> tuple[str, list[dict]]:
         """Send full context to LLM, get diagnosis + structured patches."""
 
@@ -192,18 +296,40 @@ class DebugAgent(BaseResearchAgent):
                     fix_history += f"  - Patched {p.get('file', '?')}: {p.get('description', '?')}\n"
             fix_history += "\nDo NOT repeat the same fixes. Try a different approach.\n"
 
-        system_prompt = """You are an expert ML engineer debugging a failed training job on a SLURM GPU cluster.
+        system_prompt = """You are an expert ML engineer debugging a failed training job.
 
 Your task:
-1. Analyze the error logs and source code to identify the ROOT CAUSE of the failure
-2. Generate precise file patches to fix the issue
+1. FIRST classify the error: is it infrastructure (Layer 1), configuration (Layer 2), or code (Layer 3)?
+2. Analyze the error logs, source code, AND environment info to identify the ROOT CAUSE
+3. Generate precise file patches to fix the issue
+
+## Error Classification (check in this order):
+
+**Layer 1 — Environment / Infrastructure:**
+- DLL load failed / OSError: libcudart / WinError → Wrong PyTorch build (CPU vs CUDA mismatch)
+  Fix: add `subprocess.run([pip, "install", "torch", "--index-url", "https://download.pytorch.org/whl/cu124"])` in setup
+- ModuleNotFoundError → Package not installed or wrong python env
+  Fix: add missing package to requirements.txt or imports
+- CUDA out of memory → reduce batch_size/model_size in code, or kill zombie GPU processes
+- torch.cuda.is_available()==False when GPU exists → CPU-only torch was installed
+- GLIBC_X.XX not found → system too old, need container
+
+**Layer 2 — Configuration / Timeout:**
+- "Command timed out" → NOT a code bug! Process was still running. Don't change code.
+- API rate limit (429) → add retry/backoff
+- PermissionError → file permissions issue
+
+**Layer 3 — Code bugs (fix only AFTER ruling out Layer 1-2):**
+- SyntaxError, NameError, TypeError, ValueError, etc.
+
+IMPORTANT: If the environment info shows torch.cuda.is_available()=False but nvidia-smi shows a GPU,
+the fix is to REINSTALL torch from the correct CUDA index, NOT to change the training code.
 
 Rules:
 - Focus on the actual error, not style issues
 - Each patch must specify the EXACT old text to replace (copy-paste from the source, including indentation)
 - Only patch what's necessary to fix the error
 - If multiple files have related issues (e.g., mismatched imports), fix all of them
-- Common issues: import name mismatches, missing dependencies, wrong file paths, conda/env issues
 - If the error is a missing DATA file (FileNotFoundError on .csv, .obo, .gaf, .fasta, etc.),
   do NOT write download code (wget, requests, urllib). Instead, REMOVE or SIMPLIFY the code
   that requires the missing file. Comment it out or use a simpler alternative approach.
@@ -213,13 +339,17 @@ Rules:
   * Data archives (.tar.gz, .zip) not decompressed → add decompression logic before loading
   * `import X; X.func()` where func doesn't exist in X → add the missing factory function to X
   * Script catches exceptions but exits with code 0 → add `sys.exit(1)` in except blocks
+  * Windows: DataLoader with num_workers>0 causes DLL errors → set num_workers=0
+- For environment fixes that need shell commands (pip install, etc.), create or patch a setup.sh
+  or add the fix to the experiment's setup phase
 - IMPORTANT: The "old" field must be an EXACT substring of the file content (verbatim, preserving whitespace)
 - IMPORTANT: The "new" field must have correct Python indentation
 - When adding new functions/classes to a file, include them as a separate patch with "old" being the last few lines of the file
 
 Return JSON:
 {
-  "diagnosis": "Clear explanation of the root cause",
+  "diagnosis": "Clear explanation of the root cause, including which Layer (1/2/3) it is",
+  "error_layer": "infrastructure|configuration|code",
   "patches": [
     {
       "file": "filename.py",
@@ -230,9 +360,14 @@ Return JSON:
   ]
 }"""
 
-        user_prompt = f"""SLURM Job Status: {job_status}
-Debug Round: {debug_round}/{MAX_DEBUG_ROUNDS}
+        # Build environment context block
+        env_block = ""
+        if env_context:
+            env_block = f"\n=== ENVIRONMENT INFO ===\n{env_context}\n"
 
+        user_prompt = f"""Job Status: {job_status}
+Debug Round: {debug_round}/{MAX_DEBUG_ROUNDS}
+{env_block}
 === STDERR ===
 {stderr_tail}
 
@@ -242,7 +377,7 @@ Debug Round: {debug_round}/{MAX_DEBUG_ROUNDS}
 === ALL SOURCE FILES ===
 {source_listing}
 {fix_history}
-Diagnose the root cause and generate patches to fix it. Return JSON only."""
+FIRST classify the error (infrastructure / configuration / code), THEN diagnose the root cause and generate patches. Return JSON only."""
 
         result = await self.generate_json(system_prompt, user_prompt)
 

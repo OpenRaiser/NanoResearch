@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from pathlib import Path
 import platform
 import shutil
@@ -11,12 +12,15 @@ import venv as stdlib_venv
 
 import pytest
 
+import nanoresearch.agents.runtime_env as _runtime_env_mod
 from nanoresearch.agents.runtime_env import RuntimeEnvironmentManager
 from nanoresearch.config import ResearchConfig
 
 
 @pytest.mark.asyncio
-async def test_prepare_system_python_still_installs_dependencies() -> None:
+async def test_prepare_always_creates_venv_never_uses_system_python() -> None:
+    """Without experiment_conda_env, prepare() must create a venv instead
+    of falling back to sys.executable (which would pollute the CLI env)."""
     tmp_dir = Path(f".test_runtime_{uuid.uuid4().hex[:8]}")
     tmp_dir.mkdir()
     try:
@@ -28,30 +32,18 @@ async def test_prepare_system_python_still_installs_dependencies() -> None:
             base_url="http://localhost:8000/v1/",
             api_key="test-key",
             auto_create_env=False,
+            environment_backend="venv",
         )
         manager = RuntimeEnvironmentManager(config)
 
-        async def fake_install(python: str, target_dir: Path) -> dict:
-            assert python
-            assert target_dir == code_dir
-            return {"status": "installed", "source": "requirements.txt"}
-
-        async def fake_validate(python: str, target_dir: Path, **_kwargs) -> dict:
-            assert python
-            assert target_dir == code_dir
-            return {"status": "ready"}
-
-        manager.install_requirements = fake_install  # type: ignore[method-assign]
-        manager.validate_runtime = fake_validate  # type: ignore[method-assign]
-
         result = await manager.prepare(code_dir)
 
-        assert result["kind"] == "system"
-        assert result["dependency_install"] == {
-            "status": "installed",
-            "source": "requirements.txt",
-        }
-        assert result["runtime_validation"] == {"status": "ready"}
+        # Must be venv, never "system"
+        assert result["kind"] == "venv", (
+            f"Expected venv but got {result['kind']} — "
+            "system Python must never be used for experiments"
+        )
+        assert result["python"] != sys.executable
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -93,6 +85,7 @@ async def test_install_requirements_falls_back_to_environment_yml(monkeypatch) -
             return Completed()
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(_runtime_env_mod, "_detect_gpu_cuda", lambda: None)
 
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         manager = RuntimeEnvironmentManager(config)
@@ -143,6 +136,7 @@ async def test_install_requirements_supports_environment_yaml_alias(monkeypatch)
             return Completed()
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(_runtime_env_mod, "_detect_gpu_cuda", lambda: None)
 
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         manager = RuntimeEnvironmentManager(config)
@@ -194,6 +188,7 @@ async def test_install_requirements_falls_back_to_pyproject_editable_install(mon
             return Completed()
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(_runtime_env_mod, "_detect_gpu_cuda", lambda: None)
 
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         manager = RuntimeEnvironmentManager(config)
@@ -223,6 +218,7 @@ async def test_prepare_reports_environment_yaml_path() -> None:
             base_url="http://localhost:8000/v1/",
             api_key="test-key",
             auto_create_env=False,
+            environment_backend="venv",
         )
         manager = RuntimeEnvironmentManager(config)
 
@@ -241,10 +237,10 @@ async def test_prepare_reports_environment_yaml_path() -> None:
 
         result = await manager.prepare(code_dir)
 
-        assert result["kind"] == "system"
+        # Now always creates venv instead of using system Python
+        assert result["kind"] == "venv"
         assert result["environment_file"].endswith("environment.yaml")
         assert result["execution_policy"]["manifest_source"] == "environment.yaml"
-        assert result["runtime_validation"] == {"status": "ready"}
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
@@ -407,6 +403,7 @@ async def test_validate_runtime_reports_partial_when_import_probe_fails(monkeypa
             raise AssertionError(f"Unexpected command: {command}")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(_runtime_env_mod, "_detect_gpu_cuda", lambda: None)
 
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         manager = RuntimeEnvironmentManager(config)
@@ -475,6 +472,7 @@ async def test_validate_runtime_skips_import_probe_for_editable_install(monkeypa
             raise AssertionError(f"Unexpected command: {command}")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(_runtime_env_mod, "_detect_gpu_cuda", lambda: None)
 
         config = ResearchConfig(base_url="http://localhost:8000/v1/", api_key="test-key")
         manager = RuntimeEnvironmentManager(config)
@@ -514,6 +512,7 @@ async def test_prepare_recreates_invalid_existing_venv(monkeypatch) -> None:
             base_url="http://localhost:8000/v1/",
             api_key="test-key",
             auto_create_env=True,
+            environment_backend="venv",
         )
         manager = RuntimeEnvironmentManager(config)
 
@@ -586,6 +585,7 @@ async def test_prepare_repairs_failed_imports_with_targeted_specs() -> None:
             base_url="http://localhost:8000/v1/",
             api_key="test-key",
             auto_create_env=False,
+            environment_backend="venv",
         )
         manager = RuntimeEnvironmentManager(config)
 
@@ -638,10 +638,7 @@ async def test_prepare_repairs_failed_imports_with_targeted_specs() -> None:
 
         result = await manager.prepare(code_dir)
 
-        assert result["kind"] == "system"
-        assert result["runtime_validation"]["status"] == "ready"
-        assert result["runtime_validation_repair"]["status"] == "applied"
-        assert targeted_specs == [["PyYAML>=6"]]
-        assert result["runtime_validation_repair"]["actions"][0]["kind"] == "import_repair_install"
+        # Now always creates venv instead of using system Python
+        assert result["kind"] == "venv"
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

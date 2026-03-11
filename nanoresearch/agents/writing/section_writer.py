@@ -28,7 +28,7 @@ class _SectionWriterMixin:
         registry = ToolRegistry()
         try:
             from mcp_server.tools.arxiv_search import search_arxiv
-            from mcp_server.tools.semantic_scholar import search_semantic_scholar
+            from mcp_server.tools.openalex import search_openalex
 
             async def _search_papers(query: str, max_results: int = 5) -> list[dict]:
                 results: list[dict] = []
@@ -37,9 +37,9 @@ class _SectionWriterMixin:
                 except Exception as exc:
                     logger.debug("arxiv search failed: %s", exc)
                 try:
-                    results.extend(await search_semantic_scholar(query, max_results=max_results))
+                    results.extend(await search_openalex(query, max_results=max_results))
                 except Exception as exc:
-                    logger.debug("semantic scholar search failed: %s", exc)
+                    logger.debug("openalex search failed: %s", exc)
                 return results
 
             registry.register(ToolDefinition(
@@ -59,18 +59,18 @@ class _SectionWriterMixin:
             pass
 
         try:
-            from mcp_server.tools.semantic_scholar import get_paper_details
+            from mcp_server.tools.openalex import search_openalex as _search_openalex_detail
             registry.register(ToolDefinition(
                 name="get_paper_details",
-                description="Get detailed information about a paper by its Semantic Scholar or arXiv ID.",
+                description="Get detailed information about a paper by title or query.",
                 parameters={
                     "type": "object",
                     "properties": {
-                        "paper_id": {"type": "string", "description": "Paper ID (Semantic Scholar or arXiv)"},
+                        "paper_id": {"type": "string", "description": "Paper title or query to look up"},
                     },
                     "required": ["paper_id"],
                 },
-                handler=lambda paper_id: get_paper_details(paper_id),
+                handler=lambda paper_id: _search_openalex_detail(paper_id, max_results=1),
             ))
         except ImportError:
             pass
@@ -214,7 +214,14 @@ IMPORTANT: Use ONLY the citation keys listed in the CITATION KEYS section above.
 For example, write \\cite{{dokholyan1998}} NOT \\cite{{1}} or \\cite{{XXXX}}.
 Maintain consistent notation and terminology with any previously written sections.
 
-Output ONLY the LaTeX paragraphs for this section. Do not include \\section command."""
+Output ONLY the LaTeX paragraphs for this section. Do not include \\section command.
+
+FORMAT RULES:
+- Do NOT wrap your output in Markdown code fences (```latex ... ``` or ``` ... ```).
+- Do NOT insert \\begin{{figure}}...\\end{{figure}} environments; use \\ref{{fig:xxx}}
+  to reference figures only — figures are inserted automatically by the pipeline.
+- Use bare ~ for non-breaking space before \\ref (e.g. Figure~\\ref{{fig:arch}}),
+  NOT \\~{{}} which renders as a tilde accent character in LaTeX."""
 
         # Use tool-augmented generation for key sections
         if self.config.should_use_writing_tools(heading):
@@ -234,12 +241,19 @@ Output ONLY the LaTeX paragraphs for this section. Do not include \\section comm
                     if not content:
                         self.log(f"  ReAct loop returned empty content for {heading}, retrying without tools")
                         content = ((await self.generate(section_system, prompt)) or "").strip()
+                    # Defense-in-depth: strip stray \end{document}
+                    content = re.sub(r'\\end\{document\}\s*', '', content).strip()
                     return content
             except Exception as e:
                 logger.warning("Tool-augmented writing failed for %s, falling back: %s", heading, e)
 
         try:
-            return ((await self.generate(section_system, prompt)) or "").strip()
+            content = ((await self.generate(section_system, prompt)) or "").strip()
+            # Defense-in-depth: LLMs sometimes emit \end{document} inside
+            # section content. Strip it so it doesn't terminate the document
+            # prematurely (causing all \cite{} to become (?)).
+            content = re.sub(r'\\end\{document\}\s*', '', content).strip()
+            return content
         except Exception as e:
             logger.warning("Section generation failed for %s: %s", heading, e)
             return f"% Section generation failed: {heading}"

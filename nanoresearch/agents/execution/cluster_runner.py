@@ -11,6 +11,7 @@ import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import time
 import zipfile
@@ -18,6 +19,52 @@ from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+_IS_WINDOWS = platform.system() == "Windows"
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Kill a process and all its descendants.
+
+    On Windows the venv ``python.exe`` is a thin wrapper that spawns the real
+    interpreter as a child.  A plain ``proc.kill()`` only terminates the
+    wrapper, leaving the child alive.  ``taskkill /T /F`` kills the entire
+    tree.  On Unix we recursively kill child processes via ``pgrep -P``.
+
+    NOTE: We intentionally avoid ``os.killpg`` because child processes
+    typically inherit the parent's process group — killing the group would
+    terminate the pipeline itself.
+    """
+    try:
+        if _IS_WINDOWS:
+            subprocess.run(
+                ["taskkill", "/T", "/F", "/PID", str(pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
+        else:
+            # Recursively kill children first (depth-first), then the target.
+            try:
+                result = subprocess.run(
+                    ["pgrep", "-P", str(pid)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                for child in result.stdout.strip().split():
+                    if child.strip():
+                        _kill_process_tree(int(child))
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+    except Exception:  # noqa: BLE001 — best effort
+        pass
+
+
 from nanoresearch.agents.repair_journal import (
     REPAIR_SNAPSHOT_JOURNAL_PATH,
 )
@@ -146,7 +193,11 @@ class _ClusterRunnerMixin:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             return {"returncode": -1, "stdout": "", "stderr": "Command timed out"}
         return {
             "returncode": proc.returncode or 0,
@@ -205,7 +256,11 @@ class _ClusterRunnerMixin:
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
             return {"returncode": -1, "stdout": "", "stderr": "Command timed out"}
         return {
             "returncode": proc.returncode or 0,
@@ -221,21 +276,30 @@ class _ClusterRunnerMixin:
         timeout: int = 60,
         env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(cwd) if cwd is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+        )
         try:
-            completed = subprocess.run(
-                command,
-                cwd=str(cwd) if cwd is not None else None,
-                capture_output=True,
-                timeout=timeout,
-                env=env,
-                text=False,
-            )
+            stdout, stderr = proc.communicate(timeout=timeout)
         except subprocess.TimeoutExpired:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=5)  # reap zombie
+            except (subprocess.TimeoutExpired, OSError):
+                pass
             return {"returncode": -1, "stdout": "", "stderr": "Command timed out"}
         return {
-            "returncode": completed.returncode or 0,
-            "stdout": completed.stdout.decode(errors="replace"),
-            "stderr": completed.stderr.decode(errors="replace"),
+            "returncode": proc.returncode or 0,
+            "stdout": stdout.decode(errors="replace"),
+            "stderr": stderr.decode(errors="replace"),
         }
 
     async def close(self) -> None:

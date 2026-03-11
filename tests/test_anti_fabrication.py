@@ -397,12 +397,11 @@ class TestEvidenceBlock:
         assert "estimate" not in block.lower() or "estimate" in "MUST USE THESE EXACT NUMBERS. DO NOT MODIFY THEM.".lower()
 
     def test_without_results(self):
-        """Evidence block without real results generates SYNTHETIC data."""
+        """Evidence block without real results tells LLM no data is available."""
         block = FigureAgent._build_evidence_block(
             SAMPLE_IDEATION, SAMPLE_BLUEPRINT, {}, "pending"
         )
-        assert "SYNTHETIC" in block
-        assert "pending" not in block.lower() or "pending" in "pending".lower()
+        assert "NO EXPERIMENT DATA AVAILABLE" in block
         # Should NOT contain "Results Pending" placeholder
         assert "Results Pending" not in block
         # Literature data should still be present
@@ -410,20 +409,20 @@ class TestEvidenceBlock:
         assert "92.4" in block
 
     def test_failed_status(self):
-        """Failed experiment status generates SYNTHETIC data instead of pending."""
+        """Failed experiment status tells LLM no data is available."""
         block = FigureAgent._build_evidence_block(
             SAMPLE_IDEATION, SAMPLE_BLUEPRINT, SAMPLE_METRICS, "failed"
         )
-        # With failed status, even if metrics data exists, synthetic fallback is used
-        assert "SYNTHETIC" in block
+        # With failed status, even if metrics data exists, no-data fallback is used
+        assert "NO EXPERIMENT DATA AVAILABLE" in block
         assert "Results Pending" not in block
 
     def test_no_literature_no_results(self):
-        """No data at all still produces a valid block with synthetic data."""
+        """No data at all still produces a valid block with no-data notice."""
         block = FigureAgent._build_evidence_block(
             {}, {"baselines": []}, {}, "pending"
         )
-        assert "SYNTHETIC" in block
+        assert "NO EXPERIMENT DATA AVAILABLE" in block
         assert "No published quantitative evidence" in block
 
 

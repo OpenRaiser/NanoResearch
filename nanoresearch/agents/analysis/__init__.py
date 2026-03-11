@@ -593,8 +593,13 @@ IMPORTANT:
             pdf_path = figures_dir / f"{fig_id}.pdf"
 
             try:
+                python_exe = self._resolve_experiment_python()
+                # BUG-36 fix: guard against empty/None python_exe
+                if not python_exe:
+                    logger.warning("No Python executable found for figure generation")
+                    continue
                 result = await self._run_shell(
-                    f'cd "{figures_dir}" && "{sys.executable}" "{script_path}"',
+                    f'cd "{figures_dir}" && "{python_exe}" "{script_path}"',
                     timeout=60,
                 )
                 if png_path.exists():

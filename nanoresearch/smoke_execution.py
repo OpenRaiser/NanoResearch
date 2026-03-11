@@ -161,7 +161,7 @@ def _build_smoke_blueprint(dataset_meta: dict[str, Any]) -> dict[str, Any]:
 
 def _build_smoke_setup_output(workspace: Workspace, dataset_meta: dict[str, Any]) -> dict[str, Any]:
     data_path = Path(str(dataset_meta["path"]))
-    data_dir = workspace.path / "data"
+    data_dir = workspace.path / "datasets"
     models_dir = workspace.path / "models"
     data_dir.mkdir(parents=True, exist_ok=True)
     models_dir.mkdir(parents=True, exist_ok=True)

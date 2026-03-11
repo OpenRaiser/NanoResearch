@@ -57,7 +57,7 @@ MAX_FILE_TREE_ENTRIES = 30
 MAX_README_EXCERPT_LENGTH = 500
 
 # Subprocess / output limits
-DRY_RUN_TIMEOUT_SECONDS = 60
+DRY_RUN_TIMEOUT_SECONDS = 1800  # 30 min — must allow runtime dataset downloads + model init
 SUBPROCESS_OUTPUT_LIMIT = 5000
 LLM_CONTEXT_TRUNCATION = 4000
 STDERR_SNIPPET_LIMIT = 2000
@@ -453,7 +453,7 @@ class ExperimentAgent(
         analyzer = FeedbackAnalyzer(self.config, self._dispatcher)
         iteration_state = IterationState(max_rounds=max_rounds)
         code_dir = self.workspace.path / "code"
-        venv_python: str = sys.executable
+        venv_python: str = ""  # set by _execute_code_with_venv in round 1
         generated_files: list[str] = []
         project_plan: dict = {}
 
@@ -657,7 +657,9 @@ class ExperimentAgent(
             else:
                 # ===== LOCAL EXECUTION =====
                 # Phase 3: dry-run
-                if round_num == 1:
+                if round_num == 1 or not venv_python:
+                    # Round 1, or venv not yet set up (e.g. preflight failed
+                    # in round 1 before execution reached)
                     execution, venv_python = await self._execute_code_with_venv(
                         generated_files, blueprint_summary
                     )

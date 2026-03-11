@@ -372,6 +372,18 @@ class _LaTeXAssemblerMixin:
         4. Auto-fix table overflow (inject \\small / \\tabcolsep / @{})
         5. Enforce max 3 contribution bullets in Introduction
         """
+        # ── 0c. Truncate garbage before \documentclass ──
+        # LLMs sometimes emit "thinking fragments" before the actual LaTeX.
+        # Everything before the first \documentclass is junk.
+        docclass_pos = text.find(r'\documentclass')
+        if docclass_pos > 0:
+            text = text[docclass_pos:]
+
+        # ── 0d. Strip Markdown code fences ──
+        # LLMs sometimes wrap LaTeX output in ```latex ... ``` fences.
+        text = re.sub(r'```(?:latex|tex)?\s*\n', '', text)
+        text = re.sub(r'\n```[ \t]*(?:\n|$)', '\n', text)
+
         # ── 0. Remove LLM artifact text ──
         # LLMs sometimes emit "thinking out loud" text that leaks into LaTeX
         _LLM_ARTIFACT_PATTERNS = [
@@ -439,6 +451,16 @@ class _LaTeXAssemblerMixin:
             _update_environment_stack(line, env_stack)
         text = "\n".join(sanitized_lines)
 
+        # ── 2c. Fix \~{}\ref → ~\ref ──
+        # LLMs confuse \~{} (tilde accent) with ~ (non-breaking space).
+        # Must come AFTER step 2b, otherwise _escape_latex_text would re-escape
+        # the bare ~ back to \~{}.
+        text = re.sub(
+            r'\\~\{\}(\\(?:ref|eqref|cite[tp]?|pageref)\{)',
+            r'~\1',
+            text,
+        )
+
         # ── 3. Normalize figure placement ──
         # Use [t!] instead of [H] to let LaTeX optimize float placement.
         # placeins package with [section] option prevents cross-section drift.
@@ -494,6 +516,94 @@ class _LaTeXAssemblerMixin:
 
         # ── 7. Extract figure blocks from inside list environments ──
         text = _LaTeXAssemblerMixin._extract_figures_from_lists(text)
+
+        # ── 8. Relocate non-architecture figures out of Introduction ──
+        text = _LaTeXAssemblerMixin._relocate_intro_figures(text)
+
+        # ── 9. Fix stray \end{document} inside body ──
+        # LLMs sometimes emit \end{document} inside section content,
+        # causing everything after it (including \bibliography) to be
+        # ignored — all citations become (?).
+        # Strategy: remove ALL \end{document}, extract bibliography
+        # commands, then re-append them in the correct order at the end.
+        text = _LaTeXAssemblerMixin._fix_end_document_placement(text)
+
+        return text
+
+    @staticmethod
+    def _fix_end_document_placement(text: str) -> str:
+        r"""Ensure exactly one \end{document} at the very end, with
+        \bibliographystyle and \bibliography just before it.
+
+        LLMs sometimes emit \end{document} inside section content (e.g.
+        after an equation block), causing LaTeX to stop processing before
+        reaching the bibliography commands — all \cite{} become (?).
+
+        Only operates on full documents (must contain \begin{document}).
+        """
+        # Guard: only operate on full LaTeX documents
+        if r'\begin{document}' not in text:
+            return text
+
+        # Count \end{document} — if exactly one and it's at the end,
+        # and bibliography is before it, nothing to fix.
+        end_doc_positions = [
+            m.start() for m in re.finditer(r'\\end\{document\}', text)
+        ]
+        if not end_doc_positions:
+            # No \end{document} at all — add bibliography + end
+            text = text.rstrip()
+            text += "\n\n\\bibliographystyle{plainnat}"
+            text += "\n\\bibliography{references}"
+            text += "\n\n\\end{document}\n"
+            return text
+
+        if len(end_doc_positions) == 1:
+            # Check if bibliography is before \end{document}
+            end_pos = end_doc_positions[0]
+            has_bib_before = (
+                re.search(r'\\bibliography\{', text[:end_pos])
+                or re.search(r'\\begin\{thebibliography\}', text[:end_pos])
+            )
+            if has_bib_before:
+                return text  # All good — single \end{document} with bib before it
+
+        # ---- Need to fix: multiple \end{document} or bib after it ----
+
+        # 1. Extract bibliography commands (preserve style & file name)
+        bib_style_m = re.search(
+            r'\\bibliographystyle\{([^}]+)\}', text,
+        )
+        bib_file_m = re.search(
+            r'\\bibliography\{([^}]+)\}', text,
+        )
+        bib_style = bib_style_m.group(1) if bib_style_m else "plainnat"
+        bib_file = bib_file_m.group(1) if bib_file_m else "references"
+
+        # Also check for inline \begin{thebibliography}...\end{thebibliography}
+        inline_bib_m = re.search(
+            r'(\\begin\{thebibliography\}.*?\\end\{thebibliography\})',
+            text, re.DOTALL,
+        )
+        inline_bib = inline_bib_m.group(1) if inline_bib_m else ""
+
+        # 2. Remove ALL \end{document} and bibliography commands from body
+        text = re.sub(r'\\end\{document\}\s*', '', text)
+        text = re.sub(r'\\bibliographystyle\{[^}]*\}\s*', '', text)
+        text = re.sub(r'\\bibliography\{[^}]*\}\s*', '', text)
+        if inline_bib:
+            text = text.replace(inline_bib, '')
+
+        # 3. Strip trailing whitespace
+        text = text.rstrip()
+
+        # 4. Re-append in correct order: bibliography → \end{document}
+        if inline_bib:
+            text += "\n\n" + inline_bib
+        else:
+            text += f"\n\n\\bibliographystyle{{{bib_style}}}"
+            text += f"\n\\bibliography{{{bib_file}}}"
+        text += "\n\n\\end{document}\n"
 
         return text
 
@@ -648,6 +758,104 @@ class _LaTeXAssemblerMixin:
             text = pat.sub(_move_figs, text)
         return text
 
+    # Labels that are legitimately placed in Introduction (architecture/overview)
+    _INTRO_KEEP_LABELS = re.compile(
+        r'arch|overview|model|framework|pipeline|system|fig1|fig_1',
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _relocate_intro_figures(text: str) -> str:
+        """Move non-architecture figures out of the Introduction section.
+
+        Ablation, results, and training-curve figures don't belong in
+        Introduction — they should appear near their first ``\\ref`` in
+        later sections (Experiments, Results, etc.).
+        """
+        # Find Introduction section boundaries
+        intro_match = re.search(
+            r'(\\section\{Introduction\})',
+            text, re.IGNORECASE,
+        )
+        if not intro_match:
+            return text
+
+        intro_start = intro_match.end()
+
+        # Find the next \section{...} after Introduction
+        next_section = re.search(r'\\section\{', text[intro_start:])
+        if not next_section:
+            return text  # no following section — nothing to do
+
+        intro_end = intro_start + next_section.start()
+        intro_text = text[intro_start:intro_end]
+
+        # Extract all figure environments from Introduction
+        fig_pattern = re.compile(
+            r'\\begin\{figure\*?\}.*?\\end\{figure\*?\}', re.DOTALL
+        )
+        figures_in_intro = list(fig_pattern.finditer(intro_text))
+        if not figures_in_intro:
+            return text
+
+        # Classify: keep architecture figures, relocate the rest
+        to_relocate: list[tuple[str, str]] = []  # (label, figure_block)
+        # Process in reverse to preserve indices when removing
+        new_intro = intro_text
+        for m in reversed(figures_in_intro):
+            fig_block = m.group(0)
+            # Extract label
+            label_match = re.search(r'\\label\{([^}]+)\}', fig_block)
+            label = label_match.group(1) if label_match else ""
+
+            if _LaTeXAssemblerMixin._INTRO_KEEP_LABELS.search(label):
+                continue  # architecture figure — keep in Intro
+
+            to_relocate.insert(0, (label, fig_block))
+            # Remove from Introduction
+            new_intro = new_intro[:m.start()] + new_intro[m.end():]
+
+        if not to_relocate:
+            return text
+
+        # Rebuild text with figures removed from Introduction
+        text = text[:intro_start] + new_intro + text[intro_end:]
+        # Collapse excess blank lines left behind
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # Re-calculate post-intro offset after removal
+        next_section2 = re.search(r'\\section\{', text[intro_start:])
+        post_intro_offset = intro_start + (next_section2.start() if next_section2 else 0)
+
+        # Re-insert each figure near its first \ref in the text AFTER Introduction
+        for label, fig_block in to_relocate:
+            inserted = False
+            if label:
+                # Search for \ref{label} only in text after Introduction
+                post_intro_text = text[post_intro_offset:]
+                ref_pattern = re.compile(
+                    r'\\(?:ref|autoref|cref)\{' + re.escape(label) + r'\}'
+                )
+                ref_match = ref_pattern.search(post_intro_text)
+                if ref_match:
+                    # Find end of the paragraph containing the ref
+                    para_end = post_intro_text.find('\n\n', ref_match.end())
+                    if para_end == -1:
+                        para_end = len(post_intro_text)
+                    insert_pos = post_intro_offset + para_end
+                    text = text[:insert_pos] + '\n\n' + fig_block + '\n' + text[insert_pos:]
+                    inserted = True
+
+            if not inserted:
+                # Fallback: insert before \end{document}
+                end_doc = text.rfind(r'\end{document}')
+                if end_doc != -1:
+                    text = text[:end_doc] + fig_block + '\n\n' + text[end_doc:]
+                else:
+                    text += '\n\n' + fig_block
+
+        return text
+
     @staticmethod
     def _sanitize_bibtex(bib: str) -> str:
         """Fix common Unicode issues in BibTeX entries and deduplicate."""
@@ -698,6 +906,25 @@ class _LaTeXAssemblerMixin:
             )
 
         bib = _escape_ampersand_in_entry(bib)
+
+        # BUG-32 fix: escape '#' and '%' in BibTeX text fields.
+        # '#' is BibTeX string-concatenation operator; '%' starts a comment.
+        # Both break BibTeX parsing when they appear bare in titles/venues.
+        def _escape_hash_percent_in_entry(entry_text: str) -> str:
+            def _field_repl_hp(fm: re.Match) -> str:
+                field_name = fm.group(1).strip().lower()
+                if field_name in _URL_FIELDS:
+                    return fm.group(0)
+                field_body = fm.group(2)
+                escaped = re.sub(r'(?<!\\)#', r'\\#', field_body)
+                escaped = re.sub(r'(?<!\\)%', r'\\%', escaped)
+                return fm.group(0).replace(field_body, escaped)
+            return re.sub(
+                r'(\b\w+)\s*=\s*(\{(?:[^{}]|\{[^{}]*\})*\}|"[^"]*")',
+                _field_repl_hp, entry_text,
+            )
+
+        bib = _escape_hash_percent_in_entry(bib)
 
         replacements = {
             "\u00e9": r"{\'e}",
@@ -826,16 +1053,31 @@ class _LaTeXAssemblerMixin:
 
         if missing_blocks:
             self.log(f"  VALIDATION: injecting {len(missing_blocks)} missing figure(s)")
-            # Insert before \end{document}
+            # BUG-43 fix: insert BEFORE \bibliography (not before \end{document})
+            # so figures appear in the paper body, not after the references.
             inject_text = "\n\n".join(missing_blocks)
-            end_doc_pos = latex_content.rfind("\\end{document}")
-            if end_doc_pos >= 0:
+            inject_block = (
+                "\n\n% --- Auto-injected missing figures ---\n"
+                + inject_text
+                + "\n\n"
+            )
+            # Try anchors in order: \bibliographystyle, \bibliography,
+            # \begin{thebibliography}, \end{document}
+            bib_pos = -1
+            for anchor in (
+                r"\bibliographystyle{",
+                r"\bibliography{",
+                r"\begin{thebibliography}",
+                r"\end{document}",
+            ):
+                bib_pos = latex_content.find(anchor)
+                if bib_pos >= 0:
+                    break
+            if bib_pos >= 0:
                 latex_content = (
-                    latex_content[:end_doc_pos]
-                    + "\n\n% --- Auto-injected missing figures ---\n"
-                    + inject_text
-                    + "\n\n"
-                    + latex_content[end_doc_pos:]
+                    latex_content[:bib_pos]
+                    + inject_block
+                    + latex_content[bib_pos:]
                 )
             else:
                 latex_content += "\n\n" + inject_text

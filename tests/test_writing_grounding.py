@@ -180,11 +180,30 @@ def test_grounding_packet_has_prebuilt_tables():
     assert "\\label{tab:ablation}" in pkt.ablation_table_latex
 
 
-def test_grounding_packet_no_tables_when_no_results():
+def test_grounding_packet_scaffold_tables_when_no_results():
+    """When experiment fails, scaffold tables are built from blueprint."""
     pkt = _make_packet(
         experiment_results={},
         experiment_status="FAILED",
         experiment_analysis={},
+    )
+    # Scaffold tables should be generated (not empty)
+    assert "\\label{tab:main_results}" in pkt.main_table_latex
+    assert "\\label{tab:ablation}" in pkt.ablation_table_latex
+    # Proposed method row uses "--" placeholder
+    assert "--" in pkt.main_table_latex
+    # Blueprint baseline name appears
+    assert "BaselineA" in pkt.main_table_latex
+    assert "pending" in pkt.main_table_latex.lower()
+
+
+def test_grounding_packet_no_scaffold_without_metrics():
+    """If blueprint has no metrics, scaffold tables can't be built."""
+    pkt = _make_packet(
+        experiment_results={},
+        experiment_status="FAILED",
+        experiment_analysis={},
+        blueprint={"baselines": [], "metrics": []},
     )
     assert pkt.main_table_latex == ""
     assert pkt.ablation_table_latex == ""

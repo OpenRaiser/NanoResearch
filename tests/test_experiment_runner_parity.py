@@ -177,16 +177,17 @@ async def test_run_main_py_uses_runner_when_main_missing(monkeypatch) -> None:
 
         commands: list[list[str]] = []
 
-        class Completed:
+        class FakePopen:
             returncode = 0
-            stdout = b"ok\n"
-            stderr = b""
+            def __init__(self, command, **_kwargs):
+                commands.append(command)
+                self.pid = 99999
+            def communicate(self, timeout=None):
+                return b"ok\n", b""
+            def kill(self):
+                pass
 
-        def fake_run(command: list[str], **_kwargs) -> Completed:
-            commands.append(command)
-            return Completed()
-
-        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
 
         result = await agent._run_main_py(code_dir, "python-custom")
 

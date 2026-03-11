@@ -606,3 +606,53 @@ def feishu(
         border_style="blue",
     ))
     feishu_main()
+
+
+@app.command("cleanup-envs")
+def cleanup_envs(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Only list envs, don't remove"),
+    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation prompt"),
+) -> None:
+    """Remove per-session conda environments (nanoresearch_*).
+
+    Lists all nanoresearch_* conda environments and optionally removes them
+    to reclaim disk space.
+    """
+    from nanoresearch.agents.runtime_env import RuntimeEnvironmentManager
+
+    envs = RuntimeEnvironmentManager.list_nanoresearch_conda_envs()
+    if not envs:
+        console.print("[green]No nanoresearch_* conda environments found.[/green]")
+        raise typer.Exit()
+
+    table = Table(title="Per-session conda environments")
+    table.add_column("Name", style="cyan")
+    table.add_column("Path", style="dim")
+    for env in envs:
+        table.add_row(env["name"], env["path"])
+    console.print(table)
+    console.print(f"\n[bold]{len(envs)}[/bold] environment(s) found.")
+
+    if dry_run:
+        console.print("[yellow]Dry-run mode — no environments removed.[/yellow]")
+        raise typer.Exit()
+
+    if not yes:
+        confirm = typer.confirm(f"Remove all {len(envs)} environment(s)?")
+        if not confirm:
+            raise typer.Exit()
+
+    removed = 0
+    for env in envs:
+        console.print(f"  Removing {env['name']} ...", end=" ")
+        ok = RuntimeEnvironmentManager.remove_conda_env(env["name"])
+        if ok:
+            console.print("[green]OK[/green]")
+            removed += 1
+        else:
+            console.print("[red]FAILED[/red]")
+    console.print(f"\n[bold]{removed}/{len(envs)}[/bold] environments removed.")
+
+
+if __name__ == "__main__":
+    app()

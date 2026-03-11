@@ -164,7 +164,7 @@ class _CodeRunnerMixin:
                     "stdout": "",
                     "stderr": "",
                 },
-                sys.executable,
+                "",  # no python path — caller must call _setup_venv before using
             )
 
         venv_python = await self._setup_venv(code_dir)
@@ -577,17 +577,31 @@ class _CodeRunnerMixin:
         return []
 
     async def _setup_venv(self, code_dir: Path) -> str:
-        """Prepare Python environment for experiment execution.
+        """Prepare an ISOLATED Python environment for experiment execution.
 
-        If experiment_conda_env is configured, use that conda env's Python
-        directly (skip venv creation — much faster, reuses existing packages).
-        Otherwise, create an isolated venv and install requirements.
+        Always creates a fresh venv (or auto-repair conda env) so the user's
+        own environment is never polluted.  The configured experiment_conda_env
+        is intentionally skipped — experiments must be reproducible in isolation.
 
         Returns the path to the Python executable.
         """
-        runtime = RuntimeEnvironmentManager(self.config, self.log)
+        # Build a deterministic label so conda env name is idempotent across
+        # resumes of the same session — avoids creating duplicate envs.
+        session_label = ""
+        if hasattr(self, "workspace") and self.workspace:
+            m = self.workspace.manifest
+            sid = m.session_id[:8]
+            slug = m.topic[:20].replace(" ", "_") if m.topic else ""
+            session_label = f"{slug}_{sid}" if slug else sid
+        runtime = RuntimeEnvironmentManager(self.config, self.log, session_label=session_label)
         env_info = await runtime.prepare(code_dir)
-        return str(env_info.get("python", sys.executable))
+        python = env_info.get("python")
+        if not python:
+            raise RuntimeError(
+                "RuntimeEnvironmentManager.prepare() returned no 'python' key. "
+                "Refusing to fall back to system Python."
+            )
+        return str(python)
 
     @staticmethod
     def _find_conda_python(env_name: str) -> str | None:
@@ -639,7 +653,12 @@ class _CodeRunnerMixin:
         if self._build_legacy_runner_command(code_dir, mode=mode) is None:
             return None
 
-        normalized_python = python or sys.executable
+        if not python:
+            raise RuntimeError(
+                "No Python executable provided to _build_legacy_subprocess_command. "
+                "Ensure _setup_venv() was called first."
+            )
+        normalized_python = python
         suffix: list[str] = []
         if mode == "dry-run":
             suffix = ["--dry-run"]
@@ -649,7 +668,11 @@ class _CodeRunnerMixin:
 
     async def _run_main_py(self, code_dir: Path, python: str | None = None) -> dict:
         """Run the legacy experiment entrypoint in dry-run mode with timeout."""
-        python = python or sys.executable
+        if not python:
+            raise RuntimeError(
+                "No Python executable provided to _run_main_py. "
+                "Ensure _setup_venv() was called first."
+            )
         command = self._build_legacy_subprocess_command(code_dir, python, mode="dry-run")
         if command is None:
             return {
@@ -661,22 +684,47 @@ class _CodeRunnerMixin:
         try:
             proc_result = await loop.run_in_executor(
                 None,
-                lambda: subprocess.run(
+                lambda: self._run_with_tree_kill(
                     command,
                     cwd=str(code_dir),
-                    capture_output=True,
-                    text=False,
                     timeout=DRY_RUN_TIMEOUT_SECONDS,
                     env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
                 ),
             )
-            return {
-                "returncode": proc_result.returncode,
-                "stdout": _decode_bytes(proc_result.stdout, SUBPROCESS_OUTPUT_LIMIT),
-                "stderr": _decode_bytes(proc_result.stderr, SUBPROCESS_OUTPUT_LIMIT),
-            }
-        except subprocess.TimeoutExpired:
-            return {"returncode": -1, "stdout": "", "stderr": f"Timeout after {DRY_RUN_TIMEOUT_SECONDS}s"}
+            return proc_result
         except Exception as e:
             return {"returncode": -1, "stdout": "", "stderr": str(e)}
+
+    @staticmethod
+    def _run_with_tree_kill(
+        command: list[str],
+        *,
+        cwd: str | None = None,
+        timeout: int = 60,
+        env: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Run subprocess with proper process-tree cleanup on timeout."""
+        from nanoresearch.agents.execution.cluster_runner import _kill_process_tree
+
+        proc = subprocess.Popen(
+            command, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            return {"returncode": -1, "stdout": "", "stderr": f"Timeout after {timeout}s"}
+        return {
+            "returncode": proc.returncode,
+            "stdout": _decode_bytes(stdout, SUBPROCESS_OUTPUT_LIMIT),
+            "stderr": _decode_bytes(stderr, SUBPROCESS_OUTPUT_LIMIT),
+        }
 

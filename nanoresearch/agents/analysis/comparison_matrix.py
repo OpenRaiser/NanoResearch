@@ -32,7 +32,8 @@ def build_comparison_matrix(
         rows.append(row)
 
     # Find best and second-best per metric
-    annotations: dict[tuple[int, str], str] = {}
+    # Use "row_idx:metric_name" string keys so the dict is JSON-serializable.
+    annotations: dict[str, str] = {}
     for m in metrics:
         vals = [
             (i, row.get(m["name"]))
@@ -44,9 +45,9 @@ def build_comparison_matrix(
         higher = m.get("higher_is_better", True)
         vals.sort(key=lambda x: x[1], reverse=higher)
         if len(vals) >= 1:
-            annotations[(vals[0][0], m["name"])] = "best"
+            annotations[f"{vals[0][0]}:{m['name']}"] = "best"
         if len(vals) >= 2:
-            annotations[(vals[1][0], m["name"])] = "second"
+            annotations[f"{vals[1][0]}:{m['name']}"] = "second"
 
     return {
         "headers": headers,
@@ -103,7 +104,7 @@ def comparison_matrix_to_latex(matrix: dict) -> str:
                 formatted = f"{val:.2f}" if val < 1 else f"{val:.1f}"
             else:
                 formatted = str(val)
-            ann = annotations.get((i, h))
+            ann = annotations.get(f"{i}:{h}")
             if ann == "best":
                 formatted = f"\\textbf{{{formatted}}}"
             elif ann == "second":

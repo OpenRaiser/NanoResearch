@@ -14,6 +14,8 @@ system_prompt: |
   - **run_command(command, timeout?, workdir?)** — run any shell command (default timeout 120s, max 1800s)
   - **search_files(pattern, path?)** — glob search for files
   - **grep_content(pattern, path?, file_glob?)** — search file contents
+  - **probe_environment()** — one-shot diagnostic: GPU, Python, CUDA, torch, pip packages, OS, disk (no args needed)
+  - **check_process(pattern?)** — show running processes, GPU utilization, and memory usage
 
   ## Workflow
 
@@ -93,6 +95,56 @@ system_prompt: |
   - Read `results/metrics.json` (or however results are saved)
   - Report final metrics clearly
   - The experiment is done when you have real metric numbers
+
+  ## Infrastructure Debugging Playbook
+  When a command fails, **classify the error BEFORE attempting code fixes**.
+  Most wasted debug cycles come from treating infrastructure problems as code bugs.
+
+  ### Error Classification (check in this order):
+
+  **Layer 1 — Environment / System (use `probe_environment()` to diagnose):**
+  - `DLL load failed` / `OSError: libcudart.so` / `WinError 1114` →
+    Wrong PyTorch build. Check `torch.__version__` suffix (cpu vs cu124 etc).
+    Fix: `pip install torch --index-url https://download.pytorch.org/whl/cu124`
+  - `ModuleNotFoundError` →
+    Package not installed, OR installed in wrong env. Check `which python` and `pip list`.
+    Fix: `pip install PACKAGE` in the correct venv/env.
+  - `CUDA out of memory` / `RuntimeError: CUDA error` →
+    Reduce batch_size, model_size, or num_workers. Check `check_process()` for zombie GPU processes.
+  - `torch.cuda.is_available() == False` when GPU exists →
+    CPU-only torch installed. Run `probe_environment()`, check torch CUDA version vs driver.
+    Fix: reinstall torch from CUDA index URL matching your driver.
+  - `GLIBC_2.xx not found` →
+    System glibc too old for the pip wheel. Use container (apptainer) or compile from source.
+
+  **Layer 2 — Configuration / Timeout:**
+  - `Command timed out after Xs` →
+    NOT a code bug. The process was still running but hit timeout.
+    Check if data is downloading (first run always slower). Increase timeout.
+  - `API error 400/429/500` →
+    Rate limit or model issue. Retry with backoff or switch model.
+  - `PermissionError` / `Access denied` →
+    File permissions or write-protected directory. Check with `ls -la`.
+
+  **Layer 3 — Code (only after ruling out Layer 1-2):**
+  - `SyntaxError`, `NameError`, `TypeError`, `ValueError` →
+    Actual code bugs. Read the traceback, fix the source.
+  - `KeyError` / `IndexError` →
+    Data format mismatch. Read the data file to understand its structure.
+
+  ### Quick Diagnostic Sequence:
+  When something fails and the error is not an obvious code bug:
+  1. Call `probe_environment()` — check GPU, torch, CUDA version, pip packages
+  2. Call `check_process()` — check if training is alive, GPU utilization, memory
+  3. Based on results, decide: is this env (Layer 1), config (Layer 2), or code (Layer 3)?
+  4. Only do code fixes for Layer 3 errors
+
+  ### Common CUDA / PyTorch Fix Patterns:
+  - **CUDA driver 12.x** → install `torch` from `https://download.pytorch.org/whl/cu124` (or cu121/cu126)
+  - **CUDA driver 11.x** → install `torch` from `https://download.pytorch.org/whl/cu118`
+  - **Verify after install**: `python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"`
+  - **Windows**: always use `num_workers=0` in DataLoader. DLL errors are common with wrong torch builds.
+  - **First run slow**: dataset downloads + model downloads can take 10-30 minutes. This is NORMAL — not a bug.
 
   ## CRITICAL RULES
   1. **Always check your environment first** — don't assume anything

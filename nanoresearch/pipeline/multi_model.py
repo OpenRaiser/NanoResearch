@@ -66,10 +66,12 @@ class ModelDispatcher:
         timeout = round(timeout, 1)
         cache_key = (resolved_url, resolved_key, timeout)
         if cache_key not in self._clients:
+            # BUG-10 fix: separate connect timeout (15s) from read timeout.
+            # Prevents 10+ minute hangs when API endpoint is unreachable.
             self._clients[cache_key] = OpenAI(
                 base_url=resolved_url,
                 api_key=resolved_key,
-                timeout=timeout,
+                timeout=httpx.Timeout(timeout, connect=15.0),
             )
         return self._clients[cache_key]
 

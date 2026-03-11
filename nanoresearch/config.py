@@ -130,20 +130,27 @@ class ResearchConfig(BaseModel):
     skip_stages: list[str] = Field(default_factory=list)
     template_format: str = "neurips2025"
     max_retries: int = 2
-    quick_eval_timeout: int = 1200  # seconds for quick-eval execution (20 min)
+    quick_eval_timeout: int = 3600  # seconds for quick-eval execution (60 min — includes dataset download)
     execution_profile: ExecutionProfile = ExecutionProfile.LOCAL_QUICK
     writing_mode: WritingMode = WritingMode.HYBRID
-    writing_tool_max_rounds: int = 10
+    writing_tool_max_rounds: int = 3  # was 10 — each round resends full context, very expensive
     auto_create_env: bool = True
     auto_download_resources: bool = True
     local_execution_timeout: int = 1800
     runtime_auto_install_enabled: bool = True
-    runtime_auto_install_max_packages: int = 2
-    runtime_auto_install_max_nltk_downloads: int = 3
+    runtime_auto_install_max_packages: int = 50
+    runtime_auto_install_max_nltk_downloads: int = 50
     runtime_auto_install_allowlist: list[str] = Field(default_factory=list)
 
-    # Use an existing conda env instead of creating a new venv.
-    # When set, experiment agent skips venv creation and uses this env's Python.
+    # Environment backend for experiment execution.
+    # "auto" — prefer conda/mamba when available, fall back to venv.
+    # "conda" — force conda (error if not installed).
+    # "venv"  — always use isolated venv (+ pip CUDA wheel pre-install).
+    environment_backend: str = "auto"
+
+    # Use an existing NAMED conda env instead of creating a per-session env.
+    # When set, this env is used directly (shared across sessions).
+    # Takes priority over environment_backend auto-detection.
     experiment_conda_env: str = ""  # e.g., "shixun"
 
     # Multi-model review committee (optional).

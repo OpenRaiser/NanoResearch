@@ -20,6 +20,26 @@ from nanoresearch.schemas.review import (
 
 logger = logging.getLogger(__name__)
 
+# ---- Shared BibTeX helpers (BUG-4/22/26 fix) ----
+
+_CONFERENCE_KEYWORDS = frozenset({
+    "neurips", "nips", "icml", "iclr", "cvpr", "iccv", "eccv",
+    "acl", "emnlp", "naacl", "aaai", "ijcai", "sigir", "kdd",
+    "chi", "uist", "sigmod", "vldb", "www", "cikm", "wsdm",
+    "proceedings", "conference", "workshop", "symposium",
+})
+
+
+def _detect_bib_entry_type(venue: str) -> tuple[str, str]:
+    """Return (bibtex_type, venue_field) based on venue name."""
+    if not venue:
+        return "article", "journal"
+    venue_lower = venue.lower()
+    if any(kw in venue_lower for kw in _CONFERENCE_KEYWORDS):
+        return "inproceedings", "booktitle"
+    return "article", "journal"
+
+
 MAX_REVISION_ROUNDS = 5
 MAX_LATEX_FIX_ATTEMPTS = 3  # compile-fix loop iterations
 MIN_SECTION_SCORE = 8  # Sections scoring below this get revised
@@ -157,7 +177,38 @@ class ReviewAgent(BaseResearchAgent):
         # Step 3: Revision loop with convergence detection
         revision_round = 0
         current_tex = paper_tex
-        prev_avg_score = review.overall_score
+        # BUG-15 fix: initialize prev_avg_score from section_reviews average
+        # (same metric used for new_avg), not overall_score (different metric).
+        prev_avg_score = (
+            sum(sr.score for sr in review.section_reviews)
+            / len(review.section_reviews)
+            if review.section_reviews else 0
+        )
+        # BUG-9 fix: track consecutive stalls to avoid infinite revision loops
+        _stall_count = 0
+        _MAX_STALL_ROUNDS = 2
+        # BUG-30 fix: track consecutive backpressure reverts to prevent
+        # infinite loops when the original paper_tex has structural errors
+        # (e.g. \begin{equation}...\end{parameter}).
+        _bp_revert_count = 0
+        _MAX_BP_REVERTS = 2
+        # Pre-check: detect structural issues in the original paper_tex
+        # so backpressure can distinguish pre-existing vs revision-introduced.
+        _original_bp_issues = self._check_latex_structure(paper_tex)
+
+        # Auto-fix pre-existing mismatched environments from WRITING stage
+        if any("Mismatched environment" in i for i in _original_bp_issues):
+            candidate_tex = self._fix_mismatched_environments(paper_tex)
+            fixed_issues = self._check_latex_structure(candidate_tex)
+            if len(fixed_issues) < len(_original_bp_issues):
+                n_fixed = len(_original_bp_issues) - len(fixed_issues)
+                self.log(
+                    f"  Auto-fixed {n_fixed} pre-existing mismatched "
+                    f"environment(s) from WRITING stage"
+                )
+                paper_tex = candidate_tex
+                current_tex = candidate_tex
+                _original_bp_issues = fixed_issues
 
         while revision_round < MAX_REVISION_ROUNDS:
             low_sections = [
@@ -202,38 +253,50 @@ class ReviewAgent(BaseResearchAgent):
                 current_tex = self._apply_revisions(current_tex, round_revised)
 
                 # Backpressure: verify revision didn't break LaTeX structure
-                # Quick structural checks (no compilation — that happens at the end)
-                bp_issues = []
-                begins = len(re.findall(r'\\begin\{', current_tex))
-                ends = len(re.findall(r'\\end\{', current_tex))
-                if begins != ends:
-                    bp_issues.append(f"Unbalanced environments: {begins} \\begin vs {ends} \\end")
-                # Check for mismatched environment types (e.g. \begin{itemize}...\end{enumerate})
-                env_stack: list[str] = []
-                for env_m in re.finditer(r'\\(begin|end)\{([^}]+)\}', current_tex):
-                    cmd, env_name = env_m.group(1), env_m.group(2)
-                    if cmd == "begin":
-                        env_stack.append(env_name)
-                    elif env_stack and env_stack[-1] == env_name:
-                        env_stack.pop()
-                    elif env_stack:
-                        bp_issues.append(
-                            f"Mismatched environment: \\begin{{{env_stack[-1]}}} "
-                            f"closed by \\end{{{env_name}}}"
+                bp_issues = self._check_latex_structure(current_tex)
+                # BUG-30 fix: only revert if the revision INTRODUCED new
+                # structural issues.  Pre-existing issues (from WRITING)
+                # should not trigger revert — the revision didn't cause them.
+                new_bp_issues = [i for i in bp_issues if i not in _original_bp_issues]
+
+                # Auto-fix mismatched environments before reverting
+                if new_bp_issues and any("Mismatched environment" in i for i in new_bp_issues):
+                    fixed_tex = self._fix_mismatched_environments(current_tex)
+                    fixed_issues = self._check_latex_structure(fixed_tex)
+                    still_new = [i for i in fixed_issues if i not in _original_bp_issues]
+                    if len(still_new) < len(new_bp_issues):
+                        self.log(
+                            f"  Auto-fixed {len(new_bp_issues) - len(still_new)} "
+                            f"mismatched environment(s)"
                         )
-                        env_stack.pop()  # consume it to avoid cascading errors
-                        break  # one mismatch is enough to revert
-                if '\\documentclass' not in current_tex:
-                    bp_issues.append("Missing \\documentclass")
-                if '\\end{document}' not in current_tex:
-                    bp_issues.append("Missing \\end{document}")
-                if bp_issues:
-                    self.log(f"  Backpressure FAILED: {bp_issues}, reverting round {revision_round}")
-                    # Revert this round's changes
+                        current_tex = fixed_tex
+                        new_bp_issues = still_new
+
+                if new_bp_issues:
+                    _bp_revert_count += 1
+                    self.log(
+                        f"  Backpressure FAILED (new issues): {new_bp_issues}, "
+                        f"reverting round {revision_round} "
+                        f"(consecutive reverts: {_bp_revert_count})"
+                    )
                     for sec_name in round_revised:
                         review.revised_sections.pop(sec_name, None)
                     current_tex = self._apply_revisions(paper_tex, review.revised_sections)
+                    if _bp_revert_count >= _MAX_BP_REVERTS:
+                        self.log(
+                            f"  {_bp_revert_count} consecutive backpressure reverts — "
+                            f"stopping revision loop to avoid wasting LLM calls"
+                        )
+                        break
                     continue  # skip re-review, try next round
+                else:
+                    _bp_revert_count = 0  # reset on success
+                    if bp_issues:
+                        # Pre-existing structural issues — log but don't revert
+                        self.log(
+                            f"  Backpressure: {len(bp_issues)} pre-existing "
+                            f"structural issue(s), not reverting"
+                        )
 
             # Re-run all consistency checks after revision
             review.consistency_issues = self._run_consistency_checks(current_tex)
@@ -356,12 +419,20 @@ class ReviewAgent(BaseResearchAgent):
                 f"(delta: {improvement:+.1f})"
             )
             if improvement < CONVERGENCE_THRESHOLD:
-                # Check if there are still low-scoring sections before exiting
+                _stall_count += 1
+                # BUG-9 fix: if stalled for _MAX_STALL_ROUNDS consecutive
+                # rounds, stop even if sections are still below threshold.
                 still_low = [
                     sr for sr in review.section_reviews
                     if sr.score < MIN_SECTION_SCORE
                 ]
-                if still_low and revision_round < MAX_REVISION_ROUNDS:
+                if _stall_count >= _MAX_STALL_ROUNDS:
+                    self.log(
+                        f"  Stalled for {_stall_count} rounds — stopping "
+                        f"({len(still_low)} section(s) still below threshold)"
+                    )
+                    break
+                elif still_low and revision_round < MAX_REVISION_ROUNDS:
                     self.log(
                         f"  Improvement stalled ({improvement:.2f} < "
                         f"{CONVERGENCE_THRESHOLD}), but {len(still_low)} section(s) "
@@ -374,6 +445,8 @@ class ReviewAgent(BaseResearchAgent):
                         f"{CONVERGENCE_THRESHOLD}), stopping revision loop"
                     )
                     break
+            else:
+                _stall_count = 0  # reset on improvement
             prev_avg_score = new_avg
 
         review.revision_rounds = revision_round
@@ -487,9 +560,13 @@ class ReviewAgent(BaseResearchAgent):
         Handles \\section{} (level=0), \\subsection{} (level=1),
         and \\subsubsection{} (level=2).
         """
-        # Use a pattern that handles nested braces (e.g. \section{Method for \textbf{X}})
+        # BUG-37 fix: support 2 levels of nested braces in section titles
+        # (e.g. \section{Method for \textbf{Computing \textit{X}}}).
+        # Inner group: [^{}]  |  {  ( [^{}] | { [^{}]* } )*  }
         pattern = re.compile(
-            r"\\((?:sub){0,2})section\*?\{((?:[^{}]|\{[^{}]*\})+)\}",
+            r"\\((?:sub){0,2})section\*?\{"
+            r"((?:[^{}]|\{(?:[^{}]|\{[^{}]*\})*\})+)"
+            r"\}",
         )
         matches = list(pattern.finditer(tex))
         if not matches:
@@ -540,7 +617,7 @@ class ReviewAgent(BaseResearchAgent):
 
         try:
             from mcp_server.tools.arxiv_search import search_arxiv
-            from mcp_server.tools.semantic_scholar import search_semantic_scholar
+            from mcp_server.tools.openalex import search_openalex
 
             async def _search_papers(query: str, max_results: int = 5) -> list[dict]:
                 results: list[dict] = []
@@ -549,9 +626,9 @@ class ReviewAgent(BaseResearchAgent):
                 except Exception as exc:
                     logger.debug("arxiv search failed: %s", exc)
                 try:
-                    results.extend(await search_semantic_scholar(query, max_results=max_results))
+                    results.extend(await search_openalex(query, max_results=max_results))
                 except Exception as exc:
-                    logger.debug("semantic scholar search failed: %s", exc)
+                    logger.debug("openalex search failed: %s", exc)
                 return results
 
             registry.register(ToolDefinition(
@@ -672,16 +749,19 @@ class ReviewAgent(BaseResearchAgent):
         # Last resort: extract score via regex from the raw text
         score_match = re.search(r'"score"\s*:\s*(\d+)', text)
         if score_match:
-            score = int(score_match.group(1))
-            # Try to extract issues array elements
+            # BUG-31 fix: clamp score to valid range [1, 10].
+            # LLM may output e.g. "score": 99 in truncated JSON.
+            score = max(1, min(10, int(score_match.group(1))))
+            # BUG-38 fix: lower min-length from 10 to 3 so short but
+            # valid issues (e.g. "Use \\cite{}") are not silently dropped.
             issues = re.findall(r'"issues"\s*:\s*\[(.*?)\]', text, re.DOTALL)
             issue_list = []
             if issues:
-                issue_list = re.findall(r'"([^"]{10,})"', issues[0])
+                issue_list = re.findall(r'"([^"]{3,})"', issues[0])
             suggestions = re.findall(r'"suggestions"\s*:\s*\[(.*?)\]', text, re.DOTALL)
             suggestion_list = []
             if suggestions:
-                suggestion_list = re.findall(r'"([^"]{10,})"', suggestions[0])
+                suggestion_list = re.findall(r'"([^"]{3,})"', suggestions[0])
             return {
                 "score": score,
                 "issues": issue_list[:5],
@@ -912,8 +992,10 @@ Score rubric: 9-10 publication-ready, 7-8 solid with minor issues, 5-6 significa
             if s
         ]
 
-        if not issues and score < 7:
-            score = 7
+        # BUG-6 fix: do NOT inflate score when issues list is empty.
+        # Preserve the original low score so downstream revision logic
+        # receives the correct severity signal.  Step 2b will inject
+        # generic issues for sections below MIN_SECTION_SCORE anyway.
 
         return SectionReview(
             section=result.get("section", heading),
@@ -1123,9 +1205,13 @@ Return JSON:
             else:
                 suggestions.append(str(item))
 
-        # Only fix the one truly contradictory case: zero issues but low score
-        if len(issues) == 0 and score < 7:
-            score = 7
+        # BUG-6 fix: when issues is empty but score is low, preserve the
+        # original low score to convey severity to the revision LLM.
+        # The downstream Step 2b (line ~145) will inject generic issues
+        # for sections below MIN_SECTION_SCORE, so the section won't be
+        # skipped — but keeping the real score gives the revision LLM a
+        # stronger signal about how much improvement is needed.
+        # (Previously this inflated score to 7, masking severity.)
 
         sr = SectionReview(
             section=result.get("section", heading),
@@ -1455,9 +1541,11 @@ Return JSON:
             return text
 
         # Find section boundaries
+        # BUG-14 fix: support one level of nested braces in section titles
+        # e.g. \section{Method for \textbf{Hard} Cases}
         section_starts = [
             (m.start(), m.group(1))
-            for m in re.finditer(r'\\section\{([^}]+)\}', text)
+            for m in re.finditer(r'\\section\{((?:[^{}]|\{[^{}]*\})+)\}', text)
         ]
         if not section_starts:
             # No sections found, fall back to head/tail
@@ -1716,6 +1804,77 @@ Return JSON:
 
         return issues
 
+    @staticmethod
+    def _check_latex_structure(tex: str) -> list[str]:
+        """Quick structural checks for LaTeX source (no compilation).
+
+        Returns a list of issue description strings.  Used by the
+        backpressure mechanism to detect revision-introduced breakage
+        and distinguish it from pre-existing issues (BUG-30 fix).
+        """
+        issues: list[str] = []
+        begins = len(re.findall(r'\\begin\{', tex))
+        ends = len(re.findall(r'\\end\{', tex))
+        if begins != ends:
+            issues.append(f"Unbalanced environments: {begins} \\begin vs {ends} \\end")
+        # Check for mismatched environment types
+        env_stack: list[str] = []
+        for env_m in re.finditer(r'\\(begin|end)\{([^}]+)\}', tex):
+            cmd, env_name = env_m.group(1), env_m.group(2)
+            if cmd == "begin":
+                env_stack.append(env_name)
+            elif env_stack and env_stack[-1] == env_name:
+                env_stack.pop()
+            elif env_stack:
+                issues.append(
+                    f"Mismatched environment: \\begin{{{env_stack[-1]}}} "
+                    f"closed by \\end{{{env_name}}}"
+                )
+                env_stack.pop()
+                break  # one mismatch is enough
+        if '\\documentclass' not in tex:
+            issues.append("Missing \\documentclass")
+        if '\\end{document}' not in tex:
+            issues.append("Missing \\end{document}")
+        return issues
+
+    @staticmethod
+    def _fix_mismatched_environments(tex: str) -> str:
+        """Auto-fix ``\\begin{X}...\\end{Y}`` mismatches in LaTeX source.
+
+        Common LLM errors: ``\\begin{equation}...\\end{parameter}``,
+        ``\\begin{align}...\\end{equation}``, etc.
+        Strategy: scan for mismatches and replace the wrong ``\\end{Y}``
+        with the correct ``\\end{X}`` from the stack.
+        """
+        # Collect all begin/end positions
+        env_events: list[tuple[int, int, str, str]] = []  # (start, end, cmd, env_name)
+        for m in re.finditer(r'\\(begin|end)\{([^}]+)\}', tex):
+            env_events.append((m.start(), m.end(), m.group(1), m.group(2)))
+
+        # Walk through and fix mismatches (reverse order to preserve offsets)
+        fixes: list[tuple[int, int, str]] = []  # (start, end, replacement)
+        stack: list[tuple[int, int, str]] = []  # (start, end, env_name) for begins
+        for start, end, cmd, env_name in env_events:
+            if cmd == "begin":
+                stack.append((start, end, env_name))
+            elif cmd == "end":
+                if stack and stack[-1][2] == env_name:
+                    stack.pop()  # correct match
+                elif stack:
+                    expected = stack[-1][2]
+                    # Replace \end{wrong} with \end{expected}
+                    fixes.append((start, end, f"\\end{{{expected}}}"))
+                    stack.pop()
+                # else: orphan \end — leave as-is
+
+        # Apply fixes in reverse order (right to left)
+        result = tex
+        for start, end, replacement in reversed(fixes):
+            result = result[:start] + replacement + result[end:]
+
+        return result
+
     def _run_consistency_checks(self, tex: str) -> list[ConsistencyIssue]:
         """Run automated consistency checks on the LaTeX source."""
         issues: list[ConsistencyIssue] = []
@@ -1827,8 +1986,8 @@ Return JSON:
         query = f"{surname} {year}" if m else key
 
         try:
-            from mcp_server.tools.semantic_scholar import search_semantic_scholar
-            results = await search_semantic_scholar(query, max_results=5)
+            from mcp_server.tools.openalex import search_openalex
+            results = await search_openalex(query, max_results=5)
             best = None
             for r in results:
                 r_year = str(r.get("year", ""))
@@ -1850,23 +2009,29 @@ Return JSON:
                 title = best.get("title", "Unknown")
                 venue = best.get("venue", "") or "arXiv preprint"
                 r_year = best.get("year", year or 2024)
+                # BUG-26 fix: detect conference vs journal from venue name
+                entry_type, venue_field = _detect_bib_entry_type(venue)
                 return (
-                    f"@article{{{key},\n"
+                    f"@{entry_type}{{{key},\n"
                     f"  title={{{title}}},\n"
                     f"  author={{{author_str}}},\n"
                     f"  year={{{r_year}}},\n"
-                    f"  journal={{{venue}}},\n"
+                    f"  {venue_field}={{{venue}}},\n"
                     f"}}\n"
                 )
         except Exception as exc:
             logger.debug("S2 search failed for '%s': %s", key, exc)
 
+        # BUG-4 fix: instead of generating a fake stub with
+        # title={Surname et al.}, generate a minimal @misc entry that
+        # honestly marks itself as unresolved. The note field explains
+        # the situation rather than masquerading as a real reference.
         return (
             f"@misc{{{key},\n"
-            f"  title={{{surname} et al.}},\n"
             f"  author={{{surname}}},\n"
             f"  year={{{year or 2024}}},\n"
-            f"  note={{Citation auto-generated}},\n"
+            f"  note={{Could not retrieve full metadata. "
+            f"Please replace with the correct reference.}},\n"
             f"}}\n"
         )
 
@@ -2131,6 +2296,10 @@ Return JSON:
             body_start = 0
 
         for heading, new_content in revised_sections.items():
+            # BUG-41 fix: strip stray \end{document} from LLM-revised
+            # section content — it would terminate the document prematurely
+            # and cause all \cite{} after it to become (?).
+            new_content = re.sub(r'\\end\{document\}\s*', '', new_content)
             # Recalculate body_start each iteration because prior replacements
             # shift all character offsets in `result`
             body_start = result.find(body_marker)
@@ -2175,18 +2344,31 @@ Return JSON:
             # For top-level sections (\section{}), match everything up to the
             # next \section{} (same level), \end{document}, or \bibliography.
             # This includes all subsections within it.
+            # BUG-35 fix: lookahead also matches \begin{thebibliography}
+            # (inline bibliography style) in addition to \bibliography{}.
+            _BIB_LA = r"\\bibliography(?:style)?\{|\\begin\{thebibliography\}"
             if section_level == 0:
                 pattern = (
                     r"(\\section\*?\{" + esc_heading + r"\})"
                     r"(.*?)"
-                    r"(?=\\section\*?\{|\\end\{document\}|\\bibliography)"
+                    r"(?=\\section\*?\{|\\end\{document\}|" + _BIB_LA + r")"
+                )
+            elif section_level == 1:
+                # BUG-7 fix: for \subsection{}, match up to the next
+                # \section{} or \subsection{} — NOT \subsubsection{}.
+                # This ensures subsubsections within this subsection are
+                # included in the replacement range, preventing duplication.
+                pattern = (
+                    r"(\\subsection\*?\{" + esc_heading + r"\})"
+                    r"(.*?)"
+                    r"(?=\\(?:sub)?section\*?\{|\\end\{document\}|" + _BIB_LA + r")"
                 )
             else:
-                # For subsections, match up to the next same-or-higher-level section
+                # For \subsubsection{}, match up to next section at any level
                 pattern = (
-                    r"(\\(?:sub){0,2}section\*?\{" + esc_heading + r"\})"
+                    r"(\\subsubsection\*?\{" + esc_heading + r"\})"
                     r"(.*?)"
-                    r"(?=\\(?:sub){0,2}section\*?\{|\\end\{document\}|\\bibliography)"
+                    r"(?=\\(?:sub){0,2}section\*?\{|\\end\{document\}|" + _BIB_LA + r")"
                 )
             match = re.search(pattern, result[body_start:], re.DOTALL)
             if not match:

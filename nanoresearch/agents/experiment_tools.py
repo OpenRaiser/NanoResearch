@@ -5,12 +5,14 @@ clusters.  When SLURM is available the LLM can submit batch jobs; otherwise
 it falls back to direct subprocess execution.
 
 Tools registered:
-  read_file      — read any file (text or binary-as-hex)
-  write_file     — create / overwrite a file
-  list_dir       — ls with sizes and types
-  run_command    — arbitrary shell command (with timeout + safety)
-  search_files   — glob pattern search
-  grep_content   — search file contents by regex
+  read_file          — read any file (text or binary-as-hex)
+  write_file         — create / overwrite a file
+  list_dir           — ls with sizes and types
+  run_command        — arbitrary shell command (with timeout + safety)
+  search_files       — glob pattern search
+  grep_content       — search file contents by regex
+  probe_environment  — one-shot GPU/Python/CUDA/pip/OS diagnostic
+  check_process      — inspect running processes and GPU utilization
 """
 
 from __future__ import annotations
@@ -18,7 +20,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import logging
+import os
+import platform
 import re
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -244,6 +249,187 @@ async def _grep_content(
 
 
 # ---------------------------------------------------------------------------
+# Infrastructure diagnostic tools
+# ---------------------------------------------------------------------------
+
+async def _probe_environment(_base: Path | None = None) -> dict[str, Any]:
+    """One-shot environment diagnostic: GPU, Python, CUDA, pip packages, OS.
+
+    This runs several diagnostic commands and returns structured results so the
+    agent can reason about environment issues (wrong torch build, CUDA mismatch,
+    missing packages) without needing multiple round-trips.
+    """
+
+    # Force UTF-8 for subprocess output on Windows
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    async def _run(cmd: str, timeout: int = 15) -> str:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(_base) if _base else None,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            out = stdout.decode("utf-8", errors="replace").strip()
+            if not out and stderr:
+                out = stderr.decode("utf-8", errors="replace").strip()
+            return out
+        except asyncio.TimeoutError:
+            return "(timed out)"
+        except Exception as e:
+            return f"(error: {e})"
+
+    result: dict[str, Any] = {"os": {}, "python": {}, "gpu": {}, "packages": {}}
+
+    # --- OS info ---
+    result["os"]["platform"] = platform.platform()
+    result["os"]["system"] = platform.system()
+    result["os"]["machine"] = platform.machine()
+    if platform.system() == "Linux":
+        result["os"]["glibc"] = await _run("ldd --version 2>&1 | head -1")
+
+    # --- Python info ---
+    # Use the venv python if we have a base directory with a venv
+    python_cmd = "python"
+    if _base:
+        venv_python = _base / ".venv" / ("Scripts" if os.name == "nt" else "bin") / "python"
+        if venv_python.exists():
+            python_cmd = str(venv_python)
+
+    result["python"]["executable"] = await _run(f"{python_cmd} -c \"import sys; print(sys.executable)\"")
+    result["python"]["version"] = await _run(f"{python_cmd} --version")
+
+    # --- GPU / CUDA info ---
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        result["gpu"]["nvidia_smi"] = await _run(
+            "nvidia-smi --query-gpu=name,memory.total,memory.used,memory.free,driver_version,temperature.gpu "
+            "--format=csv,noheader,nounits"
+        )
+        result["gpu"]["cuda_version"] = await _run(
+            "nvidia-smi 2>&1 | head -3"
+        )
+    else:
+        result["gpu"]["nvidia_smi"] = "(nvidia-smi not found — no GPU or driver not installed)"
+
+    # --- torch status ---
+    torch_script = (
+        "import torch; "
+        "print('version=' + torch.__version__); "
+        "print('cuda_available=' + str(torch.cuda.is_available())); "
+        "print('cuda_version=' + str(torch.version.cuda)); "
+        "print('device_count=' + str(torch.cuda.device_count())); "
+        "print('device_name=' + (torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A'))"
+    )
+    torch_check = await _run(f'{python_cmd} -c "{torch_script}"', timeout=30)
+    result["packages"]["torch"] = torch_check
+
+    # --- Key ML packages ---
+    pip_list = await _run(
+        f'{python_cmd} -m pip list --format=columns 2>{"NUL" if os.name == "nt" else "/dev/null"}',
+        timeout=30,
+    )
+    # Truncate to first 60 lines
+    pip_lines = pip_list.split("\n")[:60]
+    result["packages"]["pip_list_head"] = "\n".join(pip_lines)
+
+    # --- Conda info ---
+    conda = shutil.which("conda")
+    if conda:
+        result["packages"]["conda_envs"] = await _run("conda info --envs 2>/dev/null | head -20")
+
+    # --- Disk space ---
+    if _base:
+        if os.name == "nt":
+            result["os"]["disk"] = await _run(f'powershell -Command "(Get-PSDrive -Name C).Free / 1GB"')
+        else:
+            result["os"]["disk"] = await _run(f"df -h {_base} 2>/dev/null | tail -1")
+
+    return result
+
+
+async def _check_process(pattern: str = "", _base: Path | None = None) -> dict[str, Any]:
+    """Check running processes and GPU utilization.
+
+    Useful for diagnosing: is training still alive? is GPU being used?
+    is there a zombie process hogging memory?
+
+    Parameters
+    ----------
+    pattern : str
+        Optional grep pattern to filter processes (e.g. 'python', 'train').
+        If empty, shows all python processes + GPU processes.
+    """
+
+    env = os.environ.copy()
+    env["PYTHONIOENCODING"] = "utf-8"
+
+    async def _run(cmd: str, timeout: int = 15) -> str:
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(_base) if _base else None,
+                env=env,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            return stdout.decode("utf-8", errors="replace").strip()
+        except asyncio.TimeoutError:
+            return "(timed out)"
+        except Exception as e:
+            return f"(error: {e})"
+
+    result: dict[str, Any] = {}
+
+    # --- GPU processes ---
+    nvidia_smi = shutil.which("nvidia-smi")
+    if nvidia_smi:
+        result["gpu_processes"] = await _run("nvidia-smi --query-compute-apps=pid,name,used_memory --format=csv,noheader,nounits 2>/dev/null")
+        result["gpu_utilization"] = await _run(
+            "nvidia-smi --query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total "
+            "--format=csv,noheader,nounits"
+        )
+
+    # --- System processes ---
+    if os.name == "nt":
+        # Windows
+        if pattern:
+            result["processes"] = await _run(
+                f'powershell -Command "Get-Process | Where-Object {{$_.ProcessName -match \'{pattern}\'}} '
+                f'| Select-Object Id,ProcessName,CPU,WorkingSet64 | Format-Table -AutoSize | Out-String"'
+            )
+        else:
+            result["processes"] = await _run(
+                'powershell -Command "Get-Process python* | Select-Object Id,ProcessName,CPU,WorkingSet64 '
+                '| Format-Table -AutoSize | Out-String"'
+            )
+    else:
+        # Linux/Mac
+        if pattern:
+            result["processes"] = await _run(f"ps aux | grep -i '{pattern}' | grep -v grep | head -30")
+        else:
+            result["processes"] = await _run("ps aux | grep -i python | grep -v grep | head -30")
+
+    # --- Memory ---
+    if os.name == "nt":
+        result["memory"] = await _run(
+            'powershell -Command "$os = Get-CimInstance Win32_OperatingSystem; '
+            '$used = ($os.TotalVisibleMemorySize - $os.FreePhysicalMemory) / 1MB; '
+            '$total = $os.TotalVisibleMemorySize / 1MB; '
+            'Write-Output \\\"Used: $([math]::Round($used,1)) GB / Total: $([math]::Round($total,1)) GB\\\""'
+        )
+    else:
+        result["memory"] = await _run("free -h 2>/dev/null | head -3")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Registry builder
 # ---------------------------------------------------------------------------
 
@@ -265,6 +451,8 @@ def build_experiment_tools(work_dir: Path | None = None) -> ToolRegistry:
     _rc = functools.partial(_run_command, _base=work_dir)
     _sf = functools.partial(_search_files, _base=work_dir)
     _gc = functools.partial(_grep_content, _base=work_dir)
+    _pe = functools.partial(_probe_environment, _base=work_dir)
+    _cp = functools.partial(_check_process, _base=work_dir)
 
     registry.register(ToolDefinition(
         name="read_file",
@@ -411,6 +599,44 @@ def build_experiment_tools(work_dir: Path | None = None) -> ToolRegistry:
             "required": ["pattern"],
         },
         handler=_gc,
+    ))
+
+    registry.register(ToolDefinition(
+        name="probe_environment",
+        description=(
+            "One-shot environment diagnostic. Returns GPU info (nvidia-smi), "
+            "Python version, torch CUDA status, installed packages (pip list), "
+            "conda environments, OS info, and disk space. "
+            "Use this FIRST when debugging environment/infrastructure issues "
+            "(DLL errors, CUDA mismatch, wrong torch version, import failures). "
+            "No parameters needed — it auto-detects everything."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+        handler=_pe,
+    ))
+
+    registry.register(ToolDefinition(
+        name="check_process",
+        description=(
+            "Check running processes and GPU utilization. "
+            "Shows: GPU processes (what's using VRAM), system python processes, "
+            "GPU utilization %, and system memory usage. "
+            "Use this to check if training is still alive, if GPU is being used, "
+            "or if zombie processes are hogging resources."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Optional process name filter (e.g. 'python', 'train'). Default: show all python processes.",
+                },
+            },
+        },
+        handler=_cp,
     ))
 
     return registry

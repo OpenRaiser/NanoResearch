@@ -89,6 +89,12 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
                     list(exp_dir.glob("*.py"))
                     + list(exp_dir.glob("*.txt"))
                     + list(exp_dir.glob("*.slurm"))
+                    + list(exp_dir.glob("*.json"))
+                    + list(exp_dir.glob("*.yml"))
+                    + list(exp_dir.glob("*.yaml"))
+                    + list(exp_dir.glob("*.toml"))
+                    + list(exp_dir.glob("*.cfg"))
+                    + list(exp_dir.glob("*.sh"))
                 ):
                     shutil.copy2(file_path, code_dest / file_path.name)
 
@@ -146,7 +152,7 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
             analysis_output = accumulated.get("analysis_output", {})
             inputs["experiment_results"] = (
                 exec_output.get("metrics")
-                or analysis_output.get("execution_output", {}).get("metrics", {})
+                or (analysis_output.get("execution_output") or {}).get("metrics", {})
                 or {}
             )
             inputs["experiment_analysis"] = analysis_output.get("analysis", {})
@@ -158,22 +164,25 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
                 exec_output.get("experiment_status")
                 or exec_output.get("final_status", "pending")
             )
+            # Pass ANALYSIS-generated figures so FIGURE_GEN can skip duplicates
+            inputs["existing_figures"] = analysis_output.get("figures", {})
 
         elif stage == PipelineStage.WRITING:
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
             inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
-            fig_output = accumulated.get("figure_gen_output", {})
-            if not fig_output or not fig_output.get("figures"):
-                analysis_figures = accumulated.get("analysis_output", {}).get("figures", {})
-                fig_output = {"figures": analysis_figures} if analysis_figures else {}
-            inputs["figure_output"] = fig_output
+            # Merge figures from ANALYSIS + FIGURE_GEN so WRITING sees ALL of them.
+            # ANALYSIS figures go first; FIGURE_GEN can override on key collision.
+            analysis_figures = accumulated.get("analysis_output", {}).get("figures", {})
+            fig_gen_figures = accumulated.get("figure_gen_output", {}).get("figures", {})
+            merged_figures = {**analysis_figures, **fig_gen_figures}
+            inputs["figure_output"] = {"figures": merged_figures} if merged_figures else {}
             inputs["template_format"] = self.config.template_format
 
             exec_output = accumulated.get("execution_output", {})
             analysis_output = accumulated.get("analysis_output", {})
             inputs["experiment_results"] = (
                 exec_output.get("metrics")
-                or analysis_output.get("execution_output", {}).get("metrics", {})
+                or (analysis_output.get("execution_output") or {}).get("metrics", {})
                 or {}
             )
             inputs["experiment_analysis"] = analysis_output.get("analysis", {})
@@ -200,7 +209,7 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
             analysis_output = accumulated.get("analysis_output", {})
             inputs["experiment_results"] = (
                 exec_output.get("metrics")
-                or analysis_output.get("execution_output", {}).get("metrics", {})
+                or (analysis_output.get("execution_output") or {}).get("metrics", {})
                 or {}
             )
             inputs["experiment_analysis"] = analysis_output.get("analysis", {})

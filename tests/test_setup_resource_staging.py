@@ -71,9 +71,10 @@ async def test_setup_stages_cached_resources_into_workspace(monkeypatch) -> None
             experiment_blueprint={"datasets": [{"name": "DemoSet"}]},
         )
 
-        workspace_data = workspace.path / "data"
+        workspace_datasets = workspace.path / "datasets"
         workspace_models = workspace.path / "models"
-        assert result["data_dir"] == str(workspace_data)
+        assert result["data_dir"] == str(workspace_datasets)
+        assert result["datasets_dir"] == str(workspace_datasets)
         assert result["models_dir"] == str(workspace_models)
         assert result["cache_data_dir"] == str(cache_data)
         assert result["cache_models_dir"] == str(cache_models)
@@ -87,8 +88,8 @@ async def test_setup_stages_cached_resources_into_workspace(monkeypatch) -> None
 
         assert dataset_resource["cache_path"] == str(dataset_file)
         assert Path(dataset_resource["path"]).exists()
-        assert Path(dataset_resource["path"]).parent == workspace_data
-        assert (workspace_data / "demo.csv").exists()
+        assert Path(dataset_resource["path"]).parent == workspace_datasets
+        assert (workspace_datasets / "demo.csv").exists()
 
         assert model_resource["cache_path"] == str(model_dir)
         assert Path(model_resource["path"]).exists()
@@ -96,7 +97,7 @@ async def test_setup_stages_cached_resources_into_workspace(monkeypatch) -> None
         assert (Path(model_resource["path"]) / "config.json").exists()
 
         alias_paths = {item["workspace_path"] for item in result["workspace_resource_aliases"]}
-        assert str(workspace_data / "demo.csv") in alias_paths
+        assert str(workspace_datasets / "demo.csv") in alias_paths
         assert str(workspace_models / "demo_model") in alias_paths
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -150,12 +151,12 @@ async def test_setup_stages_directory_resource_file_list_into_workspace(monkeypa
         )
 
         resource = result["downloaded_resources"][0]
-        assert resource["path"] == str(workspace.path / "data")
-        assert resource["workspace_path"] == str(workspace.path / "data")
-        assert (workspace.path / "data" / "archive.csv").exists()
-        assert resource["workspace_files"] == [str(workspace.path / "data" / "archive.csv")]
+        assert resource["path"] == str(workspace.path / "datasets")
+        assert resource["workspace_path"] == str(workspace.path / "datasets")
+        assert (workspace.path / "datasets" / "archive.csv").exists()
+        assert resource["workspace_files"] == [str(workspace.path / "datasets" / "archive.csv")]
         assert result["workspace_resource_aliases"][0]["workspace_files"] == [
-            str(workspace.path / "data" / "archive.csv")
+            str(workspace.path / "datasets" / "archive.csv")
         ]
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
