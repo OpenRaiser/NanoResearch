@@ -174,7 +174,7 @@ class ResearchConfig(BaseModel):
     # SLURM settings for react mode (auto-detected if empty)
     slurm_partition: str = ""               # e.g., "belt_road"
     slurm_max_gpus: int = 2                 # max GPUs per job
-    slurm_default_time: str = "4:00:00"     # default wall time
+    slurm_default_time: str = "30-00:00:00"  # default wall time (30 days)
     # Container settings for react mode (for clusters with old glibc)
     container_image: str = ""               # e.g., "docker://ubuntu:22.04" (clean base with glibc 2.35)
     container_path: str = ""                # e.g., "/mnt/shared/ubuntu2204.sif"

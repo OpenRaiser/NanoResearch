@@ -55,7 +55,24 @@ class ExecutionAgent(
         (code_dir / "results").mkdir(exist_ok=True)
 
         cluster_available = bool(slurm_script) and shutil.which("sbatch") is not None
-        if not self.config.prefers_cluster_execution() or not cluster_available:
+
+        # Auto-detect: if profile is local_quick but no local GPU and SLURM is
+        # available, automatically upgrade to cluster execution.
+        use_cluster = self.config.prefers_cluster_execution()
+        if not use_cluster and cluster_available:
+            try:
+                import torch as _torch
+                has_gpu = _torch.cuda.is_available() and _torch.cuda.device_count() > 0
+            except Exception:
+                has_gpu = False
+            if not has_gpu:
+                use_cluster = True
+                self.log(
+                    "No local GPU detected but sbatch is available — "
+                    "auto-upgrading to cluster (SLURM) execution"
+                )
+
+        if not use_cluster or not cluster_available:
             if self.config.prefers_cluster_execution() and not cluster_available:
                 self.log("Cluster execution requested but sbatch is unavailable, falling back to local mode")
             elif not slurm_script:
