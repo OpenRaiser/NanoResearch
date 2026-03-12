@@ -6,31 +6,43 @@
 
 AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
 
-## Recent Changes (v2.1 — 2026-03-12)
+## Changelog
 
-### Writing Quality Overhaul
-- **Table content validation** — System now validates LLM-generated tables against the grounding packet's expected metrics. Mismatched tables (wrong caption, wrong metrics, fabricated data) are automatically replaced with deterministic pre-built versions
-- **Anti-fabrication hardening** — When no experiment results are available, the writing prompt now includes an absolute ban on specific numbers/percentages. LLMs are forbidden from generating `\begin{table}` environments; tables are auto-injected by the system
-- **Figure caption cleanup** — AI-generated image captions are now cleaned from verbose generation prompts to concise academic captions (max 2 sentences). Generation prompts stored separately as metadata
-- **Figure path fix** — Added `\graphicspath{{figures/}}` to LaTeX preamble; exported paper bundles are now self-contained and compile independently
-- **Anti-AI writing checks** — Expanded banned word list with 44 additional AI-characteristic words (from [awesome-ai-research-writing](https://github.com/Leey21/awesome-ai-research-writing)). Review agent now runs automated `_check_ai_artifacts()` detecting: banned vocabulary frequency, em-dash overuse, "Furthermore"/"Moreover" repetition, and hedging pileups
-- **Experiment analysis format** — Experiments section now uses `\paragraph{Finding Title}` structure for analysis, emphasizing WHY over WHAT
-- **Reviewer strictness** — Review prompt defaults to skepticism; requires evidence backing for all claims to score 7+; checks cross-section number consistency
-- **Chart type selection guide** — Figure planning prompt now includes a 9-category chart selection guide with scale handling recommendations (log scale, broken axis, normalization)
-- **Dynamic table captions** — Scaffold tables now include dataset names from the blueprint instead of generic captions
+<details>
+<summary><b>v2.2</b> (2026-03-12) — SLURM Auto-Detection & Model Download Fix</summary>
 
-### Previous Changes (v2.0 — 2026-03-12)
-- V2.0.1-AP: CUDA/conda env detection, infra debugging, LaTeX hardening, 46 bug fixes
-- V1.9.2-AP: LaTeX repair + degenerate-run detection + figure path fix
-- V2.0-AP: Orchestrator dedup — BaseOrchestrator + thin subclasses, generate() reuse
-- V1.9-AP: Cost Tracking + Progress Streaming + Structured Logging + Blueprint Validation
+- **GPU auto-fallback**: `local_quick` profile now auto-detects GPU availability; if no local GPU but `sbatch` exists, automatically upgrades to SLURM cluster execution
+- **Model download fix**: Fixed `_run_shell()` env parameter bug that crashed all HuggingFace/ModelScope downloads; added hf-mirror.com as third fallback source
+- **SLURM config**: Partition defaults to `belt_road`; wall time uses config value (30 days) instead of LLM-estimated time
+</details>
 
-### v0.2 (2026-03-06)
-- **Deep Pipeline** — 9-stage pipeline: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
-- **REVIEW stage** — Per-section scoring, consistency checks, claim-result alignment, up to 5 revision rounds
-- **Hybrid figure generation** — Architecture diagrams (AI) + results/ablation charts (LLM-generated code)
-- **Result fabrication prevention** — Grounding system enforces exact numbers from experiments
-- **LaTeX auto-fix** — 2-level fix pipeline (deterministic + LLM) with backup/restore
+<details>
+<summary><b>v2.1</b> (2026-03-12) — Writing Quality & Anti-Fabrication</summary>
+
+- **Table validation**: LLM-generated tables checked against grounding packet; mismatched tables auto-replaced with deterministic versions
+- **Anti-fabrication**: Absolute ban on fabricated numbers; LLMs forbidden from generating `\begin{table}` (auto-injected by system)
+- **Anti-AI writing**: 44 banned AI-characteristic words; review agent detects em-dash overuse, hedging pileups, repetitive transitions
+- **Figure cleanup**: Verbose AI captions truncated to concise academic style; `\graphicspath` added for self-contained exports
+- **Reviewer strictness**: Default skepticism; evidence required for 7+ scores
+</details>
+
+<details>
+<summary><b>v2.0</b> (2026-03-12) — Infrastructure Overhaul</summary>
+
+- **BaseOrchestrator refactor**: Unified orchestrator with thin subclasses, dedup of generate() logic
+- **CUDA/conda detection**: Auto-detect environments, 46 infrastructure bug fixes
+- **LaTeX hardening**: 2-level fix pipeline (deterministic + LLM), degenerate-run detection
+- **Cost tracking**: Per-stage token counting, progress streaming, structured logging
+</details>
+
+<details>
+<summary><b>v0.2</b> (2026-03-06) — Deep Pipeline</summary>
+
+- **9-stage pipeline**: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
+- **REVIEW stage**: Per-section scoring, consistency checks, up to 5 revision rounds
+- **Hybrid figures**: Architecture diagrams (AI) + results/ablation charts (code-generated)
+- **Grounding system**: Enforces exact experiment numbers in writing; prevents result fabrication
+</details>
 
 ## What It Does
 
@@ -56,8 +68,8 @@ Unified: Topic → IDEATION → PLANNING → SETUP → CODING → EXECUTION → 
 The unified pipeline supports three high-level profiles:
 
 - `fast_draft` — lighter-weight writing/research assistance, useful for rapid draft generation
-- `local_quick` — default profile; prefers local execution with automatic venv creation and dependency installation
-- `cluster_full` — prefers SLURM/cluster execution, with automatic fallback to local mode if cluster tools are unavailable
+- `local_quick` — default profile; prefers local execution but **auto-upgrades to SLURM** if no local GPU is detected and `sbatch` is available
+- `cluster_full` — always uses SLURM/cluster execution, with automatic fallback to local mode if cluster tools are unavailable
 
 Relevant config keys:
 
