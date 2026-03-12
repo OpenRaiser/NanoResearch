@@ -650,7 +650,7 @@ Return JSON:
                     except Exception as e:
                         self.log(f"ModelScope download failed: {e}")
 
-            # Fall back to HuggingFace
+            # Fall back to HuggingFace (official endpoint)
             if not success:
                 try:
                     self.log(f"Trying HuggingFace: {model_id}")
@@ -682,6 +682,42 @@ Return JSON:
                         self.log(f"Downloaded from HuggingFace: {model_id}")
                 except Exception as e:
                     self.log(f"HuggingFace download failed: {e}")
+
+            # Fall back to hf-mirror.com (China mirror, no proxy needed)
+            if not success:
+                try:
+                    self.log(f"Trying hf-mirror.com: {model_id}")
+                    mirror_env = {
+                        "_NR_MODEL_ID": model_id,
+                        "_NR_LOCAL_DIR": str(dest),
+                        "HF_ENDPOINT": "https://hf-mirror.com",
+                    }
+                    if download_weights:
+                        result = await self._run_shell_no_proxy(
+                            'python3 -c "'
+                            'import os; '
+                            'os.environ[\'HF_ENDPOINT\'] = \'https://hf-mirror.com\'; '
+                            'from huggingface_hub import snapshot_download; '
+                            'snapshot_download(os.environ[\'_NR_MODEL_ID\'], '
+                            'local_dir=os.environ[\'_NR_LOCAL_DIR\'])"',
+                            timeout=1800, env=mirror_env,
+                        )
+                    else:
+                        result = await self._run_shell_no_proxy(
+                            'python3 -c "'
+                            'import os; '
+                            'os.environ[\'HF_ENDPOINT\'] = \'https://hf-mirror.com\'; '
+                            'from huggingface_hub import snapshot_download; '
+                            'snapshot_download(os.environ[\'_NR_MODEL_ID\'], '
+                            'local_dir=os.environ[\'_NR_LOCAL_DIR\'], '
+                            'ignore_patterns=[\'*.bin\', \'*.safetensors\', \'*.h5\', \'*.msgpack\'])"',
+                            timeout=300, env=mirror_env,
+                        )
+                    if result.get("returncode", 1) == 0:
+                        success = True
+                        self.log(f"Downloaded from hf-mirror.com: {model_id}")
+                except Exception as e:
+                    self.log(f"hf-mirror download failed: {e}")
 
             status = "full" if (download_weights and success) else ("config_only" if success else "failed")
             downloaded.append({
@@ -1159,10 +1195,13 @@ Rules:
 
         return ""
 
-    async def _run_shell_no_proxy(self, cmd: str, timeout: int = 60) -> dict:
+    async def _run_shell_no_proxy(self, cmd: str, timeout: int = 60, env: dict | None = None) -> dict:
         """Run a shell command WITHOUT proxy (for domestic sources like ModelScope)."""
-        env = {k: v for k, v in __import__('os').environ.items()
+        _env = {k: v for k, v in __import__('os').environ.items()
                if 'proxy' not in k.lower()}
+        if env:
+            _env.update(env)
+        env = _env
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -1181,10 +1220,10 @@ Rules:
             "stderr": stderr.decode(errors="replace"),
         }
 
-    async def _run_shell(self, cmd: str, timeout: int = 60) -> dict:
+    async def _run_shell(self, cmd: str, timeout: int = 60, env: dict | None = None) -> dict:
         """Run a shell command asynchronously with proxy environment."""
-        env = {**__import__('os').environ}
-        proxy_url = env.get("https_proxy") or env.get("HTTPS_PROXY", "")
+        _env = {**__import__('os').environ}
+        proxy_url = _env.get("https_proxy") or _env.get("HTTPS_PROXY", "")
         if not proxy_url:
             import re as _re
             bashrc = Path.home() / ".bashrc"
@@ -1194,19 +1233,21 @@ Rules:
                 if m:
                     proxy_url = m.group(1)
         if proxy_url:
-            env.update({
+            _env.update({
                 "http_proxy": proxy_url,
                 "https_proxy": proxy_url,
                 "HTTP_PROXY": proxy_url,
                 "HTTPS_PROXY": proxy_url,
             })
+        if env:
+            _env.update(env)
 
         proc = await asyncio.create_subprocess_shell(
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(self.workspace.path),
-            env=env,
+            env=_env,
         )
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
