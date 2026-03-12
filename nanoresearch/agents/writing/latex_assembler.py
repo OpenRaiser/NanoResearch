@@ -160,9 +160,9 @@ class _LaTeXAssemblerMixin:
             r"\usepackage{hyperref}",
             r"\usepackage{natbib}",
             r"\usepackage{booktabs}",
-            r"\usepackage{float}",
             r"\usepackage[section]{placeins}",  # prevent floats drifting across sections
             r"\usepackage{multirow}",  # for multi-row table cells
+            r"\graphicspath{{figures/}}",
             "",
             f"\\title{{{skeleton.title}}}",
             f"\\author{{{' \\and '.join(skeleton.authors)}}}",

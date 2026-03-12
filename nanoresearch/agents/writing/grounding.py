@@ -443,6 +443,20 @@ class _GroundingMixin:
             or "Ours"
         )
 
+        # Build dynamic caption with dataset info
+        datasets = blueprint.get("datasets", [])
+        dataset_names = []
+        for d in datasets:
+            if isinstance(d, dict):
+                name = d.get("name", "")
+            elif isinstance(d, str):
+                name = d
+            else:
+                continue
+            if name:
+                dataset_names.append(name)
+        dataset_str = ", ".join(dataset_names[:3]) if dataset_names else "the benchmark"
+
         n = len(metric_names)
         col_spec = "@{}l" + "c" * n + "@{}"
         header = " & ".join(metric_names)
@@ -452,7 +466,8 @@ class _GroundingMixin:
             "\\centering",
             "\\small",
             "\\setlength{\\tabcolsep}{4pt}",
-            "\\caption{Main experimental results. Best results are in \\textbf{bold}. "
+            f"\\caption{{Main experimental results on {_escape_latex_text(dataset_str)}. "
+            "Best results are in \\textbf{bold}. "
             "Results for the proposed method are pending due to execution issues.}",
             "\\label{tab:main_results}",
             f"\\begin{{tabular}}{{{col_spec}}}",
@@ -523,6 +538,20 @@ class _GroundingMixin:
             or "Full Model"
         )
 
+        # Build dynamic caption with dataset info
+        datasets = blueprint.get("datasets", [])
+        dataset_names = []
+        for d in datasets:
+            if isinstance(d, dict):
+                name = d.get("name", "")
+            elif isinstance(d, str):
+                name = d
+            else:
+                continue
+            if name:
+                dataset_names.append(name)
+        dataset_str = ", ".join(dataset_names[:3]) if dataset_names else "the benchmark"
+
         n = len(metric_names)
         col_spec = "@{}l" + "c" * n + "@{}"
         header = " & ".join(metric_names)
@@ -532,7 +561,7 @@ class _GroundingMixin:
             "\\centering",
             "\\small",
             "\\setlength{\\tabcolsep}{4pt}",
-            "\\caption{Ablation study. Each row removes one component. "
+            f"\\caption{{Ablation study on {_escape_latex_text(dataset_str)}. Each row removes one component. "
             "Results are pending due to execution issues.}",
             "\\label{tab:ablation}",
             f"\\begin{{tabular}}{{{col_spec}}}",
@@ -619,19 +648,21 @@ class _GroundingMixin:
             return (
                 "=== EXPERIMENT RESULTS: NOT AVAILABLE ===\n"
                 "The proposed method's experiment did not produce results due to execution issues.\n\n"
-                "RULES FOR EXPERIMENTS SECTION:\n"
+                "ABSOLUTE RULES FOR WRITING WITHOUT RESULTS:\n"
                 "- Do NOT fabricate results for the PROPOSED METHOD. Use '--' in its table cells.\n"
-                "- For BASELINE methods, you SHOULD fill in numbers from their original papers\n"
-                "  (cite the source). This is standard practice — reproducing published numbers.\n"
-                "- Use the PRE-BUILT TABLE scaffold provided below. Fill baseline cells with\n"
-                "  literature-reported numbers and keep proposed method cells as '--'.\n"
+                "- Do NOT write ANY specific numbers, percentages, or quantitative claims about \n"
+                "  the proposed method (e.g., 'improves by 3.2%', 'achieves 95% accuracy').\n"
+                "- For BASELINE methods, you MAY fill in numbers from their original papers\n"
+                "  (cite the source). This is standard practice.\n"
+                "- Do NOT generate \\begin{table} environments yourself.\n"
+                "  Tables will be automatically injected by the system.\n"
+                "  Reference them as Table~\\ref{tab:main_results} and Table~\\ref{tab:ablation}.\n"
                 "- Write a full Experiments section: datasets, metrics, baselines, setup,\n"
                 "  implementation details, and analysis of baseline landscape.\n"
-                "- Add one sentence noting that proposed method results are pending:\n"
-                "  'Due to technical issues during execution, results for our method could not\n"
-                "   be obtained in this version. We report baseline results from the literature\n"
-                "   for reference.'\n"
-                "- Do NOT skip the tables. Do NOT omit the ablation table.\n"
+                "- Include this sentence: 'Due to technical issues during execution, quantitative\n"
+                "   results for our method are not available in this version. We report baseline\n"
+                "   results from the literature for reference and present our experimental setup\n"
+                "   for reproducibility.'\n"
                 "=== END EXPERIMENT RESULTS ==="
             )
 
@@ -720,7 +751,14 @@ class _GroundingMixin:
             "partial": "PARTIAL — experiment ran but did not fully converge. Use available numbers with caveats.",
             "quick_eval": "QUICK-EVAL ONLY — results are from a shortened evaluation run. "
                           "Use these numbers but note they may not reflect full training.",
-            "none": "NONE — no experiment results available. Do NOT fabricate any numbers.",
+            "none": "NONE — no experiment results available.\n"
+                    "ABSOLUTE BAN: Do NOT write ANY specific numbers, percentages, improvement "
+                    "claims, or quantitative comparisons for the proposed method. "
+                    "Do NOT write phrases like 'improves by X%', 'achieves X accuracy', "
+                    "'reduces by X%', 'X percentage points'. "
+                    "Use ONLY qualitative language: 'is designed to improve', 'aims to reduce', "
+                    "'is expected to achieve competitive performance'. "
+                    "For baseline methods, you MAY cite numbers from their original published papers.",
         }
         desc = completeness_desc.get(grounding.result_completeness, "UNKNOWN")
         lines = [
@@ -742,59 +780,103 @@ class _GroundingMixin:
         grounding: GroundingPacket,
         heading: str,
     ) -> str:
-        """Verify Experiments section has correct tables; inject if missing.
+        """Verify Experiments section has correct tables; inject if missing or wrong.
 
         If the LLM omitted the main results or ablation table, or built them
-        with wrong numbers, replace/inject the deterministic pre-built versions.
+        with wrong metrics/numbers, replace/inject the deterministic pre-built versions.
         """
-        has_main_table = bool(re.search(
-            r'\\label\{tab:main_results\}', content
-        ))
-        has_ablation_table = bool(re.search(
-            r'\\label\{tab:ablation\}', content
-        ))
-
-        if not has_main_table and grounding.main_table_latex:
-            self.log(f"  {heading}: LLM omitted main results table, injecting pre-built")
-            # Find a good insertion point — after first mention of "main results"
-            # or after first paragraph
-            insert_match = re.search(
-                r'(?:main results|overall performance|comparison)',
-                content, re.IGNORECASE,
+        # --- Main results table ---
+        if grounding.main_table_latex:
+            llm_main_match = re.search(
+                r'(\\begin\{table\}.*?\\label\{tab:main_results\}.*?\\end\{table\})',
+                content, re.DOTALL,
             )
-            if insert_match:
-                # Insert after the paragraph containing the match
-                para_end = content.find('\n\n', insert_match.end())
-                if para_end == -1:
-                    para_end = len(content)
-                content = (
-                    content[:para_end]
-                    + "\n\n" + grounding.main_table_latex + "\n"
-                    + content[para_end:]
-                )
+            if llm_main_match:
+                # LLM generated a table — validate metric columns match grounding
+                llm_table = llm_main_match.group(1)
+                if not self._table_metrics_match(llm_table, grounding):
+                    self.log(f"  {heading}: LLM table metrics MISMATCH grounding packet, replacing with pre-built")
+                    content = content[:llm_main_match.start()] + grounding.main_table_latex + content[llm_main_match.end():]
+                else:
+                    self.log(f"  {heading}: LLM main table metrics match grounding ✓")
             else:
-                # Append at end
-                content += "\n\n" + grounding.main_table_latex
+                # LLM omitted the table entirely — inject
+                self.log(f"  {heading}: LLM omitted main results table, injecting pre-built")
+                insert_match = re.search(
+                    r'(?:main results|overall performance|comparison)',
+                    content, re.IGNORECASE,
+                )
+                if insert_match:
+                    para_end = content.find('\n\n', insert_match.end())
+                    if para_end == -1:
+                        para_end = len(content)
+                    content = (
+                        content[:para_end]
+                        + "\n\n" + grounding.main_table_latex + "\n"
+                        + content[para_end:]
+                    )
+                else:
+                    content += "\n\n" + grounding.main_table_latex
 
-        if not has_ablation_table and grounding.ablation_table_latex:
-            self.log(f"  {heading}: LLM omitted ablation table, injecting pre-built")
-            insert_match = re.search(
-                r'(?:ablation|component analysis)',
-                content, re.IGNORECASE,
+        # --- Ablation table ---
+        if grounding.ablation_table_latex:
+            llm_abl_match = re.search(
+                r'(\\begin\{table\}.*?\\label\{tab:ablation\}.*?\\end\{table\})',
+                content, re.DOTALL,
             )
-            if insert_match:
-                para_end = content.find('\n\n', insert_match.end())
-                if para_end == -1:
-                    para_end = len(content)
-                content = (
-                    content[:para_end]
-                    + "\n\n" + grounding.ablation_table_latex + "\n"
-                    + content[para_end:]
-                )
+            if llm_abl_match:
+                # Always replace with pre-built for consistency
+                self.log(f"  {heading}: replacing LLM ablation table with pre-built")
+                content = content[:llm_abl_match.start()] + grounding.ablation_table_latex + content[llm_abl_match.end():]
             else:
-                content += "\n\n" + grounding.ablation_table_latex
+                self.log(f"  {heading}: LLM omitted ablation table, injecting pre-built")
+                insert_match = re.search(
+                    r'(?:ablation|component analysis)',
+                    content, re.IGNORECASE,
+                )
+                if insert_match:
+                    para_end = content.find('\n\n', insert_match.end())
+                    if para_end == -1:
+                        para_end = len(content)
+                    content = (
+                        content[:para_end]
+                        + "\n\n" + grounding.ablation_table_latex + "\n"
+                        + content[para_end:]
+                    )
+                else:
+                    content += "\n\n" + grounding.ablation_table_latex
 
         return content
+
+    @staticmethod
+    def _table_metrics_match(
+        llm_table: str, grounding: GroundingPacket,
+    ) -> bool:
+        """Check if an LLM-generated table's metric columns match the grounding packet.
+
+        Returns True if at least half the expected metrics appear in the table.
+        Returns False if the table uses completely wrong metrics (hallucination).
+        """
+        # Extract expected metric names from grounding
+        expected_metrics: set[str] = set()
+        for entry in grounding.main_results:
+            for m in entry.get("metrics", []):
+                if isinstance(m, dict):
+                    name = m.get("metric_name", "")
+                    if name:
+                        expected_metrics.add(name.lower().strip())
+
+        if not expected_metrics:
+            # No expected metrics to check — can't validate, accept LLM table
+            return True
+
+        # Count how many expected metrics appear in the LLM table
+        llm_table_lower = llm_table.lower()
+        found = sum(1 for m in expected_metrics if m in llm_table_lower)
+
+        # Require at least half of expected metrics to match
+        threshold = max(1, len(expected_metrics) // 2)
+        return found >= threshold
 
     def _build_figure_blocks(self, blueprint: dict, figure_output: dict | None = None) -> dict[str, str]:
         """Pre-build LaTeX figure/table blocks to embed inline.

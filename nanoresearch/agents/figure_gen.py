@@ -134,6 +134,46 @@ AI_FIGURE_TEMPLATES: dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
+# Caption cleaning for AI-generated images
+# ---------------------------------------------------------------------------
+
+# Maximum length for a paper-ready caption.  Anything longer is likely the
+# image-generation prompt leaking through.
+MAX_ACADEMIC_CAPTION_LEN = 200
+
+
+def _clean_ai_image_caption(caption: str, title: str = "") -> str:
+    """Shorten an AI-image caption that is actually a generation prompt.
+
+    If the caption is <= MAX_ACADEMIC_CAPTION_LEN characters it is returned
+    as-is.  Otherwise we extract a short, academic-style caption by:
+      1. Taking the first sentence (up to the first period followed by a space
+         or end-of-string).
+      2. If the first sentence is still too long, fall back to a generic
+         caption built from the *title* field.
+    """
+    if not caption or len(caption) <= MAX_ACADEMIC_CAPTION_LEN:
+        return caption
+
+    # Try extracting the first sentence
+    match = re.match(r"^(.+?\.)\s", caption)
+    if match:
+        first_sentence = match.group(1).strip()
+        if len(first_sentence) <= MAX_ACADEMIC_CAPTION_LEN:
+            return first_sentence
+
+    # First sentence still too long or no period found — build from title
+    if title:
+        return f"Overview of the proposed {title.lower().rstrip('.')}."
+    # Last resort: hard-truncate at the first comma/colon boundary
+    for sep in (",", ":", ";"):
+        idx = caption.find(sep)
+        if 20 < idx <= MAX_ACADEMIC_CAPTION_LEN:
+            return caption[:idx].rstrip() + "."
+    return caption[:MAX_ACADEMIC_CAPTION_LEN].rsplit(" ", 1)[0].rstrip(".,;: ") + "."
+
+
+# ---------------------------------------------------------------------------
 # FigureAgent — dynamic figure planning + hybrid AI/code generation
 # ---------------------------------------------------------------------------
 
@@ -319,7 +359,7 @@ class FigureAgent(BaseResearchAgent):
                 fig.setdefault("fig_type", "code_chart")
                 fig.setdefault("chart_type", "grouped_bar")
                 fig.setdefault("caption", fig.get("description", ""))
-                # Validate ai_image_type for AI figures
+                # Validate ai_image_type for AI figures & clean verbose captions
                 if fig["fig_type"] == "ai_image":
                     img_type = fig.get("ai_image_type", "generic")
                     if img_type not in AI_FIGURE_TEMPLATES:
@@ -328,6 +368,11 @@ class FigureAgent(BaseResearchAgent):
                             img_type,
                         )
                         fig["ai_image_type"] = "generic"
+                    # Clean caption: LLM sometimes returns generation-prompt-
+                    # length text as the caption.  Keep it short & academic.
+                    fig["caption"] = _clean_ai_image_caption(
+                        fig["caption"], fig.get("title", ""),
+                    )
                 # Deduplicate chart_type for code_chart figures
                 if fig["fig_type"] == "code_chart":
                     ct = fig["chart_type"]
@@ -805,6 +850,13 @@ class FigureAgent(BaseResearchAgent):
         Flow: generate prompt → try Gemini (with retries) → if all fail,
         LLM diagnoses error & optimizes prompt → retry → fallback to code chart.
         """
+        # Ensure the caption used for the paper is short & academic, not the
+        # verbose image-generation prompt.  The *description* is meant for
+        # prompt generation; the *caption* goes into LaTeX.
+        clean_caption = _clean_ai_image_caption(
+            caption or description, title=fig_key.replace("_", " ").title(),
+        )
+
         # Look up the template for this AI figure type
         template = AI_FIGURE_TEMPLATES.get(ai_image_type, AI_FIGURE_TEMPLATES["generic"])
 
@@ -871,11 +923,13 @@ class FigureAgent(BaseResearchAgent):
                 )
                 if b64_images:
                     self.log(f"  {fig_key} image generated on attempt {attempt + 1}")
-                    return await self._save_figure_files(
+                    result = await self._save_figure_files(
                         fig_key, filename_stem,
-                        caption or description,
+                        clean_caption,
                         base64.b64decode(b64_images[0]),
                     )
+                    result["generation_prompt"] = image_prompt
+                    return result
                 last_error = "API returned no image data"
             except Exception as exc:
                 last_error = str(exc)
@@ -900,17 +954,21 @@ class FigureAgent(BaseResearchAgent):
                     )
                     if b64_images:
                         self.log(f"  {fig_key} succeeded with optimized prompt (attempt {opt_attempt + 1})")
-                        return await self._save_figure_files(
+                        result = await self._save_figure_files(
                             fig_key, filename_stem,
-                            caption or description,
+                            clean_caption,
                             base64.b64decode(b64_images[0]),
                         )
+                        result["generation_prompt"] = optimized_prompt
+                        return result
                 except Exception as exc:
                     self.log(f"  {fig_key} optimized attempt {opt_attempt + 1} failed: {exc}")
 
         # Step 5: Final fallback — code-generated placeholder
         self.log(f"  {fig_key} all AI generation attempts exhausted, using fallback")
-        return await self._generate_fallback_chart(fig_key, filename_stem, caption or description)
+        result = await self._generate_fallback_chart(fig_key, filename_stem, clean_caption)
+        result["generation_prompt"] = image_prompt
+        return result
 
     async def _diagnose_and_optimize_prompt(
         self,

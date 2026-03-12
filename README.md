@@ -6,29 +6,31 @@
 
 AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
 
-## Recent Changes (v0.2 — 2026-03-06)
+## Recent Changes (v2.1 — 2026-03-12)
 
-### New Features
-- **Deep Pipeline** — 9-stage pipeline with fine-grained experiment control: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
-- **REVIEW stage** — Automated paper review with per-section scoring, LaTeX consistency checks, claim-result alignment, and up to 5 revision rounds with convergence detection
-- **FIGURE_GEN stage in deep pipeline** — Dedicated figure generation between ANALYSIS and WRITING, producing architecture diagrams (AI) + results/ablation charts (code)
-- **Thinking model support** — `max_completion_tokens` for o1/o3/thinking models, with automatic fallback if proxy doesn't support it
-- **Auto-export** — Pipeline automatically exports workspace to a clean folder on completion
+### Writing Quality Overhaul
+- **Table content validation** — System now validates LLM-generated tables against the grounding packet's expected metrics. Mismatched tables (wrong caption, wrong metrics, fabricated data) are automatically replaced with deterministic pre-built versions
+- **Anti-fabrication hardening** — When no experiment results are available, the writing prompt now includes an absolute ban on specific numbers/percentages. LLMs are forbidden from generating `\begin{table}` environments; tables are auto-injected by the system
+- **Figure caption cleanup** — AI-generated image captions are now cleaned from verbose generation prompts to concise academic captions (max 2 sentences). Generation prompts stored separately as metadata
+- **Figure path fix** — Added `\graphicspath{{figures/}}` to LaTeX preamble; exported paper bundles are now self-contained and compile independently
+- **Anti-AI writing checks** — Expanded banned word list with 44 additional AI-characteristic words (from [awesome-ai-research-writing](https://github.com/Leey21/awesome-ai-research-writing)). Review agent now runs automated `_check_ai_artifacts()` detecting: banned vocabulary frequency, em-dash overuse, "Furthermore"/"Moreover" repetition, and hedging pileups
+- **Experiment analysis format** — Experiments section now uses `\paragraph{Finding Title}` structure for analysis, emphasizing WHY over WHAT
+- **Reviewer strictness** — Review prompt defaults to skepticism; requires evidence backing for all claims to score 7+; checks cross-section number consistency
+- **Chart type selection guide** — Figure planning prompt now includes a 9-category chart selection guide with scale handling recommendations (log scale, broken axis, normalization)
+- **Dynamic table captions** — Scaffold tables now include dataset names from the blueprint instead of generic captions
 
-### Bug Fixes
-- **Cross-file interface mismatch detection** — Coding agent now catches `import X; X.func()` patterns where `func` doesn't exist in `X`, not just `from X import Y`
-- **Figure/caption mismatch** — Semantic keyword-based classification maps descriptive figure keys (`fig_training_curve`) to canonical aliases (`architecture`, `results`, `ablation`)
-- **Empty tables / no SOTA comparison** — Analysis agent returns structured `comparison_with_baselines` dict and `ablation_results` array; writing agent injects baseline performance from blueprint
-- **LaTeX compilation failures** — Deterministic pre-fixes (Unicode, `@{}` doubling, missing figures, unmatched environments) applied before LLM; surgical line-level replacement instead of full-document rewrite
-- **Planning JSON truncation** — `max_tokens` increased to 16384; truncated JSON auto-repaired by closing unmatched brackets
-- **Subprocess GBK decode crash** — Safe byte decoding with UTF-8 → Latin-1 fallback for Windows compatibility
-- **Result fabrication prevention** — Writing agent accepts both `main_results` and `final_metrics` formats from analysis; never fabricates numbers when experiments fail
+### Previous Changes (v2.0 — 2026-03-12)
+- V2.0.1-AP: CUDA/conda env detection, infra debugging, LaTeX hardening, 46 bug fixes
+- V1.9.2-AP: LaTeX repair + degenerate-run detection + figure path fix
+- V2.0-AP: Orchestrator dedup — BaseOrchestrator + thin subclasses, generate() reuse
+- V1.9-AP: Cost Tracking + Progress Streaming + Structured Logging + Blueprint Validation
 
-### Improvements
-- **Image generation retry loop** — Up to 3 retries + LLM prompt diagnosis + optimized prompt retry before falling back to code chart
-- **Review scoring rubric** — Expanded with consistency rules, severity-based scoring, mandatory strengths listing
-- **Revision principles** — Preserve strengths, fix issues, do no harm, minimal changes
-- **Common ML pitfalls** — Coding and debug agents know about `ignore_mismatched_sizes`, archive decompression, `sys.exit(1)` patterns
+### v0.2 (2026-03-06)
+- **Deep Pipeline** — 9-stage pipeline: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
+- **REVIEW stage** — Per-section scoring, consistency checks, claim-result alignment, up to 5 revision rounds
+- **Hybrid figure generation** — Architecture diagrams (AI) + results/ablation charts (LLM-generated code)
+- **Result fabrication prevention** — Grounding system enforces exact numbers from experiments
+- **LaTeX auto-fix** — 2-level fix pipeline (deterministic + LLM) with backup/restore
 
 ## What It Does
 

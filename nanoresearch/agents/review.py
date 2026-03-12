@@ -1911,6 +1911,106 @@ Return JSON:
         except ImportError:
             logger.debug("checkers module not available, skipping automated checks")
 
+        # AI artifact detection (hardcoded, no external dependency)
+        try:
+            ai_issues = self._check_ai_artifacts(tex)
+            issues.extend(ai_issues)
+        except Exception as exc:
+            logger.warning("AI artifact check failed: %s", exc)
+
+        return issues
+
+    # ---- AI artifact detection ----
+    # Top ~20 most egregious AI-flavored words (case-insensitive scan)
+    _AI_BANNED_WORDS: list[str] = [
+        "delve", "leverage", "utilize", "harness", "pivotal", "unveil",
+        "elucidate", "foster", "intricate", "nuanced", "profound",
+        "testament", "vibrant", "ameliorate", "underscore", "transcend",
+        "envision", "bolster", "culminate", "traverse",
+    ]
+
+    _HEDGING_PILEUP_RE = re.compile(
+        r"\b(?:may\s+potentially|could\s+possibly|might\s+perhaps)\b",
+        re.IGNORECASE,
+    )
+
+    def _check_ai_artifacts(self, tex: str) -> list[ConsistencyIssue]:
+        """Scan LaTeX text for common AI-writing artifacts.
+
+        Returns a list of ConsistencyIssue for each detected problem.
+        """
+        issues: list[ConsistencyIssue] = []
+        tex_lower = tex.lower()
+
+        # 1. Banned AI words
+        flagged_words: list[tuple[str, int]] = []
+        for word in self._AI_BANNED_WORDS:
+            # Use word-boundary regex for accurate counting
+            count = len(re.findall(r"\b" + re.escape(word) + r"\b", tex_lower))
+            if count > 0:
+                flagged_words.append((word, count))
+
+        if flagged_words:
+            word_summary = ", ".join(
+                f'"{w}" ({c}x)' for w, c in sorted(flagged_words, key=lambda x: -x[1])
+            )
+            total = sum(c for _, c in flagged_words)
+            issues.append(ConsistencyIssue(
+                issue_type="ai_artifact",
+                description=(
+                    f"AI-flagged vocabulary detected ({total} total occurrences "
+                    f"across {len(flagged_words)} words): {word_summary}. "
+                    f"Replace with natural, specific alternatives."
+                ),
+                locations=[],
+                severity="high" if total >= 5 else "medium",
+            ))
+
+        # 2. Em-dash overuse (--- in LaTeX)
+        emdash_count = tex.count("---")
+        if emdash_count > 3:
+            issues.append(ConsistencyIssue(
+                issue_type="ai_artifact",
+                description=(
+                    f"Excessive em-dashes: {emdash_count} occurrences of '---' "
+                    f"(max 3 recommended). Rewrite sentences to avoid em-dash "
+                    f"constructions."
+                ),
+                locations=[],
+                severity="medium",
+            ))
+
+        # 3. Furthermore / Moreover overuse
+        for transition in ("Furthermore", "Moreover"):
+            count = len(re.findall(
+                r"\b" + re.escape(transition) + r"\b", tex
+            ))
+            if count > 3:
+                issues.append(ConsistencyIssue(
+                    issue_type="ai_artifact",
+                    description=(
+                        f'Overuse of "{transition}": {count} occurrences '
+                        f"(max 3 recommended for a full paper). Vary transitions "
+                        f"or restructure sentences."
+                    ),
+                    locations=[],
+                    severity="medium",
+                ))
+
+        # 4. Hedging pileups: "may potentially", "could possibly", "might perhaps"
+        hedging_matches = self._HEDGING_PILEUP_RE.findall(tex)
+        if hedging_matches:
+            issues.append(ConsistencyIssue(
+                issue_type="ai_artifact",
+                description=(
+                    f"Hedging pileup detected ({len(hedging_matches)} "
+                    f'occurrence(s)): {", ".join(repr(m) for m in hedging_matches[:5])}. '
+                    f"Use a single hedging word or state the claim directly."
+                ),
+                locations=[],
+                severity="medium",
+            ))
+
         return issues
 
     @staticmethod
