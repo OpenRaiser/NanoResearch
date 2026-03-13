@@ -75,6 +75,10 @@ import matplotlib as mpl
 mpl.use('Agg')
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
+import matplotlib.gridspec as gridspec
+from matplotlib.colors import ListedColormap, BoundaryNorm, LinearSegmentedColormap, Normalize
+from matplotlib.patches import Patch, FancyBboxPatch, FancyArrowPatch, Rectangle, Circle
+from matplotlib.collections import PatchCollection
 import numpy as np
 try:
     import seaborn as sns
@@ -387,7 +391,7 @@ class FigureAgent(BaseResearchAgent):
             if not validated:
                 return self._default_figure_plan()
 
-            # Enforce max 2 AI images (overview + detail); convert excess to code_chart
+            # Enforce max 2 AI images (overview + detail); drop excess
             ai_count = sum(1 for f in validated if f["fig_type"] == "ai_image")
             if ai_count > 2:
                 self.log(f"Figure plan has {ai_count} AI images, trimming to 2")
@@ -401,6 +405,39 @@ class FigureAgent(BaseResearchAgent):
                             continue
                     trimmed.append(f)
                 validated = trimmed
+
+            # Ensure at least 2 code_chart figures (main results + ablation)
+            code_count = sum(1 for f in validated if f["fig_type"] == "code_chart")
+            if code_count < 2:
+                existing_chart_types = {f["chart_type"] for f in validated if f["fig_type"] == "code_chart"}
+                defaults = [
+                    {
+                        "fig_key": "fig3_main_results",
+                        "fig_type": "code_chart",
+                        "chart_type": "grouped_bar",
+                        "title": "Main Results Comparison",
+                        "description": "Performance comparison of proposed method vs baselines across benchmarks.",
+                        "caption": "Performance comparison across benchmark datasets.",
+                    },
+                    {
+                        "fig_key": "fig4_ablation",
+                        "fig_type": "code_chart",
+                        "chart_type": "horizontal_bar",
+                        "title": "Ablation Study",
+                        "description": "Contribution of each component to overall performance.",
+                        "caption": "Ablation study showing the contribution of each component.",
+                    },
+                ]
+                for d in defaults:
+                    if code_count >= 2:
+                        break
+                    if d["chart_type"] not in existing_chart_types:
+                        validated.append(d)
+                        existing_chart_types.add(d["chart_type"])
+                        code_count += 1
+                        self.log(f"  Added default code_chart: {d['fig_key']} ({d['chart_type']})")
+
+            self.log(f"Figure plan: {len(validated)} figures")
 
             # Cap at 5 figures max (top-venue standard: 4-5)
             if len(validated) > 5:

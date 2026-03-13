@@ -171,10 +171,16 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
             inputs["ideation_output"] = accumulated.get("ideation_output", {})
             inputs["experiment_blueprint"] = accumulated.get("experiment_blueprint", {})
             # Merge figures from ANALYSIS + FIGURE_GEN so WRITING sees ALL of them.
-            # ANALYSIS figures go first; FIGURE_GEN can override on key collision.
+            # When FIGURE_GEN produced figures, use ONLY those (they are the
+            # definitive set for the paper). Fall back to analysis figures only
+            # when FIGURE_GEN is empty. This prevents stale/broken analysis
+            # figures (e.g. "No Data — Job Cancelled") from leaking into the paper.
             analysis_figures = accumulated.get("analysis_output", {}).get("figures", {})
             fig_gen_figures = accumulated.get("figure_gen_output", {}).get("figures", {})
-            merged_figures = {**analysis_figures, **fig_gen_figures}
+            if fig_gen_figures:
+                merged_figures = fig_gen_figures
+            else:
+                merged_figures = analysis_figures
             inputs["figure_output"] = {"figures": merged_figures} if merged_figures else {}
             inputs["template_format"] = self.config.template_format
 
