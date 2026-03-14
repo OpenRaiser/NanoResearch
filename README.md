@@ -103,32 +103,43 @@ A typical NanoResearch run produces a clean, inspectable workspace containing:
 
 <table>
   <tr>
-    <td align="center">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig1_framework.png" alt="Framework figure example" width="100%" />
+    <td align="center" width="50%">
+      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig1_framework.png" alt="Framework figure example" width="95%" />
       <br />
-      <sub>Framework figure</sub>
+      <sub><b>Framework</b></sub>
     </td>
-    <td align="center">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig2_main_results_accuracy.png" alt="Main results figure example" width="100%" />
+    <td align="center" width="50%">
+      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig2_main_results_accuracy.png" alt="Main results figure example" width="95%" />
       <br />
-      <sub>Main results</sub>
-    </td>
-  </tr>
-  <tr>
-    <td align="center">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig3_sample_complexity_curves.png" alt="Sample complexity figure example" width="100%" />
-      <br />
-      <sub>Sample complexity</sub>
-    </td>
-    <td align="center">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig4_theory_alignment_analysis.png" alt="Theory alignment figure example" width="100%" />
-      <br />
-      <sub>Theory alignment analysis</sub>
+      <sub><b>Main Results</b></sub>
     </td>
   </tr>
 </table>
 
-Typical saved artifacts include <code>manifest.json</code>, <code>papers/</code>, <code>plans/</code>, <code>code/</code>, <code>figures/</code>, and exported paper files such as <code>paper.tex</code>, <code>references.bib</code>, and <code>paper.pdf</code>.
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig3_sample_complexity_curves.png" alt="Sample complexity figure example" width="95%" />
+      <br />
+      <sub><b>Sample Complexity</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig4_theory_alignment_analysis.png" alt="Theory alignment figure example" width="95%" />
+      <br />
+      <sub><b>Theory Analysis</b></sub>
+    </td>
+  </tr>
+</table>
+
+### What the pipeline saves
+
+Typical saved artifacts include:
+
+- `manifest.json` for stage state and artifact tracking
+- `papers/` and `plans/` for literature and experiment context
+- `code/` for runnable experiment projects
+- `figures/` for generated visuals
+- exported paper assets such as `paper.tex`, `references.bib`, and `paper.pdf`
 
 ## Pipeline
 
