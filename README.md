@@ -104,12 +104,12 @@ A typical NanoResearch run produces a clean, inspectable workspace containing:
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig1_framework.png" alt="Framework figure example" width="95%" />
+      <img src="figures/fig1_framework.png" alt="Framework figure example" width="95%" />
       <br />
       <sub><b>Framework</b></sub>
     </td>
     <td align="center" width="50%">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig2_main_results_accuracy.png" alt="Main results figure example" width="95%" />
+      <img src="figures/fig2_main_results_accuracy.png" alt="Main results figure example" width="95%" />
       <br />
       <sub><b>Main Results</b></sub>
     </td>
@@ -119,12 +119,12 @@ A typical NanoResearch run produces a clean, inspectable workspace containing:
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig3_sample_complexity_curves.png" alt="Sample complexity figure example" width="95%" />
+      <img src="figures/fig3_sample_complexity_curves.png" alt="Sample complexity figure example" width="95%" />
       <br />
       <sub><b>Sample Complexity</b></sub>
     </td>
     <td align="center" width="50%">
-      <img src="nanoresearch_Contrastive_learning_for_few-shot_image__d7e5ab79/figures/fig4_theory_alignment_analysis.png" alt="Theory alignment figure example" width="95%" />
+      <img src="figures/fig4_theory_alignment_analysis.png" alt="Theory alignment figure example" width="95%" />
       <br />
       <sub><b>Theory Analysis</b></sub>
     </td>
