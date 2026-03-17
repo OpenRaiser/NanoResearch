@@ -1,262 +1,499 @@
 <div align="center">
-<img src="https://github.com/user-attachments/assets/b9a00889-8edf-4a76-a979-751cf1bcc89b" alt="Nano Research Logo" width="500"/>
-</div>
+  <img src="https://github.com/user-attachments/assets/b9a00889-8edf-4a76-a979-751cf1bcc89b" alt="NanoResearch Logo" width="500"/>
 
 # NanoResearch
 
-AI-powered research engine that automates the full academic paper pipeline: from a topic to a compiled PDF with literature review, experiment code, figures, and LaTeX paper.
+**An AI research engine for going from topic → experiments → figures → paper draft.**
 
-## Changelog
+Built for **grounded autonomous research**: NanoResearch turns a topic into literature-grounded plans, runnable experiment code, execution artifacts, figures, and a compiled LaTeX paper inside a resumable workspace.
 
-<details>
-<summary><b>v2.2</b> (2026-03-12) — SLURM Auto-Detection & Model Download Fix</summary>
+<p>
+  <a href="#quick-start"><b>Quick Start</b></a> ·
+  <a href="#showcase"><b>Showcase</b></a> ·
+  <a href="#pipeline"><b>Pipeline</b></a>
+</p>
 
-- **GPU auto-fallback**: `local_quick` profile now auto-detects GPU availability; if no local GPU but `sbatch` exists, automatically upgrades to SLURM cluster execution
-- **Model download fix**: Fixed `_run_shell()` env parameter bug that crashed all HuggingFace/ModelScope downloads; added hf-mirror.com as third fallback source
-- **SLURM config**: Partition defaults to `belt_road`; wall time uses config value (30 days) instead of LLM-estimated time
-</details>
+<p>
+  <a href="https://github.com/OpenRaiser/NanoStudy-dev"><img alt="Repository" src="https://img.shields.io/badge/GitHub-OpenRaiser%2FNanoStudy--dev-181717?logo=github"></a>
+  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-16A34A">
+  <img alt="Pipeline" src="https://img.shields.io/badge/Pipeline-Unified%20Deep-7C3AED">
+  <img alt="Execution" src="https://img.shields.io/badge/Execution-Local%20%7C%20SLURM-0EA5E9">
+</p>
 
-<details>
-<summary><b>v2.1</b> (2026-03-12) — Writing Quality & Anti-Fabrication</summary>
+<p>
+  <a href="https://github.com/OpenRaiser/NanoStudy-dev">GitHub Repository</a>
+</p>
+</div>
 
-- **Table validation**: LLM-generated tables checked against grounding packet; mismatched tables auto-replaced with deterministic versions
-- **Anti-fabrication**: Absolute ban on fabricated numbers; LLMs forbidden from generating `\begin{table}` (auto-injected by system)
-- **Anti-AI writing**: 44 banned AI-characteristic words; review agent detects em-dash overuse, hedging pileups, repetitive transitions
-- **Figure cleanup**: Verbose AI captions truncated to concise academic style; `\graphicspath` added for self-contained exports
-- **Reviewer strictness**: Default skepticism; evidence required for 7+ scores
-</details>
+---
 
-<details>
-<summary><b>v2.0</b> (2026-03-12) — Infrastructure Overhaul</summary>
+## Table of contents
 
-- **BaseOrchestrator refactor**: Unified orchestrator with thin subclasses, dedup of generate() logic
-- **CUDA/conda detection**: Auto-detect environments, 46 infrastructure bug fixes
-- **LaTeX hardening**: 2-level fix pipeline (deterministic + LLM), degenerate-run detection
-- **Cost tracking**: Per-stage token counting, progress streaming, structured logging
-</details>
+- [Overview](#overview)
+- [Why NanoResearch](#why-nanoresearch)
+- [Use cases](#use-cases)
+- [Showcase](#showcase)
+- [Pipeline](#pipeline)
+- [Key capabilities](#key-capabilities)
+- [How it works](#how-it-works)
+- [Quick start](#quick-start)
+- [Execution profiles](#execution-profiles)
+- [Common CLI commands](#common-cli-commands)
+- [Output structure](#output-structure)
+- [Model routing](#model-routing)
+- [Paper formats](#paper-formats)
+- [Project structure](#project-structure)
+- [Requirements](#requirements)
+- [Testing](#testing)
+- [Notes](#notes)
+- [FAQ](#faq)
+- [Roadmap](#roadmap)
+- [Citation](#citation)
+- [License](#license)
 
-<details>
-<summary><b>v0.2</b> (2026-03-06) — Deep Pipeline</summary>
+## Overview
 
-- **9-stage pipeline**: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
-- **REVIEW stage**: Per-section scoring, consistency checks, up to 5 revision rounds
-- **Hybrid figures**: Architecture diagrams (AI) + results/ablation charts (code-generated)
-- **Grounding system**: Enforces exact experiment numbers in writing; prevents result fabrication
-</details>
+NanoResearch is a unified research pipeline that automates the full paper-production workflow:
 
-## What It Does
+- 🔎 starts from a research topic
+- 📚 searches and synthesizes relevant literature
+- 🧪 proposes an experiment blueprint
+- 💻 generates runnable code and scripts
+- ⚙️ executes locally or on SLURM
+- 📈 analyzes real outputs
+- 🖼️ generates figures
+- ✍️ writes a LaTeX paper draft
+- 🧠 reviews and revises the result
 
-Give NanoResearch a research topic, and it will:
+It is designed around **resumable workspaces**, **multi-model routing**, and **grounded writing** so that downstream paper content is tied to actual experiment evidence instead of free-form draft generation.
 
-1. **Ideation** — Search arXiv + Semantic Scholar, identify research gaps, generate hypotheses
-2. **Planning** — Design a complete experiment blueprint (datasets, baselines, metrics, ablations)
-3. **Setup** — Search repos, clone references, and optionally auto-download datasets/models
-4. **Coding** — Generate a runnable experiment project plus training scripts
-5. **Execution** — Auto-create environments, install requirements, run locally or on SLURM
-6. **Analysis** — Parse real outputs, extract metrics, and prepare grounded evidence
-7. **Figures** — Create architecture diagrams (Gemini AI) + data visualization charts (LLM-generated code)
-8. **Writing** — Write a full LaTeX paper section-by-section, with optional ReAct tool use
+## Why NanoResearch
 
+Most "AI paper writers" stop at outlines or prose. NanoResearch is built for a deeper loop:
+
+- **End-to-end pipeline**: topic to exportable paper workspace
+- **Grounded writing**: writing consumes structured experiment evidence, figures, and citations
+- **Checkpoint + resume**: failed stages can be resumed from the last saved state
+- **Execution-aware**: supports local execution and SLURM-backed workflows
+- **Multi-model by stage**: route ideation, coding, writing, and review to different models
+- **Exportable outputs**: clean paper/code/figure bundles for sharing or submission prep
+
+## Use cases
+
+- 🚀 **Research prototyping** — quickly turn a fresh idea into a full experiment-and-paper workspace
+- 🧪 **Benchmark generation** — create repeatable topic-to-paper runs across multiple tasks
+- 🤖 **Autonomous experimentation** — let the system generate code, execute runs, and analyze outputs
+- 📝 **Paper drafting from evidence** — produce LaTeX drafts grounded in actual experiment artifacts
+- 🗂️ **Internal research tooling** — use workspaces, manifests, and stage artifacts as an auditable research log
+
+## Showcase
+
+### Generated research workspace
+
+A typical NanoResearch run produces a clean, inspectable workspace containing:
+
+- literature and planning artifacts
+- runnable experiment code
+- generated figures
+- LaTeX paper sources and bibliography
+- a final exported bundle for sharing or submission prep
+
+### Example outputs
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="figures/showcase-framework.png" alt="Framework figure example" width="95%" />
+      <br />
+      <sub><b>Framework</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="figures/showcase-main-results.png" alt="Main results figure example" width="95%" />
+      <br />
+      <sub><b>Main Results</b></sub>
+    </td>
+  </tr>
+</table>
+
+<table>
+  <tr>
+    <td align="center" width="50%">
+      <img src="figures/showcase-sample-complexity.png" alt="Sample complexity figure example" width="95%" />
+      <br />
+      <sub><b>Sample Complexity</b></sub>
+    </td>
+    <td align="center" width="50%">
+      <img src="figures/showcase-theory-analysis.png" alt="Theory alignment figure example" width="95%" />
+      <br />
+      <sub><b>Theory Analysis</b></sub>
+    </td>
+  </tr>
+</table>
+
+### What the pipeline saves
+
+Typical saved artifacts include:
+
+- 📋 `manifest.json` for stage state and artifact tracking
+- 📚 `papers/` and `plans/` for literature and experiment context
+- 💻 `code/` for runnable experiment projects
+- 🖼️ `figures/` for generated visuals
+- 📄 exported paper assets such as `paper.tex`, `references.bib`, and `paper.pdf`
+
+## Pipeline
+
+```text
+Topic
+  ↓
+IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
+  ↓
+Exported workspace with paper.pdf / paper.tex / references.bib / figures / code / data
 ```
-Unified: Topic → IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW → paper.pdf
+
+`nanoresearch run` uses the **unified deep backbone** by default.
+The `deep` command is kept as a compatibility alias, and the legacy standard orchestrator remains available for older workspaces.
+
+### Stage summary
+
+| Stage | What it does |
+| --- | --- |
+| `IDEATION` | Search literature, identify gaps, propose hypotheses, collect must-cite candidates |
+| `PLANNING` | Turn the idea into a concrete experiment blueprint |
+| `SETUP` | Prepare repositories, dependencies, models, and datasets |
+| `CODING` | Generate a runnable experiment project |
+| `EXECUTION` | Run experiments locally or on SLURM, with retry/debug support |
+| `ANALYSIS` | Parse logs and metrics into structured evidence |
+| `FIGURE_GEN` | Create architecture visuals and result charts |
+| `WRITING` | Write and compile the LaTeX paper draft |
+| `REVIEW` | Review sections, detect issues, and revise |
+
+## Key capabilities
+
+| Capability | What it means in practice |
+| --- | --- |
+| **Grounded writing** | Paper sections are written from structured evidence, citations, and experiment artifacts instead of pure free-form generation |
+| **Resumable workspaces** | Each stage writes artifacts to disk so failed runs can be resumed instead of restarted |
+| **Execution-aware pipeline** | Generated code can be executed locally or on SLURM-backed environments |
+| **Multi-model routing** | Different stages can use different models for ideation, coding, writing, figures, and review |
+| **Exportable outputs** | Final outputs can be exported as a clean bundle with paper, figures, code, data, and manifest |
+
+### Literature + citation grounding
+- Searches external research sources and builds structured ideation artifacts
+- Tracks must-cite papers and citation quality through the writing pipeline
+- Produces BibTeX-backed LaTeX drafts instead of plain-text summaries
+
+### Real experiment evidence
+- Writing and figures consume execution outputs and analysis artifacts
+- Helps keep tables, claims, and plots tied to actual results
+- Preserves intermediate JSON artifacts for debugging and auditability
+
+### Hybrid figure generation
+- Architecture figures can be image-model driven
+- Results and ablation figures can be generated from code
+- Figure prompts, scripts, and outputs are saved into the workspace
+
+### Workspace-first workflow
+Every run gets its own workspace under:
+
+```text
+~/.nanobot/workspace/research/{session_id}
 ```
 
-`nanoresearch run` now uses the unified deep backbone by default. The legacy `deep` command remains as a compatibility alias, and the old standard orchestrator is kept only for resuming older workspaces.
+That workspace stores the manifest, stage artifacts, logs, generated code, paper drafts, and exported outputs.
 
-## Execution Profiles
+## How it works
 
-The unified pipeline supports three high-level profiles:
-
-- `fast_draft` — lighter-weight writing/research assistance, useful for rapid draft generation
-- `local_quick` — default profile; prefers local execution but **auto-upgrades to SLURM** if no local GPU is detected and `sbatch` is available
-- `cluster_full` — always uses SLURM/cluster execution, with automatic fallback to local mode if cluster tools are unavailable
-
-Relevant config keys:
-
-```json
-{
-  "research": {
-    "execution_profile": "local_quick",
-    "writing_mode": "hybrid",
-    "writing_tool_max_rounds": 10,
-    "auto_create_env": true,
-    "auto_download_resources": true,
-    "local_execution_timeout": 1800
-  }
-}
+```text
+1. IDEATION   → collect papers, gaps, hypotheses, must-cite candidates
+2. PLANNING   → build the experiment blueprint
+3. SETUP      → prepare repos, environments, and resources
+4. CODING     → generate runnable experiment code
+5. EXECUTION  → run locally or on SLURM
+6. ANALYSIS   → convert outputs into structured evidence
+7. FIGURE_GEN → generate architecture and results figures
+8. WRITING    → build paper.tex, references.bib, and paper.pdf
+9. REVIEW     → critique and revise the draft
 ```
 
-## Quick Start
+The result is not just a document. It is a full research workspace with saved intermediate state, artifacts, and logs that can be resumed and inspected later.
 
-### Install
+## Quick start
+
+### 1) Install
 
 ```bash
-git clone https://github.com/your-org/nanoresearch.git
-cd nanoresearch
+git clone https://github.com/OpenRaiser/NanoStudy-dev.git
+cd NanoStudy-dev
 pip install -e ".[dev]"
 ```
 
-### Configure
+### 2) Configure
 
 Create `~/.nanobot/config.json`:
 
 ```json
 {
   "research": {
-    "base_url": "https://your-api-endpoint/v1/",
+    "base_url": "https://your-openai-compatible-endpoint/v1/",
     "api_key": "your-api-key",
-    "timeout": 180.0,
-    "ideation":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.5 },
-    "planning":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.2, "timeout": 300.0 },
-    "experiment":    { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.1, "timeout": 600.0 },
-    "writing":       { "model": "claude-sonnet-4-6", "temperature": 0.4, "max_tokens": 16384, "timeout": 600.0 },
-    "code_gen":      { "model": "deepseek-ai/DeepSeek-V3.2", "temperature": 0.1, "max_tokens": 16384, "timeout": 600.0 },
-    "figure_prompt": { "model": "gpt-5.2", "temperature": 0.5, "max_tokens": 4096, "timeout": 300.0 },
-    "figure_code":   { "model": "gpt-5.2-codex", "temperature": null, "max_tokens": 16384, "timeout": 600.0 },
+    "template_format": "neurips2025",
+    "execution_profile": "local_quick",
+    "writing_mode": "hybrid",
+    "max_retries": 2,
+    "auto_create_env": true,
+    "auto_download_resources": true,
+    "ideation": {
+      "model": "deepseek-ai/DeepSeek-V3.2",
+      "temperature": 0.5,
+      "max_tokens": 16384,
+      "timeout": 600.0
+    },
+    "planning": {
+      "model": "deepseek-ai/DeepSeek-V3.2",
+      "temperature": 0.2,
+      "max_tokens": 16384,
+      "timeout": 600.0
+    },
+    "code_gen": {
+      "model": "gpt-5.2-codex",
+      "temperature": null,
+      "max_tokens": 16384,
+      "timeout": 600.0
+    },
+    "writing": {
+      "model": "deepseek-ai/DeepSeek-V3.2",
+      "temperature": 0.4,
+      "max_tokens": 16384,
+      "timeout": 600.0
+    },
     "figure_gen": {
-      "model": "gemini-3.1-flash-image-preview",
+      "model": "gemini-3.1-flash-preview-image-generation",
       "image_backend": "gemini",
       "temperature": null,
-      "timeout": 300.0,
-      "aspect_ratio": "16:9",
-      "image_size": "1024x1024"
+      "timeout": 300.0
+    },
+    "review": {
+      "model": "gemini-3.1-flash-lite-preview",
+      "temperature": 0.3,
+      "max_tokens": 16384,
+      "timeout": 300.0
     }
   }
 }
 ```
 
-Or use environment variables: `NANORESEARCH_BASE_URL`, `NANORESEARCH_API_KEY`, `NANORESEARCH_TIMEOUT`.
+Environment-variable overrides are also supported:
 
-### Run
+- `NANORESEARCH_BASE_URL`
+- `NANORESEARCH_API_KEY`
+- `NANORESEARCH_TIMEOUT`
+
+### 3) Validate config
 
 ```bash
-# Full pipeline
-nanoresearch run --topic "Your Research Topic" --verbose
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
+```
 
-# Resume from checkpoint (if a stage fails)
+### 4) Run the full pipeline
+
+```bash
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips2025 --verbose
+```
+
+### 5) Resume if a stage fails
+
+```bash
 nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --verbose
+```
 
-# Check status
-nanoresearch status --workspace ~/.nanobot/workspace/research/{session_id}
+### 6) Export a clean output folder
 
-# List all sessions
-nanoresearch list
-
-# Export to clean folder
+```bash
 nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
 ```
 
-### Output
+## Execution profiles
 
-```
-my_paper/
-├── paper.pdf          # Compiled paper
-├── paper.tex          # LaTeX source
-├── references.bib     # Bibliography
-├── figures/           # Architecture diagram (AI) + charts (seaborn)
-├── code/              # Runnable experiment project
-│   ├── main.py
-│   ├── src/{model,dataset,trainer,evaluate,utils}.py
-│   ├── config/default.yaml
-│   └── scripts/{train.sh,run_ablation.sh}
-├── data/              # Structured intermediate data (JSON)
-└── manifest.json      # Full pipeline execution record
-```
+The unified pipeline supports three high-level execution profiles:
 
-## Multi-Model Routing
+| Profile | Behavior |
+| --- | --- |
+| `fast_draft` | Lightweight drafting and faster iteration |
+| `local_quick` | Prefer local execution; can upgrade to SLURM when appropriate |
+| `cluster_full` | Cluster-first execution for heavier runs |
 
-Each pipeline stage can use a different LLM optimized for that task:
+## Common CLI commands
 
-| Stage | Purpose | Recommended Model |
-|-------|---------|-------------------|
-| `ideation` | Literature search + hypothesis | DeepSeek-V3.2 |
-| `planning` | Experiment design | DeepSeek-V3.2 |
-| `experiment` | Code project generation | DeepSeek-V3.2 / Codex |
-| `writing` | LaTeX paper sections | Claude Sonnet 4.6 |
-| `figure_prompt` | Architecture diagram prompt | GPT-5.2 |
-| `figure_code` | Chart plotting code | Codex |
-| `figure_gen` | AI image generation | Gemini Flash |
+| Command | Purpose |
+| --- | --- |
+| `nanoresearch run --topic "..."` | Start a new unified pipeline run |
+| `nanoresearch resume --workspace ...` | Resume from the last checkpoint |
+| `nanoresearch status --workspace ...` | Show per-stage status and artifacts |
+| `nanoresearch list` | List saved research sessions |
+| `nanoresearch export --workspace ...` | Export a clean output bundle |
+| `nanoresearch config` | Print the effective config with masked secrets |
+| `nanoresearch inspect --workspace ...` | Inspect saved artifacts for a workspace |
+| `nanoresearch health` | Run environment/config health checks |
+| `nanoresearch delete <session_id>` | Remove a saved session workspace |
 
-All models are accessed through a single OpenAI-compatible API endpoint. Set `temperature: null` for models that don't support it (e.g., Codex, o-series).
-
-## Hybrid Figure Generation
-
-NanoResearch uses a hybrid approach for figures:
-
-- **Architecture diagram** (`fig1`): AI image generation via Gemini native API — produces a visual model overview
-- **Results chart** (`fig2`): LLM generates a complete Python plotting script with synthetic data, executed to produce a publication-quality grouped bar chart
-- **Ablation chart** (`fig3`): Same approach — LLM-generated code creates an ablation study bar chart
-
-The generated plotting scripts are saved alongside the figures for reproducibility.
-
-## Checkpoint / Resume
-
-Every stage saves its output to disk. If a stage fails (API timeout, rate limit, etc.), resume from the last completed checkpoint:
+For the full command surface, use:
 
 ```bash
-nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id}
+nanoresearch --help
 ```
 
-The pipeline skips already-completed stages and continues from where it left off.
+## Output structure
 
-## Project Structure
+A typical exported output looks like this:
 
+```text
+my_paper/
+├── paper.pdf
+├── paper.tex
+├── references.bib
+├── figures/
+├── code/
+├── data/
+└── manifest.json
 ```
+
+A live workspace contains the full intermediate state as well:
+
+```text
+~/.nanobot/workspace/research/{session_id}/
+├── manifest.json
+├── papers/
+├── plans/
+├── code/
+├── figures/
+├── drafts/
+├── logs/
+└── ...
+```
+
+## Model routing
+
+NanoResearch routes different stages to different model configs through a single configuration layer.
+This lets you mix models by task instead of forcing one model to do everything.
+
+Typical routing buckets include:
+
+- `ideation`
+- `planning`
+- `experiment`
+- `code_gen`
+- `writing`
+- `figure_prompt`
+- `figure_code`
+- `figure_gen`
+- `review`
+- `revision`
+
+The system is built around **OpenAI-compatible endpoints**, with support for stage-specific overrides when needed.
+
+## Paper formats
+
+Template formats are auto-discovered from `nanoresearch/templates/`.
+Current built-in formats include:
+
+- `arxiv`
+- `icml`
+- `neurips`
+- `neurips2025`
+
+Example:
+
+```bash
+nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2025
+```
+
+## Project structure
+
+```text
 nanoresearch/
-├── nanoresearch/              # Main package
-│   ├── cli.py                # CLI commands (run, resume, status, list, export)
-│   ├── config.py             # Per-stage model routing + global config
-│   ├── agents/               # 9 pipeline agents + helpers
-│   │   ├── base.py          # BaseResearchAgent (shared LLM call logic + JSON repair)
-│   │   ├── ideation.py      # Literature search + hypothesis generation
-│   │   ├── planning.py      # Experiment blueprint design
-│   │   ├── setup.py         # GitHub code search + repo cloning + model download
-│   │   ├── coding.py        # Code project generation + cross-file mismatch detection
-│   │   ├── execution.py     # SLURM job submission + monitoring + debug loop
-│   │   ├── analysis.py      # Result parsing + structured comparison/ablation output
-│   │   ├── figure_gen.py    # Hybrid figure generation (AI + code) with retry + diagnosis
-│   │   ├── writing.py       # Section-by-section paper writing + PDF compilation
-│   │   ├── review.py        # Automated review + revision + consistency checks
-│   │   ├── debug.py         # Debug agent (used by execution for failed jobs)
-│   │   ├── preflight.py     # Static preflight checks on experiment code
-│   │   └── checkers.py      # LaTeX consistency + math formula validators
-│   ├── pipeline/             # Infrastructure
-│   │   ├── unified_orchestrator.py  # Default unified entrypoint
-│   │   ├── deep_orchestrator.py  # Unified deep backbone implementation
-│   │   ├── orchestrator.py  # Legacy standard compatibility pipeline
-│   │   ├── state.py         # Pipeline state machine
-│   │   ├── workspace.py     # Workspace directory + manifest management
-│   │   └── multi_model.py   # OpenAI + Gemini API dispatcher
-│   └── schemas/              # Pydantic data models
-│       ├── manifest.py      # Stage enum + state transitions + manifest
-│       ├── ideation.py      # PaperReference, IdeationOutput
-│       ├── experiment.py    # ExperimentBlueprint, Dataset, Metric
-│       └── paper.py         # PaperSkeleton, Section, Figure
-├── mcp_server/               # MCP tool server
-│   ├── server.py            # JSON-RPC 2.0 stdio server
-│   └── tools/               # arXiv search, Semantic Scholar, LaTeX, PDF compile
-├── tests/                    # 185 tests
-├── outputs/                  # Example pipeline outputs
+├── nanoresearch/
+│   ├── cli.py
+│   ├── config.py
+│   ├── agents/
+│   ├── pipeline/
+│   ├── schemas/
+│   └── templates/
+├── mcp_server/
+├── skills/
+├── tests/
+├── outputs/
+├── PROJECT_DOCUMENTATION.md
 └── pyproject.toml
 ```
 
+### Important modules
+
+- `nanoresearch/agents/` — stage agents for ideation, planning, setup, coding, execution, analysis, figures, writing, and review
+- `nanoresearch/pipeline/` — orchestrators, state machine, multi-model dispatch, and workspace management
+- `nanoresearch/templates/` — LaTeX templates and conference formats
+- `mcp_server/` — tool server integrations for research and document workflows
+- `tests/` — regression and pipeline tests
+
 ## Requirements
 
-- Python >= 3.10
-- An OpenAI-compatible API endpoint (self-hosted or cloud)
-- `tectonic` or `pdflatex` for PDF compilation (optional — paper.tex works standalone)
+- Python **3.10+**
+- An **OpenAI-compatible API endpoint** for text-model stages
+- Optional image-model access for some figure-generation setups
+- `tectonic` or `pdflatex` for PDF compilation
 
-### Install tectonic (recommended)
+Recommended LaTeX toolchain:
 
 ```bash
 conda install -c conda-forge tectonic
 ```
 
-## Tests
+## Testing
 
 ```bash
 pip install -e ".[dev]"
-pytest tests/ -v  # 185 tests
+pytest tests/ -v
+```
+
+## Notes
+
+- This project is best suited to users comfortable with generated code, experiment debugging, and iterative research workflows.
+- Generated papers still require human review before submission.
+- The repository includes both the current unified pipeline and compatibility paths for older workspaces.
+
+## FAQ
+
+### Does NanoResearch run real experiments?
+Yes. The pipeline is designed to generate runnable code, execute it locally or on SLURM, and feed resulting artifacts into later analysis, figure generation, and writing stages.
+
+### Can I resume a failed run?
+Yes. Workspaces are checkpointed by stage, and `nanoresearch resume --workspace ...` continues from the last incomplete or failed stage.
+
+### Do I need one model for every stage?
+No. NanoResearch supports per-stage model routing, so ideation, coding, writing, figures, and review can use different models.
+
+### Is the generated paper submission-ready?
+Treat it as a strong draft, not a final submission. The system can generate a full paper workspace and compiled draft, but human review is still required.
+
+## Roadmap
+
+- Improve README assets and example galleries
+- Expand evaluation and benchmark coverage for autonomous research workflows
+- Continue tightening grounding and citation-integrity guarantees
+- Improve execution robustness across more local and cluster environments
+- Refine figure generation and review-stage quality controls
+
+## Citation
+
+If NanoResearch helps your work, cite the repository:
+
+```bibtex
+@software{nanoresearch2026,
+  title = {NanoResearch},
+  author = {OpenRaiser},
+  year = {2026},
+  url = {https://github.com/OpenRaiser/NanoStudy-dev}
+}
 ```
 
 ## License
