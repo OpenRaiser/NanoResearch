@@ -45,7 +45,6 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [Paper formats](#paper-formats)
 - [Project structure](#project-structure)
 - [Requirements](#requirements)
-- [Testing](#testing)
 - [Notes](#notes)
 - [FAQ](#faq)
 - [Roadmap](#roadmap)
@@ -514,7 +513,6 @@ nanoresearch/
 │   └── templates/
 ├── mcp_server/
 ├── skills/
-├── tests/
 ├── outputs/
 ├── PROJECT_DOCUMENTATION.md
 └── pyproject.toml
@@ -526,7 +524,6 @@ nanoresearch/
 - `nanoresearch/pipeline/` — orchestrators, state machine, multi-model dispatch, and workspace management
 - `nanoresearch/templates/` — LaTeX templates and conference formats
 - `mcp_server/` — tool server integrations for research and document workflows
-- `tests/` — regression and pipeline tests
 
 ## Requirements
 
@@ -539,13 +536,6 @@ Recommended LaTeX toolchain:
 
 ```bash
 conda install -c conda-forge tectonic
-```
-
-## Testing
-
-```bash
-pip install -e ".[dev]"
-pytest tests/ -v
 ```
 
 ## Notes
