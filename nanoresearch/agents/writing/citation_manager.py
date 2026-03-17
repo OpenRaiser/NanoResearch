@@ -69,42 +69,72 @@ class _CitationManagerMixin:
     async def _resolve_single_citation(self, key: str) -> str:
         """Resolve a single missing citation key to a bib entry.
 
-        Parses the key pattern (e.g., 'gu2022', 'child2019b') to extract
-        author surname and year, then searches OpenAlex.
+        Parses the key pattern (e.g., 'gu2022', 'child2019b',
+        'beltagy2020longformer') to extract author surname, year, and
+        optional method/paper name, then searches OpenAlex.
         Falls back to a stub entry if search fails.
         """
-        # Parse key: letters = surname, digits = year, optional trailing letter
-        m = re.match(r"([a-z]+)(\d{4})([a-z]?)$", key, re.IGNORECASE)
+        # Parse key: letters = surname, digits = year, optional trailing letters (method name)
+        m = re.match(r"([a-z]+)(\d{4})([a-z]*)$", key, re.IGNORECASE)
         if m:
             surname = m.group(1).capitalize()
             year = m.group(2)
-            query = f"{surname} {year}"
+            method_hint = m.group(3)  # e.g. "longformer", "bigbird", "b"
+            # Build search query: include method name if it's more than a
+            # single disambiguator letter (e.g. "longformer" but not "b")
+            if len(method_hint) > 1:
+                query = f"{surname} {year} {method_hint}"
+            else:
+                query = f"{surname} {year}"
         else:
             # Unusual key format — use as-is for search
             surname = key
             year = ""
+            method_hint = ""
             query = key
 
         # Try OpenAlex search (free, no API key application needed)
         try:
             from mcp_server.tools.openalex import search_openalex
             results = await search_openalex(query, max_results=5)
-            # Find best match: title/author containing surname, year matching
+            # Find best match with prioritized matching
             best = None
+            # Priority 1: year + author match + method hint in title
             for r in results:
                 r_year = str(r.get("year", ""))
                 r_authors = " ".join(r.get("authors", []))
-                if year and r_year == year and surname.lower() in r_authors.lower():
-                    best = r
-                    break
+                r_title = (r.get("title") or "").lower()
+                if (year and r_year == year
+                        and surname.lower() in r_authors.lower()):
+                    if method_hint and len(method_hint) > 1:
+                        if method_hint.lower() in r_title:
+                            best = r
+                            break
+                    else:
+                        best = r
+                        break
+            # Priority 2: year + author match (without method hint check)
+            if not best:
+                for r in results:
+                    r_year = str(r.get("year", ""))
+                    r_authors = " ".join(r.get("authors", []))
+                    if year and r_year == year and surname.lower() in r_authors.lower():
+                        best = r
+                        break
+            # Priority 3: year + method hint in title (author name may differ)
+            if not best and method_hint and len(method_hint) > 1:
+                for r in results:
+                    r_year = str(r.get("year", ""))
+                    r_title = (r.get("title") or "").lower()
+                    if year and r_year == year and method_hint.lower() in r_title:
+                        best = r
+                        break
+            # Priority 4: year match only (no blind first-result fallback)
             if not best and results:
-                # Fallback: first result with matching year
                 for r in results:
                     if year and str(r.get("year", "")) == year:
                         best = r
                         break
-            if not best and results:
-                best = results[0]  # Last resort: first result
 
             if best:
                 authors = best.get("authors", [])
@@ -136,6 +166,43 @@ class _CitationManagerMixin:
             f"Please replace with the correct reference.}},\n"
             f"}}\n"
         )
+
+    def _cleanup_unused_bibtex(self, latex: str, bibtex: str) -> str:
+        """Remove BibTeX entries that are not cited anywhere in the LaTeX source.
+
+        This prevents the .bib file from accumulating unused entries
+        collected during ideation but never referenced in the final paper.
+        """
+        # 1. Collect all cited keys from LaTeX
+        cited: set[str] = set()
+        for m in self._CITE_KEY_RE.finditer(latex):
+            for k in m.group(1).split(","):
+                k = k.strip()
+                if k:
+                    cited.add(k)
+
+        if not cited:
+            return bibtex  # No citations at all — don't touch bib
+
+        # 2. Parse bib entries and filter
+        # Match @type{key, ... } blocks
+        entry_re = re.compile(
+            r'(@\w+\s*\{)\s*([^,\s]+)\s*,(.*?)(?=\n@|\Z)',
+            re.DOTALL,
+        )
+        kept: list[str] = []
+        removed_count = 0
+        for m in entry_re.finditer(bibtex):
+            key = m.group(2).strip()
+            if key in cited:
+                kept.append(m.group(0).rstrip())
+            else:
+                removed_count += 1
+
+        if removed_count > 0:
+            self.log(f"Removed {removed_count} unused BibTeX entries (kept {len(kept)})")
+            return "\n\n".join(kept) + "\n"
+        return bibtex
 
     # ---- citation coverage validation ----------------------------------------
 
@@ -184,7 +251,7 @@ class _CitationManagerMixin:
         # 3. Citation distribution by section
         section_cites: dict[str, int] = {}
         # Split by \section
-        section_pattern = re.compile(r'\\section\{([^}]+)\}')
+        section_pattern = re.compile(r'\\section\{((?:[^{}]|\{[^{}]*\})+)\}')
         parts = section_pattern.split(latex)
         for i in range(1, len(parts), 2):
             sec_name = parts[i] if i < len(parts) else "Unknown"

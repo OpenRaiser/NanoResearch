@@ -24,8 +24,15 @@ class _ReactModeMixin:
         code_dir = self.workspace.path / "code"
         code_dir.mkdir(parents=True, exist_ok=True)
 
+        # Build allowed env set for isolation enforcement.
+        # Only activate isolation when user has explicitly chosen an env.
+        # None = no restriction; frozenset(...) = only these envs + nanoresearch_*
+        _allowed: frozenset[str] | None = None
+        if self.config.experiment_conda_env:
+            _allowed = frozenset({self.config.experiment_conda_env, "base"})
+
         # Build tools
-        tools = build_experiment_tools(work_dir=code_dir)
+        tools = build_experiment_tools(work_dir=code_dir, allowed_envs=_allowed)
 
         # Build SLURM config block for system prompt
         partition = self.config.slurm_partition
@@ -51,12 +58,18 @@ class _ReactModeMixin:
         conda_env = self.config.experiment_conda_env
         if conda_env:
             conda_env_hint = (
-                f"\n**Pre-configured conda env**: `{conda_env}` — use this env "
+                f"\n**MANDATORY conda env**: `{conda_env}` — you MUST use this env "
                 f"(activate with `conda activate {conda_env}`). "
-                f"It likely already has PyTorch and common ML packages installed.\n"
+                f"Do NOT use any other existing conda environment. "
+                f"This env was explicitly chosen by the user. "
+                f"If it lacks packages, install them into THIS env.\n"
             )
         else:
-            conda_env_hint = ""
+            conda_env_hint = (
+                "\n**No pre-configured env** — create a new per-session venv or "
+                "conda env (prefix name with `nanoresearch_`). "
+                "Do NOT use any existing user conda environments.\n"
+            )
 
         # Build container config block for system prompt
         container_image = self.config.container_image

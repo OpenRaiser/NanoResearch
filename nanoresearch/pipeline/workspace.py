@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 import uuid
 from datetime import datetime, timezone
@@ -23,6 +22,15 @@ from nanoresearch.schemas.manifest import (
     processing_stages_for_mode,
 )
 
+from nanoresearch.pipeline._workspace_helpers import (  # noqa: F401
+    _WorkspaceExportMixin,
+    _slugify,
+    _copy_if_exists,
+    _prepare_exported_paper_tex,
+    _insert_into_preamble,
+    _count_lines,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +39,7 @@ _DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
 WORKSPACE_DIRS = ["papers", "plans", "drafts", "figures", "logs", "code"]
 
 
-class Workspace:
+class Workspace(_WorkspaceExportMixin):
     """Manages a single research session workspace on disk."""
 
     def __init__(self, path: Path) -> None:
@@ -299,13 +307,29 @@ class Workspace:
 
     def write_json(self, subpath: str, data: dict | list) -> Path:
         p = self.path / subpath
+        content: str | None = None
+        tmp: Path | None = None
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(
-                json.dumps(data, indent=2, ensure_ascii=False, default=str),
-                encoding="utf-8",
-            )
+            content = json.dumps(data, indent=2, ensure_ascii=False, default=str)
+            # Atomic write: temp file + os.replace to avoid corruption on crash
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(str(tmp), str(p))
         except OSError as exc:
+            # Cleanup temp file if it exists
+            if tmp is not None:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            # Fallback to direct write if os.replace fails (e.g. cross-device)
+            if content is not None:
+                try:
+                    p.write_text(content, encoding="utf-8")
+                    return p  # fallback succeeded
+                except OSError:
+                    pass
             raise RuntimeError(f"Failed to write JSON to {p}: {exc}") from exc
         return p
 
@@ -333,175 +357,8 @@ class Workspace:
             raise FileNotFoundError(f"File not found: {p}")
         return p.read_text(encoding="utf-8")
 
-    # ---- export ----------------------------------------------------------
+    # export() is inherited from _WorkspaceExportMixin
 
-    def export(self, output_dir: Path | None = None) -> Path:
-        """Export a clean, self-contained output folder.
-
-        Structure:
-            {topic_slug}/
-            ├── paper.pdf
-            ├── paper.tex
-            ├── references.bib
-            ├── figures/
-            │   ├── fig1_architecture.pdf
-            │   └── ...
-            ├── code/
-            │   └── experiment.py
-            ├── data/
-            │   ├── ideation_output.json
-            │   └── experiment_blueprint.json
-            └── manifest.json
-        """
-        # Build folder name from topic
-        topic = self.manifest.topic
-        slug = _slugify(topic)
-        name = f"nanoresearch_{slug}_{self.manifest.session_id[:8]}"
-
-        if output_dir is None:
-            output_dir = Path.cwd()
-        dest = output_dir / name
-
-        if dest.exists():
-            try:
-                shutil.rmtree(dest)
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Cannot remove existing export dir {dest}: {exc}"
-                ) from exc
-        try:
-            dest.mkdir(parents=True)
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot create export dir {dest}: {exc}"
-            ) from exc
-
-        # Copy paper outputs
-        _copy_if_exists(self.drafts_dir / "paper.pdf", dest / "paper.pdf")
-        _copy_if_exists(self.drafts_dir / "paper.tex", dest / "paper.tex")
-        _copy_if_exists(self.drafts_dir / "references.bib", dest / "references.bib")
-
-        # Copy figures
-        fig_dest = dest / "figures"
-        if self.figures_dir.exists() and any(self.figures_dir.iterdir()):
-            shutil.copytree(self.figures_dir, fig_dest, dirs_exist_ok=True)
-        _prepare_exported_paper_tex(
-            dest / "paper.tex",
-            has_figures=fig_dest.exists() and any(fig_dest.iterdir()),
-        )
-
-        # Copy code (skip .venv, __pycache__, node_modules to avoid long paths on Windows)
-        code_dest = dest / "code"
-        _skip_dirs = {".venv", "venv", "__pycache__", "node_modules", ".git", ".tox"}
-        if self.code_dir.exists() and any(self.code_dir.iterdir()):
-            shutil.copytree(
-                self.code_dir, code_dest, dirs_exist_ok=True,
-                ignore=shutil.ignore_patterns(*_skip_dirs),
-            )
-        else:
-            code_dest.mkdir(exist_ok=True)
-            _copy_if_exists(self.plans_dir / "code_skeleton.py", code_dest / "experiment.py")
-
-        # Copy structured data
-        data_dest = dest / "data"
-        data_dest.mkdir(exist_ok=True)
-        _copy_if_exists(self.papers_dir / "ideation_output.json", data_dest / "ideation_output.json")
-        _copy_if_exists(self.plans_dir / "experiment_blueprint.json", data_dest / "experiment_blueprint.json")
-        _copy_if_exists(self.drafts_dir / "paper_skeleton.json", data_dest / "paper_skeleton.json")
-
-        # Copy manifest
-        _copy_if_exists(self._manifest_path, dest / "manifest.json")
-
-        # Write a short README
-        readme = (
-            f"# {topic}\n\n"
-            f"Auto-generated by NanoResearch (session: {self.manifest.session_id})\n\n"
-            f"## Contents\n\n"
-            f"- `paper.pdf` — Compiled paper\n"
-            f"- `paper.tex` — LaTeX source\n"
-            f"- `references.bib` — Bibliography\n"
-            f"- `figures/` — All figures (PDF + PNG)\n"
-            f"- `code/experiment.py` — Experiment code skeleton ({_count_lines(code_dest / 'experiment.py')} lines)\n"
-            f"- `code/` — Complete runnable project (if multi-file generation enabled)\n"
-            f"- `data/` — Structured intermediate outputs (JSON)\n"
-            f"- `manifest.json` — Full pipeline execution record\n"
-        )
-        (dest / "README.md").write_text(readme, encoding="utf-8")
-
-        return dest
-
-
-def _slugify(text: str, max_len: int = 40) -> str:
-    """Convert text to a filesystem-safe slug."""
-    import re
-    # Keep alphanumeric, Chinese chars, hyphens
-    slug = re.sub(r'[^\w\u4e00-\u9fff-]', '_', text)
-    slug = re.sub(r'_+', '_', slug).strip('_')
-    return slug[:max_len]
-
-
-def _copy_if_exists(src: Path, dst: Path) -> None:
-    if src.is_file():
-        try:
-            shutil.copy2(src, dst)
-        except OSError as exc:
-            logger.warning("Failed to copy %s -> %s: %s", src, dst, exc)
-
-
-def _prepare_exported_paper_tex(tex_path: Path, has_figures: bool) -> None:
-    """Make exported ``paper.tex`` self-contained relative to the export root."""
-    if not tex_path.is_file():
-        return
-
-    try:
-        tex = tex_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Failed to read exported LaTeX %s: %s", tex_path, exc)
-        return
-
-    updated = tex
-    uses_graphics = r"\includegraphics" in updated
-    has_graphicspath = r"\graphicspath" in updated
-    has_graphicx = re.search(
-        r"\\usepackage(?:\[[^\]]*\])?\{[^}]*\bgraphicx\b[^}]*\}",
-        updated,
-    ) is not None
-
-    if uses_graphics and not has_graphicx:
-        updated = _insert_into_preamble(updated, r"\usepackage{graphicx}")
-    if uses_graphics and has_figures and not has_graphicspath:
-        updated = _insert_into_preamble(updated, r"\graphicspath{{figures/}}")
-
-    if updated == tex:
-        return
-
-    try:
-        tex_path.write_text(updated, encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Failed to update exported LaTeX %s: %s", tex_path, exc)
-
-
-def _insert_into_preamble(tex: str, snippet: str) -> str:
-    """Insert a LaTeX preamble snippet before ``\\begin{document}``."""
-    if snippet in tex:
-        return tex
-
-    marker = r"\begin{document}"
-    index = tex.find(marker)
-    line = f"{snippet}\n"
-    if index == -1:
-        return f"{line}{tex}"
-
-    prefix = tex[:index]
-    if prefix and not prefix.endswith("\n"):
-        prefix += "\n"
-    return f"{prefix}{line}{tex[index:]}"
-
-
-def _count_lines(path: Path) -> int:
-    try:
-        if path.is_file():
-            return len(path.read_text(encoding="utf-8").splitlines())
-    except OSError:
-        pass
-    return 0
+    # _slugify, _copy_if_exists, _prepare_exported_paper_tex,
+    # _insert_into_preamble, _count_lines are imported from
+    # nanoresearch.pipeline._workspace_helpers and re-exported above.

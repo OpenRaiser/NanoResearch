@@ -24,10 +24,12 @@ from nanoresearch.schemas.manifest import PipelineMode, PipelineStage
 
 logger = logging.getLogger(__name__)
 
-# Retry backoff settings
-RETRY_BASE_DELAY = 5.0   # seconds
-RETRY_MAX_DELAY = 60.0   # seconds
-RETRY_BACKOFF_FACTOR = 2.0
+# Retry backoff settings (centralised in constants.py)
+from nanoresearch.agents.constants import (
+    RETRY_BACKOFF_FACTOR,
+    RETRY_BASE_DELAY,
+    RETRY_MAX_DELAY,
+)
 
 # Progress callback type: (stage_name, status, message)
 ProgressCallback = Callable[[str, str, str], None]

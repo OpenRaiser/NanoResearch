@@ -1,7 +1,7 @@
 """Figure generation stage output schema."""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class FigureRecord(BaseModel):
@@ -20,3 +20,10 @@ class FigureOutput(BaseModel):
     figures: list[FigureRecord] = Field(default_factory=list)
     figure_count: int = 0
     status: str = "pending"
+
+    @model_validator(mode="after")
+    def _sync_figure_count(self) -> "FigureOutput":
+        """Keep figure_count in sync with len(figures)."""
+        if self.figure_count != len(self.figures):
+            self.figure_count = len(self.figures)
+        return self

@@ -397,11 +397,13 @@ class TestEvidenceBlock:
         assert "estimate" not in block.lower() or "estimate" in "MUST USE THESE EXACT NUMBERS. DO NOT MODIFY THEM.".lower()
 
     def test_without_results(self):
-        """Evidence block without real results tells LLM no data is available."""
+        """Evidence block without real results but WITH literature allows charts."""
         block = FigureAgent._build_evidence_block(
             SAMPLE_IDEATION, SAMPLE_BLUEPRINT, {}, "pending"
         )
-        assert "NO EXPERIMENT DATA AVAILABLE" in block
+        # Has literature → allows charts with published data
+        assert "NO EXPERIMENT DATA FOR PROPOSED METHOD" in block
+        assert "You MAY generate comparison charts" in block
         # Should NOT contain "Results Pending" placeholder
         assert "Results Pending" not in block
         # Literature data should still be present
@@ -409,12 +411,13 @@ class TestEvidenceBlock:
         assert "92.4" in block
 
     def test_failed_status(self):
-        """Failed experiment status tells LLM no data is available."""
+        """Failed experiment status with literature allows charts."""
         block = FigureAgent._build_evidence_block(
             SAMPLE_IDEATION, SAMPLE_BLUEPRINT, SAMPLE_METRICS, "failed"
         )
-        # With failed status, even if metrics data exists, no-data fallback is used
-        assert "NO EXPERIMENT DATA AVAILABLE" in block
+        # With failed status, even if metrics data exists, no real results used
+        # But literature exists → allows charts
+        assert "NO EXPERIMENT DATA FOR PROPOSED METHOD" in block
         assert "Results Pending" not in block
 
     def test_no_literature_no_results(self):

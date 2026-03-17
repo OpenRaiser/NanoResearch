@@ -69,8 +69,13 @@ from nanoresearch.agents.repair_journal import (
     REPAIR_SNAPSHOT_JOURNAL_PATH,
 )
 
-POLL_INTERVAL = 30
-MAX_WAIT_TIME = 7 * 24 * 3600
+from nanoresearch.agents.constants import (
+    CLUSTER_MAX_WAIT_LONG,
+    CLUSTER_POLL_INTERVAL,
+)
+
+POLL_INTERVAL = CLUSTER_POLL_INTERVAL  # backward compat alias
+MAX_WAIT_TIME = CLUSTER_MAX_WAIT_LONG
 
 class _ClusterRunnerMixin:
     """Mixin — see module docstring."""
@@ -84,7 +89,7 @@ class _ClusterRunnerMixin:
         if not tracker.exists():
             return None
 
-        job_id = tracker.read_text().strip()
+        job_id = tracker.read_text(encoding="utf-8").strip()
         if not job_id or not job_id.isdigit():
             return None
 
@@ -99,7 +104,7 @@ class _ClusterRunnerMixin:
         if not Path(slurm_script).exists():
             raise RuntimeError(f"SLURM script not found: {slurm_script}")
 
-        result = await self._run_shell(f"sbatch {slurm_script}")
+        result = await self._run_shell(f"sbatch {shlex.quote(slurm_script)}")
         stdout = result.get("stdout", "")
         stderr = result.get("stderr", "")
 
@@ -111,11 +116,13 @@ class _ClusterRunnerMixin:
             )
 
         job_id = match.group(1)
+        if not job_id.isdigit():
+            raise RuntimeError(f"Extracted job ID is not numeric: {job_id!r}")
 
         # Save job ID for resume tracking
         tracker_path = Path(slurm_script).parent / "logs" / "active_job_id.txt"
         tracker_path.parent.mkdir(parents=True, exist_ok=True)
-        tracker_path.write_text(job_id)
+        tracker_path.write_text(job_id, encoding="utf-8")
 
         return job_id
 
@@ -205,27 +212,34 @@ class _ClusterRunnerMixin:
             "stderr": stderr.decode(errors="replace"),
         }
 
+    _cached_proxy_env: dict[str, str] | None = None
+
     def _build_proxy_env(self) -> dict[str, str]:
+        if _ClusterRunnerMixin._cached_proxy_env is not None:
+            # Refresh from current os.environ but reuse cached proxy detection
+            env = {**os.environ}
+            env.update(_ClusterRunnerMixin._cached_proxy_env)
+            env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+            return env
         env = {**os.environ}
         proxy_url = env.get("https_proxy") or env.get("HTTPS_PROXY", "")
         if not proxy_url:
-            import re as _re
-
             bashrc = Path.home() / ".bashrc"
             if bashrc.exists():
                 content = bashrc.read_text(errors="replace")
-                match = _re.search(r"https_proxy=(http://[^\s;'\"]+)", content)
+                match = re.search(r"https_proxy=(http://[^\s;'\"]+)", content)
                 if match:
                     proxy_url = match.group(1)
+        proxy_overlay: dict[str, str] = {}
         if proxy_url:
-            env.update(
-                {
-                    "http_proxy": proxy_url,
-                    "https_proxy": proxy_url,
-                    "HTTP_PROXY": proxy_url,
-                    "HTTPS_PROXY": proxy_url,
-                }
-            )
+            proxy_overlay = {
+                "http_proxy": proxy_url,
+                "https_proxy": proxy_url,
+                "HTTP_PROXY": proxy_url,
+                "HTTPS_PROXY": proxy_url,
+            }
+            env.update(proxy_overlay)
+        _ClusterRunnerMixin._cached_proxy_env = proxy_overlay
         env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
         return env
 

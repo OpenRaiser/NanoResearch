@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from nanoresearch.agents._code_utils import _strip_code_fences
 from . import (
     MAX_REFERENCE_REPOS,
     MAX_FILE_TREE_ENTRIES,
@@ -142,16 +143,8 @@ Generate the COMPLETE file content. Follow the interface contract exactly."""
             code_gen_config, FILE_GEN_SYSTEM_PROMPT, prompt
         )
 
-        # Clean up: remove markdown fences if present (handles ```python, ```json, etc.)
-        content = (content or "").strip()
-        if content.startswith("```"):
-            lines = content.split("\n")
-            # Remove opening fence line
-            lines = lines[1:]
-            # Remove only the last closing fence
-            if lines and lines[-1].strip().startswith("```"):
-                lines = lines[:-1]
-            content = "\n".join(lines)
+        # Robust fence stripping — handles LLM self-correction and multiple blocks
+        content = _strip_code_fences(content)
 
         return content
 

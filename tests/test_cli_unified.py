@@ -46,6 +46,10 @@ def test_run_uses_unified_deep_workspace() -> None:
 
         assert config.execution_profile == ExecutionProfile.LOCAL_QUICK
         assert create_mock.call_args.kwargs["pipeline_mode"] == PipelineMode.DEEP
-        orchestrator_cls.assert_called_once_with(workspace, config)
+        orchestrator_cls.assert_called_once()
+        call_args = orchestrator_cls.call_args
+        assert call_args[0] == (workspace, config) or (
+            call_args[0][0] is workspace and call_args[0][1] is config
+        )
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)

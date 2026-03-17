@@ -12,13 +12,36 @@ logger = logging.getLogger(__name__)
 MAX_PAPERS_FOR_CITATIONS = 50
 
 from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
+from nanoresearch.agents.writing.latex_assembler import _strip_llm_thinking
 from nanoresearch.skill_prompts import get_writing_system_prompt, ABSTRACT_SYSTEM, TITLE_SYSTEM
 
 ABSTRACT_SYSTEM_PROMPT = ABSTRACT_SYSTEM
 TITLE_SYSTEM_PROMPT = TITLE_SYSTEM
 
+_LEADING_FILLER_RE = re.compile(
+    r"^(?:Now|Next|Then|Here|Let us|Let me|In this section|We now|"
+    r"I have enough context[^.]*\.\s*|I will (?:now )?write[^.]*\.\s*|"
+    r"I(?:'ll| will| can| shall) (?:now )?(?:write|draft|generate|compose|produce)[^.]*\.\s*|"
+    r"Having described[^,]*,\s*|Having established[^,]*,\s*|"
+    r"With this in mind[,;:\s]*|Building on this[,;:\s]*)[,;:\s]*",
+    re.IGNORECASE,
+)
+
+
 class _SectionWriterMixin:
     """Mixin — section generation methods."""
+
+    @staticmethod
+    def _strip_leading_filler(text: str) -> str:
+        """Remove LLM filler words/phrases at the start of generated section content."""
+        # Only strip if the remainder still starts with a word (not a LaTeX command)
+        m = _LEADING_FILLER_RE.match(text)
+        if m:
+            rest = text[m.end():]
+            if rest and rest[0].isalpha():
+                # Capitalize first letter of remaining text
+                return rest[0].upper() + rest[1:]
+        return text
 
     async def _build_writing_tools(self) -> ToolRegistry | None:
         """Build a ToolRegistry with search tools for writing.
@@ -183,7 +206,26 @@ class _SectionWriterMixin:
             )
         prompt = f"Based on the following research context, write the abstract:\n\n{context}{number_binding}"
         try:
-            return ((await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)) or "").strip()
+            abstract = ((await self.generate(ABSTRACT_SYSTEM_PROMPT, prompt)) or "").strip()
+            # Enforce word limit: if too long, ask LLM to compress (not hard-truncate)
+            words = abstract.split()
+            if len(words) > 260:
+                logger.info("Abstract too long (%d words), asking LLM to compress to ~250", len(words))
+                compress_prompt = (
+                    f"The following abstract is {len(words)} words. "
+                    f"Compress it to 200-250 words while preserving ALL key information: "
+                    f"the problem, method name, all components, dataset names, and metric values. "
+                    f"Do NOT drop the experimental results sentence. "
+                    f"Output ONLY the compressed abstract text.\n\n{abstract}"
+                )
+                compressed = ((await self.generate(ABSTRACT_SYSTEM_PROMPT, compress_prompt)) or "").strip()
+                if compressed and 100 < len(compressed.split()) <= 280:
+                    abstract = compressed
+                    logger.info("Abstract compressed to %d words", len(abstract.split()))
+                else:
+                    logger.warning("LLM compression returned bad length (%d words), keeping original",
+                                   len((compressed or "").split()))
+            return abstract
         except Exception as e:
             logger.warning("Abstract generation failed, using fallback: %s", e)
             return "Abstract not available."
@@ -243,6 +285,11 @@ FORMAT RULES:
                         content = ((await self.generate(section_system, prompt)) or "").strip()
                     # Defense-in-depth: strip stray \end{document}
                     content = re.sub(r'\\end\{document\}\s*', '', content).strip()
+                    # Strip LLM filler at start of section
+                    content = self._strip_leading_filler(content)
+                    content = _strip_llm_thinking(content)
+                    # Fix component count mismatches (e.g. "four components" but lists 5)
+                    content = self._fix_component_count_mismatch(content)
                     return content
             except Exception as e:
                 logger.warning("Tool-augmented writing failed for %s, falling back: %s", heading, e)
@@ -253,10 +300,85 @@ FORMAT RULES:
             # section content. Strip it so it doesn't terminate the document
             # prematurely (causing all \cite{} to become (?)).
             content = re.sub(r'\\end\{document\}\s*', '', content).strip()
+            # Strip LLM filler at start of section
+            content = self._strip_leading_filler(content)
+            content = _strip_llm_thinking(content)
+            # Fix component count mismatches (e.g. "four components" but lists 5)
+            content = self._fix_component_count_mismatch(content)
             return content
         except Exception as e:
             logger.warning("Section generation failed for %s: %s", heading, e)
             return f"% Section generation failed: {heading}"
+
+    # ---- post-processing: component count fix --------------------------------
+
+    # Map number words to digits (and back)
+    _NUM_WORDS = {
+        "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+        "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+    _DIGIT_WORDS = {v: k for k, v in _NUM_WORDS.items()}
+
+    @classmethod
+    def _fix_component_count_mismatch(cls, content: str) -> str:
+        r"""Fix 'N components: (1)...(2)...' where N doesn't match actual count.
+
+        Detects patterns like 'four key components' followed by enumerated items
+        (either \item, (1)/(2)/(3), or \subsection) and corrects the number word.
+        """
+        # Pattern: "NUM_WORD key/main/core? components/modules/stages/parts"
+        num_claim_re = re.compile(
+            r'\b(two|three|four|five|six|seven|eight|nine|ten)\b'
+            r'(\s+(?:key|main|core|primary|major|fundamental|critical|novel|distinct))?'
+            r'\s+(components?|modules?|stages?|parts?|contributions?|elements?|blocks?)',
+            re.IGNORECASE,
+        )
+        # Find all claims in the content
+        for m in num_claim_re.finditer(content):
+            claimed_word = m.group(1).lower()
+            claimed_n = cls._NUM_WORDS.get(claimed_word, 0)
+            if claimed_n == 0:
+                continue
+
+            # Count actual items after this claim
+            after = content[m.end():]
+            # Strategy 1: count \item entries (in itemize/enumerate)
+            items_match = re.search(
+                r'\\begin\{(?:itemize|enumerate)\}(.*?)\\end\{(?:itemize|enumerate)\}',
+                after[:3000], re.DOTALL,
+            )
+            if items_match:
+                actual_n = len(re.findall(r'\\item\b', items_match.group(1)))
+            else:
+                # Strategy 2: count (1), (2), (3) style enumeration
+                # Only match sequential numbering starting from (1) to avoid
+                # false positives from equation numbers, years, etc.
+                paren_items = re.findall(r'\((\d+)\)', after[:2000])
+                # Filter: keep only small sequential numbers (1-10 range)
+                paren_small = [int(x) for x in paren_items if 1 <= int(x) <= 10]
+                # Require (1) to be present (sequential enumeration starts at 1)
+                if paren_small and 1 in paren_small:
+                    actual_n = max(paren_small)
+                else:
+                    # Strategy 3: count \subsection entries
+                    subsections = re.findall(r'\\subsection\{', after[:5000])
+                    actual_n = len(subsections) if subsections else 0
+
+            if actual_n > 0 and actual_n != claimed_n and actual_n in cls._DIGIT_WORDS:
+                correct_word = cls._DIGIT_WORDS[actual_n]
+                # Preserve original capitalization
+                if m.group(1)[0].isupper():
+                    correct_word = correct_word.capitalize()
+                old_span = content[m.start():m.end()]
+                new_span = old_span[:m.start(1) - m.start()] + correct_word + old_span[m.end(1) - m.start():]
+                content = content[:m.start()] + new_span + content[m.end():]
+                logger.info(
+                    "Fixed component count mismatch: '%s' → '%s' (actual: %d items)",
+                    claimed_word, correct_word, actual_n,
+                )
+                break  # Only fix the first mismatch per call to avoid cascading
+
+        return content
 
     # ---- bibtex & latex -----------------------------------------------------
 

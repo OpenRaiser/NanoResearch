@@ -122,7 +122,7 @@ class ExperimentBlueprint(BaseModel):
     )
     metrics: list[Metric] = Field(default_factory=list)
     ablation_groups: list[AblationGroup] = Field(default_factory=list)
-    compute_requirements: ComputeRequirements | dict = Field(
+    compute_requirements: ComputeRequirements = Field(
         default_factory=ComputeRequirements,
         description="Estimated compute needs (GPUs, hours, etc.)",
     )
@@ -134,6 +134,15 @@ class ExperimentBlueprint(BaseModel):
         default="",
         description="Note explaining which numbers are from published results vs projected",
     )
+
+    @field_validator("compute_requirements", mode="before")
+    @classmethod
+    def _coerce_compute_requirements(cls, v):
+        if v is None:
+            return ComputeRequirements()
+        if isinstance(v, dict):
+            return ComputeRequirements(**v)
+        return v
 
     @field_validator("title", "hypothesis_ref", "evidence_summary", "data_provenance_note", mode="before")
     @classmethod

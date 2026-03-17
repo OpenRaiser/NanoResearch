@@ -153,6 +153,14 @@ class ResearchConfig(BaseModel):
     # Takes priority over environment_backend auto-detection.
     experiment_conda_env: str = ""  # e.g., "shixun"
 
+    # Point to a user-managed Python environment. Accepts:
+    #   - python executable path:  "D:/anaconda/envs/myenv/python.exe"
+    #   - environment directory:   "D:/projects/.venv"  (auto-finds python inside)
+    #   - conda env name:          "shixun"  (resolved via conda)
+    # When set, skips all auto-creation/install — uses the environment as-is.
+    # Takes highest priority over all other environment settings.
+    experiment_python: str = ""
+
     # Multi-model review committee (optional).
     # Each entry: {"role": str, "focus": str, "model": str,
     #              "base_url": str|None, "api_key": str|None, "weight": float}

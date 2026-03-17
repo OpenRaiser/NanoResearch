@@ -529,7 +529,7 @@ async def test_collect_results_recovers_metrics_from_cluster_logs() -> None:
         assert results["recovered_from"] == "slurm_logs"
         assert results["metrics_artifact_materialized"] is True
         assert results["metrics_artifact_path"] == "results/metrics.json"
-        assert results["parsed_metrics"]["accuracy"] == "0.91"
+        assert results["parsed_metrics"]["accuracy"] == 0.91
         metric_names = {
             item["metric_name"]
             for item in results["metrics"]["main_results"][0]["metrics"]

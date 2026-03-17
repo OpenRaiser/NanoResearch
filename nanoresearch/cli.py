@@ -188,13 +188,27 @@ def run(
         border_style="blue",
     ))
 
-    orchestrator = UnifiedPipelineOrchestrator(workspace, config)
+    orchestrator = UnifiedPipelineOrchestrator(
+        workspace, config, progress_callback=_cli_progress,
+    )
     try:
         result = asyncio.run(_run_deep_pipeline(orchestrator, topic))
         _print_result(result, workspace)
     except Exception as e:
         console.print(f"[red]Pipeline failed:[/red] {e}")
         raise typer.Exit(1)
+
+
+def _cli_progress(stage: str, status: str, message: str) -> None:
+    """Shared progress callback for CLI pipeline commands."""
+    icons = {
+        "started": "[cyan]>>>[/cyan]",
+        "completed": "[green] OK[/green]",
+        "skipped": "[dim] --[/dim]",
+        "retrying": "[yellow] !![/yellow]",
+        "failed": "[red]ERR[/red]",
+    }
+    console.print(f"  {icons.get(status, '   ')} {message}")
 
 
 @app.command()
@@ -245,16 +259,13 @@ def resume(
             console.print("[green]Pipeline already completed.[/green]")
             return
 
-    def _progress(stage: str, status: str, message: str) -> None:
-        icons = {"started": "[cyan]>>>[/cyan]", "completed": "[green]OK[/green]",
-                 "skipped": "[dim]--[/dim]", "retrying": "[yellow]!![/yellow]"}
-        console.print(f"  {icons.get(status, '  ')} {message}")
-
     is_deep = manifest.pipeline_mode == PipelineMode.DEEP
 
     if is_deep:
         console.print("  [magenta]Detected unified/deep workspace — using UnifiedPipelineOrchestrator[/magenta]")
-        orchestrator = UnifiedPipelineOrchestrator(ws, config)
+        orchestrator = UnifiedPipelineOrchestrator(
+            ws, config, progress_callback=_cli_progress,
+        )
         try:
             result = asyncio.run(_run_deep_pipeline(orchestrator, manifest.topic))
             _print_result(result, ws)
@@ -262,7 +273,9 @@ def resume(
             console.print(f"[red]Deep pipeline failed:[/red] {e}")
             raise typer.Exit(1)
     else:
-        orchestrator = PipelineOrchestrator(ws, config, progress_callback=_progress)
+        orchestrator = PipelineOrchestrator(
+            ws, config, progress_callback=_cli_progress,
+        )
         try:
             result = asyncio.run(_run_pipeline(orchestrator, manifest.topic))
             _print_result(result, ws)
@@ -360,6 +373,13 @@ async def _run_pipeline(orchestrator: PipelineOrchestrator, topic: str) -> dict:
         await orchestrator.close()
 
 
+async def _run_deep_pipeline(orchestrator, topic: str) -> dict:
+    try:
+        return await orchestrator.run(topic)
+    finally:
+        await orchestrator.close()
+
+
 def _print_result(result: dict, workspace: Workspace) -> None:
     console.print("\n[bold green]Pipeline completed![/bold green]\n")
 
@@ -383,275 +403,10 @@ def _print_result(result: dict, workspace: Workspace) -> None:
         console.print(f"[bold]Raw workspace:[/bold] {workspace.path}")
 
 
-@app.command()
-def export(
-    workspace: Path = typer.Option(..., "--workspace", "-w", help="Path to workspace directory"),
-    output: Path = typer.Option(None, "--output", "-o", help="Output directory (default: current dir)"),
-) -> None:
-    """Export a completed session to a clean output folder."""
-    ws = _load_workspace_safe(workspace)
-    if ws.manifest.current_stage != PipelineStage.DONE:
-        console.print(f"[yellow]Warning:[/yellow] Pipeline status is {ws.manifest.current_stage.value}, not DONE")
-
-    try:
-        export_path = ws.export(output)
-        console.print(f"[green]Exported to:[/green] {export_path}")
-    except RuntimeError as exc:
-        console.print(f"[red]Export failed:[/red] {exc}")
-        raise typer.Exit(1)
-
-
-@app.command("config")
-def show_config(
-    config_path: Path = typer.Option(None, "--config", "-c", help="Path to config file"),
-) -> None:
-    """Show the current configuration (API keys are masked)."""
-    config = _load_config_safe(config_path)
-    snapshot = config.snapshot()
-
-    # Mask the base_url partially
-    base_url = config.base_url
-    if len(base_url) > 20:
-        base_url = base_url[:20] + "..."
-
-    table = Table(title="Configuration")
-    table.add_column("Setting", style="bold")
-    table.add_column("Value")
-
-    table.add_row("Base URL", base_url)
-    table.add_row("API Key", "****" + config.api_key[-4:] if len(config.api_key) > 4 else "***")
-    table.add_row("Global Timeout", f"{config.timeout}s")
-    table.add_row("Max Retries", str(config.max_retries))
-    table.add_row("Template Format", config.template_format)
-    table.add_row("Execution Profile", config.execution_profile.value)
-    table.add_row("Writing Mode", config.writing_mode.value)
-    table.add_row("Auto Create Env", str(config.auto_create_env))
-    table.add_row("Auto Download Resources", str(config.auto_download_resources))
-
-    console.print(table)
-
-    # Per-stage models
-    stage_table = Table(title="Per-Stage Models")
-    stage_table.add_column("Stage", style="bold")
-    stage_table.add_column("Model")
-    stage_table.add_column("Temperature")
-    stage_table.add_column("Max Tokens")
-
-    for stage_name in ["ideation", "planning", "experiment", "writing",
-                       "code_gen", "figure_prompt", "figure_code", "figure_gen",
-                       "evidence_extraction", "review"]:
-        sc = config.for_stage(stage_name)
-        stage_table.add_row(
-            stage_name,
-            sc.model,
-            str(sc.temperature) if sc.temperature is not None else "None",
-            str(sc.max_tokens),
-        )
-
-    console.print(stage_table)
-
-
-@app.command()
-def delete(
-    session_id: str = typer.Argument(..., help="Session ID to delete"),
-    root: Path = typer.Option(_DEFAULT_ROOT, "--root", "-r"),
-    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation"),
-) -> None:
-    """Delete a research session and its workspace."""
-    import shutil
-
-    ws_path = root / session_id
-    if not ws_path.is_dir():
-        console.print(f"[red]Session not found:[/red] {ws_path}")
-        raise typer.Exit(1)
-
-    # Show what will be deleted
-    manifest_path = ws_path / "manifest.json"
-    if manifest_path.is_file():
-        try:
-            data = json.loads(manifest_path.read_text(encoding="utf-8"))
-            console.print(f"  Topic: {data.get('topic', '?')}")
-            console.print(f"  Stage: {data.get('current_stage', '?')}")
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    if not force:
-        confirm = typer.confirm(f"Delete session {session_id} at {ws_path}?")
-        if not confirm:
-            console.print("[dim]Cancelled.[/dim]")
-            return
-
-    try:
-        shutil.rmtree(ws_path)
-        console.print(f"[green]Deleted:[/green] {ws_path}")
-    except OSError as exc:
-        console.print(f"[red]Delete failed:[/red] {exc}")
-        raise typer.Exit(1)
-
-
-@app.command()
-def deep(
-    topic: str = typer.Option(..., "--topic", "-t", help="Research topic"),
-    format: str = typer.Option("neurips2025", "--format", "-f", help="Paper format"),
-    config_path: Path = typer.Option(None, "--config", "-c", help="Path to config file"),
-    profile: ExecutionProfile | None = typer.Option(
-        None,
-        "--profile",
-        help="Unified execution profile",
-    ),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-) -> None:
-    """Compatibility alias for the unified deep-backbone pipeline."""
-    _setup_logging(verbose)
-
-    console.print("[yellow]`deep` is now a compatibility alias of `run`.[/yellow]")
-    config = _load_config_safe(config_path)
-    config.template_format = format
-    if profile is not None:
-        config.execution_profile = profile
-
-    workspace = Workspace.create(
-        topic=topic,
-        config_snapshot=config.snapshot(),
-        pipeline_mode=PipelineMode.DEEP,
-    )
-    console.print(Panel(
-        f"[bold]Topic:[/bold] {topic}\n"
-        f"[bold]Mode:[/bold] Unified deep backbone\n"
-        f"[bold]Profile:[/bold] {config.execution_profile.value}\n"
-        f"[bold]Session:[/bold] {workspace.manifest.session_id}\n"
-        f"[bold]Workspace:[/bold] {workspace.path}\n"
-        f"[bold]Format:[/bold] {format}\n\n"
-        f"Pipeline: IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW",
-        title="NanoResearch Deep Mode",
-        border_style="magenta",
-    ))
-
-    orchestrator = UnifiedPipelineOrchestrator(workspace, config)
-    try:
-        result = asyncio.run(_run_deep_pipeline(orchestrator, topic))
-        _print_result(result, workspace)
-    except Exception as e:
-        console.print(f"[red]Deep pipeline failed:[/red] {e}")
-        console.print(f"[bold]Workspace:[/bold] {workspace.path}")
-        raise typer.Exit(1)
-
-
-async def _run_deep_pipeline(orchestrator, topic: str) -> dict:
-    try:
-        return await orchestrator.run(topic)
-    finally:
-        await orchestrator.close()
-
-
-@app.command()
-def inspect(
-    workspace: Path = typer.Option(..., "--workspace", "-w", help="Path to workspace directory"),
-    stage: str = typer.Option(None, "--stage", "-s", help="Stage to inspect (e.g., ideation, planning)"),
-) -> None:
-    """Inspect individual stage outputs from a session."""
-    ws = _load_workspace_safe(workspace)
-
-    file_map = {
-        "ideation": "papers/ideation_output.json",
-        "planning": "plans/experiment_blueprint.json",
-        "experiment": "logs/experiment_output.json",
-        "setup": "plans/setup_output.json",
-        "coding": "plans/coding_output.json",
-        "execution": "plans/execution_output.json",
-        "analysis": "plans/analysis_output.json",
-        "figure_gen": "drafts/figure_output.json",
-        "writing": "drafts/paper_skeleton.json",
-        "review": "drafts/review_output.json",
-    }
-
-    if stage:
-        stage = stage.lower()
-        if stage not in file_map:
-            console.print(f"[red]Unknown stage:[/red] {stage}. Available: {list(file_map)}")
-            raise typer.Exit(1)
-        try:
-            data = ws.read_json(file_map[stage])
-            console.print_json(json.dumps(data, indent=2, ensure_ascii=False, default=str))
-        except FileNotFoundError:
-            console.print(f"[yellow]No output found for stage '{stage}'[/yellow]")
-    else:
-        # Show overview of all available outputs
-        console.print(f"[bold]Workspace:[/bold] {ws.path}\n")
-        for name, path in file_map.items():
-            exists = (ws.path / path).is_file()
-            icon = "[green]exists[/green]" if exists else "[dim]missing[/dim]"
-            console.print(f"  {name:12s} {icon}  ({path})")
-
-
-@app.command()
-def feishu(
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-) -> None:
-    """启动飞书机器人，通过飞书消息触发 NanoResearch pipeline。
-
-    需要先在飞书开放平台创建应用并配置 App ID/Secret。
-    凭证通过环境变量 FEISHU_APP_ID/FEISHU_APP_SECRET 或
-    ~/.nanobot/config.json 中的 feishu.app_id/app_secret 配置。
-    """
-    _setup_logging(verbose)
-    from nanoresearch.feishu_bot import main as feishu_main
-    console.print(Panel(
-        "[bold]NanoResearch 飞书机器人[/bold]\n\n"
-        "在飞书中给机器人发消息即可启动 pipeline。\n"
-        "支持的命令：/run <主题>、/status、/list、/stop、/help\n"
-        "或直接发送研究主题。\n\n"
-        "按 Ctrl+C 停止。",
-        title="Feishu Bot",
-        border_style="blue",
-    ))
-    feishu_main()
-
-
-@app.command("cleanup-envs")
-def cleanup_envs(
-    dry_run: bool = typer.Option(False, "--dry-run", help="Only list envs, don't remove"),
-    yes: bool = typer.Option(False, "-y", "--yes", help="Skip confirmation prompt"),
-) -> None:
-    """Remove per-session conda environments (nanoresearch_*).
-
-    Lists all nanoresearch_* conda environments and optionally removes them
-    to reclaim disk space.
-    """
-    from nanoresearch.agents.runtime_env import RuntimeEnvironmentManager
-
-    envs = RuntimeEnvironmentManager.list_nanoresearch_conda_envs()
-    if not envs:
-        console.print("[green]No nanoresearch_* conda environments found.[/green]")
-        raise typer.Exit()
-
-    table = Table(title="Per-session conda environments")
-    table.add_column("Name", style="cyan")
-    table.add_column("Path", style="dim")
-    for env in envs:
-        table.add_row(env["name"], env["path"])
-    console.print(table)
-    console.print(f"\n[bold]{len(envs)}[/bold] environment(s) found.")
-
-    if dry_run:
-        console.print("[yellow]Dry-run mode — no environments removed.[/yellow]")
-        raise typer.Exit()
-
-    if not yes:
-        confirm = typer.confirm(f"Remove all {len(envs)} environment(s)?")
-        if not confirm:
-            raise typer.Exit()
-
-    removed = 0
-    for env in envs:
-        console.print(f"  Removing {env['name']} ...", end=" ")
-        ok = RuntimeEnvironmentManager.remove_conda_env(env["name"])
-        if ok:
-            console.print("[green]OK[/green]")
-            removed += 1
-        else:
-            console.print("[red]FAILED[/red]")
-    console.print(f"\n[bold]{removed}/{len(envs)}[/bold] environments removed.")
+# Import command modules to register their @app.command() decorators
+import nanoresearch.cli_commands  # noqa: F401, E402
+import nanoresearch.cli_code_edit  # noqa: F401, E402
+import nanoresearch.cli_paper_edit  # noqa: F401, E402
 
 
 if __name__ == "__main__":

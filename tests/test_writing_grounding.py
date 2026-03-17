@@ -194,7 +194,8 @@ def test_grounding_packet_scaffold_tables_when_no_results():
     assert "--" in pkt.main_table_latex
     # Blueprint baseline name appears
     assert "BaselineA" in pkt.main_table_latex
-    assert "pending" in pkt.main_table_latex.lower()
+    # V2.1+: scaffold uses "--" placeholders instead of "pending"
+    assert "--" in pkt.main_table_latex
 
 
 def test_grounding_packet_no_scaffold_without_metrics():
@@ -241,7 +242,8 @@ def test_grounding_status_context_none():
     )
     ctx = WritingAgent._build_grounding_status_context(pkt)
     assert "NONE" in ctx
-    assert "Do NOT fabricate" in ctx
+    # V2.1+: stronger anti-fabrication wording
+    assert "Do NOT write" in ctx or "Do NOT fabricate" in ctx
 
 
 def test_grounding_status_context_quick_eval():

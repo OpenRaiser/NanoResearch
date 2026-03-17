@@ -55,13 +55,13 @@ async def verify_citation_claims(
 
             try:
                 result = await agent.generate_json(
-                    system=(
+                    system_prompt=(
                         "You are a citation fact-checker. Compare the claim "
                         "in the paper against the source's title and abstract. "
                         'Return JSON: {"accurate": true/false, '
                         '"issue": null or string describing the inaccuracy}'
                     ),
-                    user=(
+                    user_prompt=(
                         f'Claim in paper: "{sentence[:500]}"\n\n'
                         f'Source paper title: "{title}"\n'
                         f'Source paper abstract: "{abstract[:1500]}"\n\n'

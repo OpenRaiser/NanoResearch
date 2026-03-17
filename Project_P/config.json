@@ -1,0 +1,11 @@
+{
+    "tectonic_path": "/mnt/petrelfs/xujinhang/anaconda3/bin/tectonic",
+    "llm": {
+        "base_url": "http://35.220.164.252:3888/v1/",
+        "api_key": "sk-placeholder",
+        "model": "claude-sonnet-4-6",
+        "vision_model": "claude-sonnet-4-6",
+        "temperature": 0.1,
+        "timeout": 60
+    }
+}
