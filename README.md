@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/b9a00889-8edf-4a76-a979-751cf1bcc89b" alt="NanoResearch Logo" width="500"/>
+  <img src="https://github.com/user-attachments/assets/dc05697b-c256-4d9e-be7b-18591963bc46" alt="NanoResearch Logo" width="500"/>
 
 # NanoResearch
 
