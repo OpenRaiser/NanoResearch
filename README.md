@@ -104,7 +104,7 @@ A typical NanoResearch run produces a clean, inspectable workspace containing:
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="figures/showcase-framework.png" alt="Framework figure example" width="95%" />
+      <img src="https://github.com/user-attachments/assets/107daa4a-775e-4168-a12a-128b4680141b" alt="Framework figure example" width="95%" />
       <br />
       <sub><b>Framework</b></sub>
     </td>
