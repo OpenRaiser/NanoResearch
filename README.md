@@ -343,6 +343,67 @@ For the full command surface, use:
 nanoresearch --help
 ```
 
+## Feishu Bot Integration
+
+NanoResearch includes a Feishu (Lark) bot that lets you trigger the full pipeline, check status, and receive results directly in Feishu chat — no terminal needed.
+
+### Prerequisites
+
+```bash
+pip install lark-oapi
+```
+
+### Configure Credentials
+
+Create a Feishu custom app at [open.feishu.cn](https://open.feishu.cn) and obtain the App ID and App Secret. Then configure via **environment variables**:
+
+```bash
+export FEISHU_APP_ID="cli_xxx"
+export FEISHU_APP_SECRET="xxx"
+```
+
+Or add to `~/.nanobot/config.json`:
+
+```json
+{
+  "feishu": {
+    "app_id": "cli_xxx",
+    "app_secret": "xxx"
+  }
+}
+```
+
+### Launch
+
+```bash
+nanoresearch feishu          # start the bot
+nanoresearch feishu -v       # verbose logging
+```
+
+The bot connects via WebSocket long-connection (no public server or webhook URL required). Press `Ctrl+C` to stop.
+
+### Supported Commands
+
+| Command | Description |
+|---------|-------------|
+| `/run <topic>` | Start a research pipeline for the given topic |
+| `/status` | Check the current running task's progress |
+| `/list` | List all historical research sessions |
+| `/stop` | Stop the currently running pipeline |
+| `/export` | Re-export the most recent completed research |
+| `/new` | Clear conversation memory, start fresh |
+| `/help` | Show help message |
+
+### Natural Language Mode
+
+You can also chat naturally — the bot acts as an AI research assistant:
+
+- **Ask research questions**: "What are the latest advances in multi-modal learning?"
+- **Request a paper**: "Help me write a paper on adaptive sparse attention" — the bot will guide you through 5 quick questions (topic, paper type, data scenario, innovation preference, goal) then automatically launch the pipeline.
+- **Memory**: The bot remembers context across messages within a conversation. Use `/new` to reset.
+
+When the pipeline finishes, the bot automatically sends the compiled `paper.pdf` to the chat.
+
 ## Output structure
 
 A typical exported output looks like this:
