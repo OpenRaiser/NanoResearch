@@ -243,17 +243,17 @@ Create `~/.nanobot/config.json`. **You must replace `base_url` and `api_key` wit
     "max_retries": 2,
     "auto_create_env": true,
     "auto_download_resources": true,
-    "ideation":      { "model": "your-model", "temperature": 0.5, "max_tokens": 16384, "timeout": 600.0 },
-    "planning":      { "model": "your-model", "temperature": 0.2, "max_tokens": 16384, "timeout": 600.0 },
-    "code_gen":      { "model": "your-model", "temperature": 0.1, "max_tokens": 16384, "timeout": 600.0 },
-    "writing":       { "model": "your-model", "temperature": 0.4, "max_tokens": 16384, "timeout": 600.0 },
+    "ideation": { "model": "your-model", "temperature": 0.5, "max_tokens": 16384, "timeout": 600.0 },
+    "planning": { "model": "your-model", "temperature": 0.2, "max_tokens": 16384, "timeout": 600.0 },
+    "code_gen": { "model": "your-model", "temperature": 0.1, "max_tokens": 16384, "timeout": 600.0 },
+    "writing": { "model": "your-model", "temperature": 0.4, "max_tokens": 16384, "timeout": 600.0 },
     "figure_gen": {
       "model": "gemini-3.1-flash-image-preview",
       "image_backend": "gemini",
       "temperature": null,
       "timeout": 300.0
     },
-    "review":        { "model": "your-model", "temperature": 0.3, "max_tokens": 16384, "timeout": 300.0 }
+    "review": { "model": "your-model", "temperature": 0.3, "max_tokens": 16384, "timeout": 300.0 }
   }
 }
 ```
