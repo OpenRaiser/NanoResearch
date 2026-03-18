@@ -61,6 +61,7 @@ NanoResearch 是一个端到端的自主科研系统。与传统的"AI 写论文
 - [Pipeline](#pipeline)
 - [Key Capabilities](#key-capabilities)
 - [Quick Start](#quick-start)
+- [Claude Code 集成模式](#claude-code-集成模式)
 - [Execution Profiles](#execution-profiles)
 - [CLI Commands](#cli-commands)
 - [Output Structure](#output-structure)
@@ -298,6 +299,68 @@ nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --ver
 nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
 ```
 
+## Claude Code 集成模式
+
+除了 Python CLI，NanoResearch 还支持通过 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** 直接驱动研究流水线——**无需配置任何 API Key**。
+
+### 工作原理
+
+在 Claude Code 集成模式下，Claude Code 本身就是研究引擎：
+
+- **WebSearch** 替代外部 API 进行文献检索（arXiv、Semantic Scholar、Google Scholar）
+- **Bash** 执行实验代码、提交 SLURM 作业、编译 LaTeX
+- **文件读写** 生成实验代码、论文和结构化产物
+
+### Quick Start
+
+```bash
+# 1. Clone 项目
+git clone https://github.com/OpenRaiser/NanoResearch.git
+cd NanoResearch
+
+# 2. 启动 Claude Code（确保已安装 claude CLI）
+claude
+
+# 3. 在 Claude Code 中运行完整流水线
+/project:research "Your Research Topic Here"
+```
+
+### Available Commands
+
+| Command | 功能 |
+|---------|------|
+| `/project:research <topic>` | 运行完整 9 阶段流水线 |
+| `/project:ideation <topic>` | Stage 1: 文献检索 + 假说生成 |
+| `/project:planning` | Stage 2: 实验方案设计 |
+| `/project:experiment` | Stages 3-5: 环境准备 + 代码生成 + 实验执行 |
+| `/project:analysis` | Stage 6: 实验结果分析 |
+| `/project:writing` | Stages 7-8: 图表生成 + 论文撰写 |
+| `/project:review` | Stage 9: 多视角审稿 + 修订 |
+| `/project:status` | 查看当前流水线状态 |
+| `/project:resume` | 从断点恢复流水线 |
+
+### Example Workflow
+
+```bash
+# 启动一个完整的研究项目
+/project:research "Dropout Regularization Comparison on Tabular Data"
+
+# 查看当前进度
+/project:status
+
+# 如果中途失败，从断点恢复
+/project:resume
+```
+
+### Tips
+
+- **架构图生成**：推荐使用 Nano Banana 系列图像模型生成高质量架构图。Claude Code 模式下可在 `figure_gen` 阶段通过 Bash 调用图像生成 API。
+- **LaTeX 编译**：推荐使用 `tectonic` 替代 `pdflatex`。Conda 安装的 texlive 可能缺少 `pdflatex.fmt`，导致编译失败。安装 tectonic：`conda install -c conda-forge tectonic`。
+- **断点续跑**：所有阶段的产物保存在 `manifest.json` 中，支持任意阶段恢复。
+- **与 Python CLI 兼容**：Claude Code 模式生成的工作空间与 Python CLI 完全兼容，可混合使用两种模式。
+
+---
+
 ## Execution Profiles
 
 | Profile | 说明 |
@@ -495,6 +558,8 @@ nanoresearch feishu -v       # 详细日志模式
 - **OpenAI 兼容 API 端点**（用于文本模型阶段）
 - 可选：图像模型访问权限（用于部分配图）
 - `tectonic` 或 `pdflatex`（用于 PDF 编译）
+
+> **推荐使用 `tectonic`**：Conda 安装的 texlive 可能缺少 `pdflatex.fmt`，导致编译失败且修复困难。`tectonic` 会自动下载所需的 TeX 包，无需额外配置。
 
 ```bash
 conda install -c conda-forge tectonic

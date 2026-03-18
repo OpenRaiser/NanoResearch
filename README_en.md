@@ -40,6 +40,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [Key capabilities](#key-capabilities)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
+- [Claude Code integration](#claude-code-integration)
 - [Execution profiles](#execution-profiles)
 - [Common CLI commands](#common-cli-commands)
 - [Output structure](#output-structure)
@@ -346,6 +347,68 @@ nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --ver
 nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
 ```
 
+## Claude Code integration
+
+In addition to the Python CLI, NanoResearch can be driven directly through **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — **no API keys required**.
+
+### How it works
+
+In Claude Code integration mode, Claude Code itself is the research engine:
+
+- **WebSearch** replaces external APIs for literature retrieval (arXiv, Semantic Scholar, Google Scholar)
+- **Bash** runs experiment code, submits SLURM jobs, and compiles LaTeX
+- **File read/write** generates experiment code, papers, and structured artifacts
+
+### Quick start
+
+```bash
+# 1. Clone the project
+git clone https://github.com/OpenRaiser/NanoResearch.git
+cd NanoResearch
+
+# 2. Launch Claude Code (make sure the claude CLI is installed)
+claude
+
+# 3. Run the full pipeline inside Claude Code
+/project:research "Your Research Topic Here"
+```
+
+### Available commands
+
+| Command | Description |
+|---------|-------------|
+| `/project:research <topic>` | Run the full 9-stage pipeline |
+| `/project:ideation <topic>` | Stage 1: Literature search + hypothesis generation |
+| `/project:planning` | Stage 2: Experiment blueprint design |
+| `/project:experiment` | Stages 3-5: Setup + code generation + execution |
+| `/project:analysis` | Stage 6: Results analysis |
+| `/project:writing` | Stages 7-8: Figure generation + paper writing |
+| `/project:review` | Stage 9: Multi-perspective review + revision |
+| `/project:status` | Show current pipeline status |
+| `/project:resume` | Resume pipeline from last checkpoint |
+
+### Example workflow
+
+```bash
+# Start a complete research project
+/project:research "Dropout Regularization Comparison on Tabular Data"
+
+# Check current progress
+/project:status
+
+# If a stage fails, resume from checkpoint
+/project:resume
+```
+
+### Tips
+
+- **Architecture diagrams**: We recommend using the Nano Banana series of image models for high-quality architecture diagrams. In Claude Code mode, the `figure_gen` stage can call image generation APIs via Bash.
+- **LaTeX compilation**: Use `tectonic` instead of `pdflatex`. Conda's texlive installation may be missing `pdflatex.fmt`, causing compilation failures. Install with: `conda install -c conda-forge tectonic`.
+- **Checkpoint & resume**: All stage artifacts are tracked in `manifest.json`, enabling resume from any stage.
+- **Compatible with Python CLI**: Workspaces created in Claude Code mode are fully compatible with the Python CLI, and vice versa.
+
+---
+
 ## Execution profiles
 
 The unified pipeline supports three high-level execution profiles:
@@ -533,6 +596,8 @@ nanoresearch/
 - An **OpenAI-compatible API endpoint** for text-model stages
 - Optional image-model access for some figure-generation setups
 - `tectonic` or `pdflatex` for PDF compilation
+
+> **`tectonic` is recommended**: Conda's texlive installation may be missing `pdflatex.fmt`, causing compilation failures that are hard to fix. `tectonic` automatically downloads required TeX packages with no additional setup.
 
 Recommended LaTeX toolchain:
 
