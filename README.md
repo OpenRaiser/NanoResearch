@@ -52,6 +52,14 @@ NanoResearch 是一个端到端的自主科研系统。与传统的"AI 写论文
 
 ---
 
+<div align="center">
+  <img src="imgs/before_after.png" alt="Before and After NanoResearch" width="90%" />
+  <p><b>🦀 告别手动科研的痛苦循环</b></p>
+  <p>不再反复调试失败的实验、手动整理数据、从零写论文——<br/>NanoResearch 将完整科研流程自动化，让你专注于真正的研究创新。</p>
+</div>
+
+---
+
 ## Table of Contents
 
 - [Highlights](#highlights)
