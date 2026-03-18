@@ -40,7 +40,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [Key capabilities](#key-capabilities)
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
-- [Claude Code integration](#claude-code-integration)
+- [Claude Code Mode](#claude-code-mode)
 - [Execution profiles](#execution-profiles)
 - [Common CLI commands](#common-cli-commands)
 - [Output structure](#output-structure)
@@ -347,7 +347,7 @@ nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --ver
 nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
 ```
 
-## Claude Code integration
+## Claude Code Mode
 
 In addition to the Python CLI, NanoResearch can be driven directly through **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** — **no API keys required**.
 
