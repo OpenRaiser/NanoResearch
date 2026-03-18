@@ -569,6 +569,10 @@ conda install -c conda-forge tectonic
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — Claude Code 的科研技能扩展
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date)](https://star-history.com/#OpenRaiser/NanoResearch&Date)
+
 ## Citation
 
 ```bibtex

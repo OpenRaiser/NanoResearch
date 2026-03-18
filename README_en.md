@@ -637,6 +637,10 @@ Treat it as a strong draft, not a final submission. The system can generate a fu
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — scientific research skills for Claude Code
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date)](https://star-history.com/#OpenRaiser/NanoResearch&Date)
+
 ## Citation
 
 If NanoResearch helps your work, cite the repository:
