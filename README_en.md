@@ -31,7 +31,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 ---
 
 <div align="center">
-  <img src="imgs/before_after.png" alt="Before and After NanoResearch" width="90%" />
+  <img src="https://raw.githubusercontent.com/OpenRaiser/NanoResearch/main/imgs/before_after.png" alt="Before and After NanoResearch" width="90%" />
   <p><b>🦀 Break free from the manual research grind</b></p>
   <p>No more debugging failed experiments, wrangling data by hand, or writing papers from scratch —<br/>NanoResearch automates the full research workflow so you can focus on real innovation.</p>
 </div>
