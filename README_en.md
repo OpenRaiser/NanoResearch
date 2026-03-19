@@ -63,7 +63,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [License](#license)
 
 ## Overview
-
+ 
 NanoResearch is a unified research pipeline that automates the full paper-production workflow:
 
 - starts from a research topic
