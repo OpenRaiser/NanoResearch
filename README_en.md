@@ -649,8 +649,8 @@ Treat it as a strong draft, not a final submission. The system can generate a fu
 
 <a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
-    <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark&v=1" />
+    <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&v=1" />
   </picture>
 </a>
 
