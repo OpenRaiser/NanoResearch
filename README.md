@@ -579,15 +579,12 @@ conda install -c conda-forge tectonic
 
 ## Star History
 
-<details>
-  <summary><kbd>Star History</kbd></summary>
-  <a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
-      <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" />
-    </picture>
-  </a>
-</details>
+<a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
+    <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" />
+  </picture>
+</a>
 
 ## Citation
 
