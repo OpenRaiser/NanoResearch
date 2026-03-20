@@ -1,0 +1,45 @@
+name: horizontal_bar
+version: '1.0'
+description: Prompt template for horizontal_bar chart
+system_prompt: 'Create a HORIZONTAL BAR CHART (ideal for ablation studies or rankings).
+
+
+  LAYOUT:
+
+  - Sort bars by value (best on top or full model on top)
+
+  - Full model / proposed method: COLORS[0], no hatch
+
+  - Ablated variants: lighter/muted colors with hatch patterns
+
+  - Bar height ~0.6, edgecolor=''white'', linewidth=0.5
+
+
+  REFERENCE LINE:
+
+  - Add a vertical dashed line at the full model''s value (color=COLORS[0], alpha=0.5)
+
+  - This clearly shows the impact of each ablation
+
+
+  ANNOTATIONS:
+
+  - Value labels at the right end of each bar (fontsize=8)
+
+  - Best value: fontweight=''bold''
+
+  - Show delta from full model: e.g., ''(-2.3)'' in gray next to ablated bars
+
+
+  LABELS:
+
+  - Y-axis: component/variant names (clean, readable)
+
+  - X-axis: metric name with units
+
+  - Use descriptive variant names (e.g., ''w/o Attention Module'' not ''Ablation 3'')
+
+
+  Remove top+right spines, add subtle vertical grid.
+
+  No title inside figure.'

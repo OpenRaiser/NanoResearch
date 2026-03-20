@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment
+.env
+*.env
+
+# Pipeline outputs (kept in outputs/ for examples, but not tracked by default)
+outputs/
+
+# LaTeX intermediates
+*.aux
+*.bbl
+*.blg
+*.log
+*.xdv
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Archives
+*.zip
+
+# NeurIPS raw template (usable copy lives in nanoresearch/templates/)
+templates/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Pipeline workspaces (test runs)
+nanoresearch_*/
+
+# Smoke test runs & temp directories
+smoke_runs/
+.tmp_pytest*/
+.tmp_resume_*.py
+.tmp_run_*.py
+tmp*/
+.test_experiment_*/
+.runner_quote_check_*/
+.smoke_contract_check/
+.nanobot_home/
+
+# Temp scripts
+*.tmp
+
+# Archives
+*.tar
+*.tar.gz
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.bin
+
+# Large data
+*.csv
+*.tsv
+*.h5
+*.hdf5
+
+# Markdown docs (auto-generated, not part of source)
+EXPERIMENT_AUTOMATION_ROADMAP.md
+PROJECT_OVERVIEW_AND_FIX_BACKLOG.md

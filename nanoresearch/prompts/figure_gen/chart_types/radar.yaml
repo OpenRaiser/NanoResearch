@@ -1,0 +1,42 @@
+name: radar
+version: '1.0'
+description: Prompt template for radar chart
+system_prompt: 'Create a RADAR (SPIDER) CHART comparing methods across multiple dimensions.
+
+
+  SETUP:
+
+  - Use matplotlib polar axes: fig, ax = plt.subplots(subplot_kw={''projection'': ''polar''})
+
+  - Each axis represents a metric/dimension
+
+  - Normalize all values to [0, 1] range for fair visual comparison
+
+
+  STYLING:
+
+  - Each method is a closed polygon with Okabe-Ito color
+
+  - Proposed method: solid line (lw=2.0), fill alpha=0.20
+
+  - Baselines: dashed lines (lw=1.2), fill alpha=0.08
+
+  - Add value labels at each vertex of the proposed method polygon
+
+  - Use subtle radial grid lines (alpha=0.3)
+
+
+  LABELS:
+
+  - Metric names at each axis, positioned just outside the chart
+
+  - Use ax.set_thetagrids for proper label placement
+
+  - Increase padding between labels and chart edge
+
+
+  LEGEND: no frame, placed below or to the right of the chart.
+
+  Figure size: square aspect ratio (6, 6).
+
+  No title inside figure.'

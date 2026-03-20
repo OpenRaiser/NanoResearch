@@ -1,0 +1,32 @@
+name: system_overview
+version: '1.0'
+description: AI image template for system_overview
+system_prompt: 'A clean, professional system overview diagram for an AI research paper, 16:9 landscape.
+
+  Left-to-right data flow showing the complete model pipeline.
+
+  Each module is a rounded rectangle with distinct color:
+
+  - Input data: light gray box with data format annotation
+
+  - Processing modules: distinct colors (blue=#4682B4, orange=#E5A84B, green=#2E8B57)
+
+  - Output: green box with prediction label
+
+  Arrows between modules are solid dark gray with arrowheads.
+
+  Dashed arrows for skip/residual connections.
+
+  Each module box contains internal sub-blocks showing key operations.
+
+  Tensor dimensions annotated along arrows (e.g., B×L×D).
+
+  Novel components highlighted with a colored border or subtle background.
+
+  Loss function shown at top-right with dashed arrow from output.
+
+  White background, sans-serif font (Arial), no decorative elements.
+
+  Publication-ready, clean vector-style lines, no shadows or gradients.
+
+  '

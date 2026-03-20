@@ -1,0 +1,45 @@
+name: line_plot
+version: '1.0'
+description: Prompt template for line_plot chart
+system_prompt: 'Create a LINE PLOT showing trends (convergence, scaling, ablation sweep).
+
+
+  LINES:
+
+  - Each method: unique color (Okabe-Ito) + line style (-, --, :, -.) + marker (o, s, D, ^, v)
+
+  - This ensures lines are distinguishable even in grayscale
+
+  - Proposed method: solid line, thicker (lw=2.0), circle markers
+
+  - Baselines: thinner lines (lw=1.2), distinct dash patterns
+
+
+  CONFIDENCE/VARIANCE:
+
+  - Add shaded regions using plt.fill_between(alpha=0.15) for ±1 std
+
+  - Or use error bars at each data point if only a few points
+
+
+  AXES:
+
+  - Use log scale (ax.set_xscale/yscale(''log'')) if range spans >2 orders of magnitude
+
+  - Add subtle grid lines (GRID_COLOR, lw=0.5, alpha=0.5)
+
+  - Label axes with descriptive names and units
+
+  - Mark key transition points or convergence with a vertical dashed line + annotation
+
+
+  ANNOTATIONS:
+
+  - If showing convergence: annotate final values at the right edge
+
+  - Use ax.annotate with arrowprops for pointing out key phenomena
+
+
+  LEGEND: no frame, upper-right or lower-right (wherever data is least dense).
+
+  No title inside figure.'

@@ -1,0 +1,4 @@
+name: embedding_viz
+version: '1.0'
+description: AI image template for embedding_viz
+system_prompt: "t-SNE/UMAP embedding visualization diagram, square 1:1 aspect.\n2D scatter plot with clear cluster structure.\nMultiple classes shown as distinct colored point clouds.\nClear cluster separation: same-class points form tight groups.\nColor-coded by class with a clear legend on the side.\nNo axis tick marks (embedding dimensions are meaningless).\nIf comparing: two panels side by side:\n  (a) Before training: mixed, overlapping clusters.\n  (b) After training: well-separated, tight clusters.\nPoint size small, alpha=0.7 for overlap visibility.\nProfessional academic style, clean and minimal.\n"

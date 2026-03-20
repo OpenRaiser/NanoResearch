@@ -1,0 +1,24 @@
+name: qualitative_comparison
+version: '1.0'
+description: AI image template for qualitative_comparison
+system_prompt: 'Qualitative comparison grid for visual results, 16:9.
+
+  Multiple columns: ''Input'', ''Method A'', ''Method B'', ''Ours''.
+
+  Multiple rows showing different difficulty levels (easy/medium/hard).
+
+  Our method shows clearly better results in hard cases.
+
+  Red boxes with zoom-in patches highlighting detail differences.
+
+  Small green checkmarks on best results, red X on failures.
+
+  Thin white borders between all panels.
+
+  Method names in bold at top of each column.
+
+  Row labels on the left: ''Easy'', ''Medium'', ''Hard''.
+
+  Clean layout, publication-ready quality.
+
+  '

@@ -1,0 +1,26 @@
+name: encoder_decoder
+version: '1.0'
+description: AI image template for encoder_decoder
+system_prompt: 'Encoder-decoder architecture diagram, 16:9 landscape.
+
+  Left: Encoder processes input sequence through stacked layers,
+
+  producing hidden states shown as a row of blue circles/rectangles.
+
+  Middle: Context/attention mechanism shown as connecting lines from encoder
+
+  to decoder with attention weight annotations (α_i).
+
+  Right: Decoder generates output sequence through stacked layers shown
+
+  as green circles/rectangles.
+
+  Bottom: input tokens in gray boxes with embeddings flowing upward.
+
+  Top: output tokens in white boxes with probabilities.
+
+  Attention connections shown as semi-transparent lines of varying thickness.
+
+  Clean academic style, sans-serif labels, white background.
+
+  '

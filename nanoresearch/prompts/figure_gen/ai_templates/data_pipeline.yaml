@@ -1,0 +1,22 @@
+name: data_pipeline
+version: '1.0'
+description: AI image template for data_pipeline
+system_prompt: 'Data preprocessing pipeline diagram, 16:9, left-to-right flow.
+
+  4-5 stages as colored rounded rectangles:
+
+  Stage 1: ''Raw Data'' (gray) → Stage 2: ''Cleaning'' (blue) →
+
+  Stage 3: ''Processing'' (green) → Stage 4: ''Augmentation'' (orange) →
+
+  Stage 5: ''Final Dataset'' (dark blue).
+
+  Arrows between stages with small text labels describing operations.
+
+  Each stage has a small icon or sample data visualization inside.
+
+  Dataset statistics shown below: sample counts, class distribution.
+
+  Professional academic style, consistent sizing, white background.
+
+  '

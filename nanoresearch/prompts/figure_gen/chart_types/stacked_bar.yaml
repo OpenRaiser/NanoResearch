@@ -1,0 +1,4 @@
+name: stacked_bar
+version: '1.0'
+description: Prompt template for stacked_bar chart
+system_prompt: "Create a STACKED BAR CHART showing composition or component breakdown.\n\nSTYLING:\n- Each segment uses an Okabe-Ito color with edgecolor='white', linewidth=0.5\n- Add hatching patterns for grayscale accessibility\n- Label each segment with its percentage or value inside the bar (if space allows)\n  or use leader lines to annotations outside\n\nDATA:\n- Total value label on top of each stacked bar\n- If showing ablation: highlight the component being removed\n\nLEGEND:\n- No frame, placed below the figure or to the right\n- Order legend entries to match the stacking order (bottom to top)\n\nAXES: label y-axis with the total metric, x-axis with categories.\nRemove top+right spines.\nNo title inside figure."

@@ -1,0 +1,54 @@
+name: grouped_bar
+version: '1.0'
+description: Prompt template for grouped_bar chart
+system_prompt: 'Create a GROUPED BAR CHART comparing methods across metrics/datasets.
+
+
+  LAYOUT:
+
+  - Group bars by dataset or metric on x-axis, with each method as a separate bar
+
+  - Bar width ~0.12-0.15 per method; gap between groups ~0.3
+
+  - Use edgecolor=''white'', linewidth=0.5 for clean bar separation
+
+
+  DATA ANNOTATION:
+
+  - Add numeric value labels on top of each bar (fontsize=7-8)
+
+  - Best value in each group: fontweight=''bold'', slightly larger font
+
+  - If std available, add error bars (capsize=3, elinewidth=0.8). Do NOT use capthick.
+
+  - Use ''±'' notation in value labels when std is shown
+
+
+  AXES:
+
+  - Y-axis: start from a value ~3-5% below the minimum to magnify differences
+
+  - Add subtle horizontal grid lines (GRID_COLOR, lw=0.5, alpha=0.6, zorder=0)
+
+  - Y-axis label: metric name with units, e.g., ''Accuracy (%)''
+
+  - Remove top+right spines
+
+
+  LEGEND:
+
+  - No frame, placed at upper-left or outside above the plot
+
+  - If >5 methods, use ncol=N for horizontal layout
+
+  - Proposed method entry first in legend
+
+
+  HATCHING (for grayscale accessibility):
+
+  - Proposed method: solid fill (no hatch)
+
+  - Baselines: add different hatch patterns (''/'', ''\\'', ''x'', ''.'') at alpha=0.3
+
+
+  No title inside figure — caption handles it.'

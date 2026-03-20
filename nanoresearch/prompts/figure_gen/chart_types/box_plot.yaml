@@ -1,0 +1,43 @@
+name: box_plot
+version: '1.0'
+description: Prompt template for box_plot chart
+system_prompt: 'Create a BOX PLOT showing distribution of results across runs/datasets.
+
+
+  STYLING:
+
+  - Use Okabe-Ito palette, each method a distinct color
+
+  - Box: width=0.6, edgecolor=TEXT_COLOR, linewidth=0.8
+
+  - Median line: color=TEXT_COLOR, linewidth=1.5
+
+  - Mean marker: diamond (D), edgecolor=''black'', zorder=5
+
+  - Whiskers: extend to 1.5×IQR
+
+
+  DATA OVERLAY:
+
+  - If N < 30: add individual data points as jittered strip (alpha=0.5, size=3)
+
+  - Use sns.stripplot or manual jitter with np.random.normal
+
+
+  STATISTICAL ANNOTATIONS:
+
+  - Add significance brackets between key pairs with *, **, *** markers
+
+  - Annotate median/mean values above each box (fontsize=7)
+
+
+  AXES:
+
+  - Y-axis: metric name with units
+
+  - X-axis: method names (proposed method first or highlighted)
+
+  - Remove top+right spines, add subtle horizontal grid
+
+
+  No title inside figure.'

@@ -1,0 +1,387 @@
+"""Experiment agent — multi-phase code project generation with iterative improvement.
+
+Round 1 (initial):
+  Phase 1: Generate project plan (file list + interface contracts) via Codex.
+  Phase 2: Generate each file individually via Codex.
+  Preflight checks (fail-fast validation).
+  Phase 3: --dry-run execution.
+  Phase 4: --quick-eval for real experiment results.
+  Feedback analysis -> decide continue/stop.
+
+Round 2+ (iteration):
+  LLM generates hypothesis from feedback.
+  LLM modifies specific files (not full regeneration).
+  Preflight -> dry-run -> quick-eval -> feedback analysis -> continue/stop.
+
+Returns the best round's results.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import math
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+from nanoresearch.agents.base import BaseResearchAgent, _fix_json_escapes, _repair_truncated_json
+from nanoresearch.agents.cluster_executor import ClusterExecutor
+from nanoresearch.agents.experiment_tools import build_experiment_tools
+from nanoresearch.agents.feedback_analyzer import FeedbackAnalyzer
+from nanoresearch.agents.preflight import PreflightChecker
+from nanoresearch.agents.project_runner import RUNNER_SCRIPT_NAME, ensure_project_runner
+from nanoresearch.agents.repair_journal import (
+    append_snapshot_journal,
+    capture_repair_snapshot,
+    rollback_snapshot,
+)
+from nanoresearch.agents.runtime_env import RuntimeEnvironmentManager
+from nanoresearch.schemas.iteration import (
+    ExperimentHypothesis,
+    FeedbackAnalysis,
+    IterationState,
+    RoundResult,
+)
+from nanoresearch.schemas.manifest import PipelineStage
+
+logger = logging.getLogger(__name__)
+
+# Configurable limits
+MAX_REFERENCE_REPOS = 3
+MAX_FILE_TREE_ENTRIES = 30
+MAX_README_EXCERPT_LENGTH = 500
+
+# Subprocess / output limits
+DRY_RUN_TIMEOUT_SECONDS = 1800  # 30 min
+SUBPROCESS_OUTPUT_LIMIT = 5000
+LLM_CONTEXT_TRUNCATION = 4000
+STDERR_SNIPPET_LIMIT = 2000
+
+
+def _decode_bytes(data: bytes | str, limit: int = 0) -> str:
+    """Decode subprocess output bytes to str safely on Windows (GBK fallback)."""
+    if isinstance(data, str):
+        return data[:limit] if limit else data
+    try:
+        text = data.decode("utf-8", errors="replace")
+    except Exception:
+        text = data.decode("latin-1", errors="replace")
+    return text[:limit] if limit else text
+
+
+from nanoresearch.prompts import load_prompt as _load_prompt
+
+PROJECT_PLAN_SYSTEM_PROMPT = _load_prompt("experiment", "project_plan")
+
+FILE_GEN_SYSTEM_PROMPT = _load_prompt("experiment", "file_gen")
+
+
+def _is_finite(value: Any) -> bool:
+    """Check if a numeric value is a finite real number."""
+    if isinstance(value, (int, float)):
+        return math.isfinite(value)
+    return False
+
+
+def _all_metrics_finite(metrics: list) -> bool:
+    """Check that all metric values in a list are finite numbers."""
+    if not isinstance(metrics, list):
+        return False
+    has_valid = False
+    for m in metrics:
+        if not isinstance(m, dict):
+            continue
+        val = m.get("value")
+        if val is not None:
+            if _is_finite(val):
+                has_valid = True
+            else:
+                m["value"] = None
+    return has_valid
+
+
+def _training_entry_finite(entry: dict) -> bool:
+    """Check that numeric fields in a training log entry are finite."""
+    has_finite = False
+    for key in ("train_loss", "val_loss"):
+        val = entry.get(key)
+        if val is not None:
+            if _is_finite(val):
+                has_finite = True
+            else:
+                entry[key] = None
+    metrics = entry.get("metrics", {})
+    if not isinstance(metrics, dict):
+        return False
+    for mk, mv in list(metrics.items()):
+        if mv is not None and not _is_finite(mv):
+            metrics[mk] = None
+        elif isinstance(mv, (int, float)):
+            has_finite = True
+    return has_finite
+
+
+_METRIC_NAME_HINTS = frozenset({
+    "acc", "loss", "err", "f1", "prec", "recall", "auc", "mse", "mae",
+    "rmse", "bleu", "rouge", "cer", "wer", "perp", "fid", "score",
+    "iou", "map", "ndcg", "psnr", "ssim", "dice", "top1", "top5",
+})
+
+
+def _has_metric_name_hint(metric_list: list[dict]) -> bool:
+    """Check if any extracted metric name matches a common metric substring."""
+    for entry in metric_list:
+        name = str(entry.get("metric_name", "")).lower().replace("-", "_")
+        if any(hint in name for hint in _METRIC_NAME_HINTS):
+            return True
+    return False
+
+
+def _metric_entries_from_mapping(mapping: dict, *, num_runs: int | None = None) -> list[dict[str, Any]]:
+    """Extract summary metric entries from a flat/nested metrics mapping."""
+    metric_list: list[dict[str, Any]] = []
+    for mname, mval in mapping.items():
+        if any(str(mname).startswith(prefix) for prefix in ("per_class", "confusion_matrix", "qualitative")):
+            continue
+        if str(mname) in {
+            "run_seed", "num_runs", "num_samples", "variant", "training_time_sec",
+            "parameter_count", "FLOPs_M", "best_val_accuracy", "inference_time_ms",
+            "epoch", "step", "dataset", "method_name", "model_name", "name",
+        }:
+            continue
+
+        if isinstance(mval, dict) and "mean" in mval and _is_finite(mval.get("mean")):
+            entry = {
+                "metric_name": str(mname),
+                "value": mval["mean"],
+                "std": mval.get("std", 0.0),
+            }
+            if num_runs is not None:
+                entry["num_runs"] = num_runs
+            metric_list.append(entry)
+        elif _is_finite(mval):
+            entry = {
+                "metric_name": str(mname),
+                "value": mval,
+            }
+            if num_runs is not None:
+                entry["num_runs"] = num_runs
+            metric_list.append(entry)
+    return metric_list
+
+
+
+from .react_mode import _ReactModeMixin
+from .iteration import _IterationMixin
+from .quick_eval import _QuickEvalMixin
+from .code_runner import _CodeRunnerMixin
+from .code_gen import _CodeGenMixin
+from .experiment_agent import _ExperimentAgentMixin
+
+
+class ExperimentAgent(
+    _ExperimentAgentMixin,
+    _ReactModeMixin,
+    _IterationMixin,
+    _QuickEvalMixin,
+    _CodeRunnerMixin,
+    _CodeGenMixin,
+    BaseResearchAgent,
+):
+    stage = PipelineStage.EXPERIMENT
+
+    @staticmethod
+    def _strip_json_fence(raw: str) -> str:
+        text = str(raw or "").strip()
+        if text.startswith("```"):
+            lines = text.split("\n")[1:]
+            if lines and lines[-1].strip().startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines)
+        return text
+
+    @staticmethod
+    def _json_parse_candidates(text: str) -> list[str]:
+        stripped = str(text or "").strip()
+        if not stripped:
+            return [""]
+        candidates = [stripped]
+        bracket_positions = [
+            index for index in (stripped.find("{"), stripped.find("[")) if index >= 0
+        ]
+        if bracket_positions:
+            first_json_index = min(bracket_positions)
+            if first_json_index > 0:
+                candidates.append(stripped[first_json_index:])
+        return candidates
+
+    @staticmethod
+    def _decode_json_value(text: str, *, strict: bool) -> Any:
+        decoder = json.JSONDecoder(strict=strict)
+        value, _end = decoder.raw_decode(text.lstrip())
+        return value
+
+    @classmethod
+    def _parse_llm_json_payload(cls, raw: str) -> Any:
+        text = cls._strip_json_fence(raw)
+        last_error: json.JSONDecodeError | None = None
+        for candidate in cls._json_parse_candidates(text):
+            try:
+                return cls._decode_json_value(candidate, strict=True)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        fixed = _fix_json_escapes(text)
+        for candidate in cls._json_parse_candidates(fixed):
+            try:
+                return cls._decode_json_value(candidate, strict=False)
+            except json.JSONDecodeError as exc:
+                last_error = exc
+        repaired = _repair_truncated_json(fixed)
+        if repaired is not None:
+            for candidate in cls._json_parse_candidates(repaired):
+                try:
+                    return cls._decode_json_value(candidate, strict=False)
+                except json.JSONDecodeError as exc:
+                    last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise json.JSONDecodeError("Invalid JSON payload", text, 0)
+
+    @staticmethod
+    def _line_range_to_offsets(lines: list[str], start: int, end: int) -> tuple[int, int]:
+        start_offset = sum(len(line) for line in lines[:start])
+        end_offset = sum(len(line) for line in lines[:end])
+        return start_offset, end_offset
+
+    @classmethod
+    def _find_rstrip_line_span(cls, content: str, old: str) -> tuple[int, int] | None:
+        old_lines = old.splitlines()
+        if not old_lines:
+            return None
+        content_lines = content.splitlines(keepends=True)
+        if len(old_lines) > len(content_lines):
+            return None
+        for start in range(len(content_lines) - len(old_lines) + 1):
+            if all(
+                content_lines[start + index].rstrip() == old_lines[index].rstrip()
+                for index in range(len(old_lines))
+            ):
+                return cls._line_range_to_offsets(content_lines, start, start + len(old_lines))
+        return None
+
+    @classmethod
+    def _find_anchor_span(
+        cls, content: str, old: str, *, max_extra_lines: int = 8,
+    ) -> tuple[int, int] | None:
+        old_lines = [line.strip() for line in old.splitlines() if line.strip()]
+        if len(old_lines) < 2:
+            return None
+        first_line = old_lines[0]
+        last_line = old_lines[-1]
+        content_lines = content.splitlines(keepends=True)
+        if not content_lines:
+            return None
+        for start in range(len(content_lines)):
+            if first_line not in content_lines[start].strip():
+                continue
+            min_end = start + max(1, len(old_lines) - 1)
+            max_end = min(len(content_lines), start + len(old_lines) + max_extra_lines)
+            for end in range(min_end, max_end):
+                if last_line and last_line in content_lines[end - 1].strip():
+                    return cls._line_range_to_offsets(content_lines, start, end)
+        return None
+
+    @classmethod
+    def _find_definition_block_span(cls, content: str, old: str) -> tuple[int, int] | None:
+        first_nonempty = next((line.strip() for line in old.splitlines() if line.strip()), "")
+        if not first_nonempty:
+            return None
+        signature_match = re.match(r"^(async\s+def|def|class)\s+([A-Za-z_]\w*)\b", first_nonempty)
+        if not signature_match:
+            return None
+        keyword = signature_match.group(1)
+        name = signature_match.group(2)
+        content_lines = content.splitlines(keepends=True)
+        definition_pattern = re.compile(r"^(async\s+def|def|class)\s+([A-Za-z_]\w*)\b")
+        for start, line in enumerate(content_lines):
+            stripped = line.strip()
+            match = definition_pattern.match(stripped)
+            if not match:
+                continue
+            if match.group(1) != keyword or match.group(2) != name:
+                continue
+            indent = len(line) - len(line.lstrip())
+            end = start + 1
+            while end < len(content_lines):
+                next_line = content_lines[end]
+                next_stripped = next_line.strip()
+                if not next_stripped:
+                    end += 1
+                    continue
+                next_indent = len(next_line) - len(next_line.lstrip())
+                if next_indent <= indent:
+                    if definition_pattern.match(next_stripped):
+                        break
+                    if next_stripped.startswith("@"):
+                        lookahead = end + 1
+                        while lookahead < len(content_lines) and not content_lines[lookahead].strip():
+                            lookahead += 1
+                        if lookahead < len(content_lines):
+                            decorated = content_lines[lookahead].strip()
+                            decorated_match = definition_pattern.match(decorated)
+                            if decorated_match and (
+                                len(content_lines[lookahead]) - len(content_lines[lookahead].lstrip())
+                            ) <= indent:
+                                break
+                end += 1
+            return cls._line_range_to_offsets(content_lines, start, end)
+        return None
+
+    @classmethod
+    def _apply_search_replace_edit(
+        cls, content: str, old: str, new: str,
+    ) -> tuple[str, bool, str]:
+        if not old:
+            return content, False, ""
+        if old in content:
+            return content.replace(old, new, 1), True, "exact"
+        rstrip_span = cls._find_rstrip_line_span(content, old)
+        if rstrip_span is not None:
+            start, end = rstrip_span
+            return content[:start] + new + content[end:], True, "rstrip_lines"
+        if "\n" not in old.strip():
+            old_line = old.strip()
+            content_lines = content.splitlines(keepends=True)
+            for index, line in enumerate(content_lines):
+                if line.strip() != old_line:
+                    continue
+                indent = len(line) - len(line.lstrip())
+                replacement_lines = new.strip().split("\n")
+                replacement = "\n".join(
+                    (" " * indent + item.strip()) if item.strip() else ""
+                    for item in replacement_lines
+                )
+                if line.endswith("\n") and not replacement.endswith("\n"):
+                    replacement += "\n"
+                start, end = cls._line_range_to_offsets(content_lines, index, index + 1)
+                return content[:start] + replacement + content[end:], True, "single_line_stripped"
+        anchor_span = cls._find_anchor_span(content, old)
+        if anchor_span is not None:
+            start, end = anchor_span
+            return content[:start] + new + content[end:], True, "anchor_span"
+        definition_span = cls._find_definition_block_span(content, old)
+        if definition_span is not None:
+            start, end = definition_span
+            return content[:start] + new + content[end:], True, "definition_block"
+        return content, False, ""
+
+    # ------------------------------------------------------------------
+    # ReAct experiment mode -- prompt loaded from YAML
+    # ------------------------------------------------------------------
+
+    _REACT_SYSTEM_TEMPLATE = _load_prompt("experiment", "react_system")

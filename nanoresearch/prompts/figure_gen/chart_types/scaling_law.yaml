@@ -1,0 +1,45 @@
+name: scaling_law
+version: '1.0'
+description: Prompt template for scaling_law chart
+system_prompt: 'Create a LOG-LOG SCALING LAW plot showing power-law relationships.
+
+
+  AXES:
+
+  - X-axis: compute/data/model-size on LOG scale (ax.set_xscale(''log''))
+
+  - Y-axis: loss/error on LOG scale (ax.set_yscale(''log''))
+
+  - Both axes should show clean powers of 10 as tick labels
+
+
+  LINES:
+
+  - Each scaling dimension as a distinct curve (color + marker + line style)
+
+  - Fitted power-law lines shown alongside actual data points
+
+  - Annotate slope: ''α = -0.076'' next to each fitted line using ax.annotate
+
+  - If showing compute-optimal frontier: dashed black line labeled ''Compute-optimal''
+
+
+  DATA POINTS:
+
+  - Use distinct markers at each measured point (circle, square, triangle)
+
+  - Fit a linear regression in log-log space for the power-law trend
+
+  - Show R² value for each fit
+
+
+  STYLING:
+
+  - Add subtle grid lines on both axes (GRID_COLOR, alpha=0.4)
+
+  - Use scientific notation for axis tick labels where appropriate
+
+  - Legend with fitted equation: ''L = C^α, α = ...'' for each curve
+
+
+  No title inside figure.'

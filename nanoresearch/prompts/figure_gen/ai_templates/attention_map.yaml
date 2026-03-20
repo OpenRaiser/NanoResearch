@@ -1,0 +1,4 @@
+name: attention_map
+version: '1.0'
+description: AI image template for attention_map
+system_prompt: "Attention visualization figure for a research paper.\nFor NLP: token-level attention heatmap matrix.\n  Rows = query tokens, columns = key tokens.\n  Cell color intensity: white (0.0) to dark blue (1.0).\n  Notable attention patterns highlighted.\nFor Vision: attention heatmap overlaid on input images.\n  Top row: 3-4 original input images.\n  Bottom row: corresponding attention maps (jet colormap, semi-transparent overlay).\n  Attention correctly focuses on semantically meaningful regions.\n  Each column labeled (a), (b), (c), (d).\nClean layout, thin borders between panels, professional academic style.\n"

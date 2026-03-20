@@ -1,0 +1,42 @@
+name: scatter
+version: '1.0'
+description: Prompt template for scatter chart
+system_prompt: 'Create a SCATTER PLOT showing relationships between two variables.
+
+
+  MARKERS:
+
+  - Different Okabe-Ito colors per method/category
+
+  - Different marker shapes per category (o, s, D, ^, v, P)
+
+  - edgecolor=''white'', linewidth=0.3 for depth effect
+
+  - alpha=0.75 for overlapping points
+
+  - marker size ~40-60 (s parameter in scatter)
+
+
+  ANALYSIS OVERLAYS:
+
+  - Add trend line (linear/polynomial fit) with R² annotation
+
+  - Or Pareto frontier if showing efficiency-vs-quality tradeoff
+
+  - Annotate key/outlier points with method names using ax.annotate
+
+  - Consider adding marginal distributions (sns.jointplot) if bivariate
+
+
+  AXES:
+
+  - Label with descriptive names and units
+
+  - Add subtle grid lines (GRID_COLOR)
+
+  - rasterized=True if >500 points for clean PDF export
+
+
+  LEGEND: no frame, placed away from data cluster.
+
+  No title inside figure.'
