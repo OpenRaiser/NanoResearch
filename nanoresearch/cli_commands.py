@@ -139,7 +139,7 @@ def delete(
 @app.command()
 def deep(
     topic: str = typer.Option(..., "--topic", "-t", help="Research topic"),
-    format: str = typer.Option("neurips2025", "--format", "-f", help="Paper format"),
+    format: str = typer.Option("neurips", "--format", "-f", help="Paper format"),
     config_path: Path = typer.Option(None, "--config", "-c", help="Path to config file"),
     profile: ExecutionProfile | None = typer.Option(
         None,

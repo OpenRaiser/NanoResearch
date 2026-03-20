@@ -221,7 +221,7 @@ pip install -e ".[dev]"
   "research": {
     "base_url": "https://your-openai-compatible-endpoint/v1/",
     "api_key": "your-api-key",
-    "template_format": "neurips2025",
+    "template_format": "neurips",
     "execution_profile": "local_quick",
     "writing_mode": "hybrid",
     "max_retries": 2,
@@ -292,7 +292,7 @@ nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
 ### 4) Run
 
 ```bash
-nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips2025 --verbose
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips --verbose
 ```
 
 ### 5) Resume
@@ -450,10 +450,9 @@ NanoResearch 通过统一配置层将不同阶段路由到不同模型，让你�
 - `arxiv`
 - `icml`
 - `neurips`
-- `neurips2025`
 
 ```bash
-nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2025
+nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips
 ```
 
 ## Project Structure

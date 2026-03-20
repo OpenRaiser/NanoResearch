@@ -128,7 +128,7 @@ class ResearchConfig(BaseModel):
         )
     )
     skip_stages: list[str] = Field(default_factory=list)
-    template_format: str = "neurips2025"
+    template_format: str = "neurips"
     max_retries: int = 2
     quick_eval_timeout: int = 3600  # seconds for quick-eval execution (60 min — includes dataset download)
     execution_profile: ExecutionProfile = ExecutionProfile.LOCAL_QUICK

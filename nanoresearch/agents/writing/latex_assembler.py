@@ -112,7 +112,7 @@ class _LaTeXAssemblerMixin(
         self,
         tex_path,
         max_fix_attempts: int = MAX_LATEX_FIX_ATTEMPTS,
-        template_format: str = "neurips2025",
+        template_format: str = "neurips",
     ) -> dict:
         """Compile LaTeX to PDF with automatic error-fix loop.
 

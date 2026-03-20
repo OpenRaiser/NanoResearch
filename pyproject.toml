@@ -21,6 +21,7 @@ dependencies = [
     "Pillow>=10.0.0",
     "PyMuPDF>=1.25.0",
     "seaborn>=0.12.0",
+    "pyyaml>=6.0",
 ]
 
 [project.optional-dependencies]

@@ -247,7 +247,7 @@ Create `~/.nanobot/config.json`. **You must replace `base_url` and `api_key` wit
   "research": {
     "base_url": "https://your-openai-compatible-endpoint/v1/",
     "api_key": "your-api-key",
-    "template_format": "neurips2025",
+    "template_format": "neurips",
     "execution_profile": "local_quick",
     "writing_mode": "hybrid",
     "max_retries": 2,
@@ -340,7 +340,7 @@ nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
 ### 4) Run the full pipeline
 
 ```bash
-nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips2025 --verbose
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips --verbose
 ```
 
 ### 5) Resume if a stage fails
@@ -565,12 +565,11 @@ Current built-in formats include:
 - `arxiv`
 - `icml`
 - `neurips`
-- `neurips2025`
 
 Example:
 
 ```bash
-nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2025
+nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips
 ```
 
 ## Project structure
