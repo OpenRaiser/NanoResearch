@@ -209,7 +209,7 @@ class BaseResearchAgent(ABC):
 
             tool_calls = getattr(msg, "tool_calls", None)
             if not tool_calls:
-                return msg.content or ""
+                return self._dispatcher._strip_think_blocks(msg.content or "")
 
             assistant_msg: dict[str, Any] = {
                 "role": "assistant",
@@ -296,8 +296,10 @@ class BaseResearchAgent(ABC):
         self.log(f"Exceeded {max_tool_rounds} tool rounds, forcing final answer")
         final_msg = await self._dispatcher.generate_with_tools(cfg, messages, tools=None)
         if hasattr(final_msg, 'tool_calls') and final_msg.tool_calls:
-            return final_msg.content or "Agent completed but produced no text summary."
-        return final_msg.content or ""
+            return self._dispatcher._strip_think_blocks(
+                final_msg.content or "Agent completed but produced no text summary."
+            )
+        return self._dispatcher._strip_think_blocks(final_msg.content or "")
 
     @abstractmethod
     async def run(self, **inputs: Any) -> dict[str, Any]:
