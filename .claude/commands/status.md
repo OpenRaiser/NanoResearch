@@ -4,7 +4,7 @@ Show the current status of a NanoResearch workspace.
 
 ## Instructions
 
-1. Find the most recent workspace under `~/.nanobot/workspace/research/`. If `$ARGUMENTS` is provided, treat it as a workspace path.
+1. Find the most recent workspace under `~/.nanoresearch/workspace/research/`. If `$ARGUMENTS` is provided, treat it as a workspace path.
 
 2. Read `manifest.json` from the workspace directory.
 

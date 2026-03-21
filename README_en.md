@@ -30,6 +30,14 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 
 ---
 
+<div align="center">
+  <img src="https://github.com/OpenRaiser/NanoResearch/releases/download/assets/before_after.png" alt="Before and After NanoResearch" width="90%" />
+  <p><b>🦀 Break free from the manual research grind</b></p>
+  <p>No more debugging failed experiments, wrangling data by hand, or writing papers from scratch —<br/>NanoResearch automates the full research workflow so you can focus on real innovation.</p>
+</div>
+
+---
+
 ## Table of contents
 
 - [Overview](#overview)
@@ -55,7 +63,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [License](#license)
 
 ## Overview
-
+ 
 NanoResearch is a unified research pipeline that automates the full paper-production workflow:
 
 - starts from a research topic
@@ -199,7 +207,7 @@ The `deep` command is kept as a compatibility alias, and the legacy standard orc
 Every run gets its own workspace under:
 
 ```text
-~/.nanobot/workspace/research/{session_id}
+~/.nanoresearch/workspace/research/{session_id}
 ```
 
 That workspace stores the manifest, stage artifacts, logs, generated code, paper drafts, and exported outputs.
@@ -232,14 +240,14 @@ pip install -e ".[dev]"
 
 ### 2) Configure
 
-Create `~/.nanobot/config.json`. **You must replace `base_url` and `api_key` with your own OpenAI-compatible API endpoint**, and choose models available on your endpoint for each stage:
+Create `~/.nanoresearch/config.json`. **You must replace `base_url` and `api_key` with your own OpenAI-compatible API endpoint**, and choose models available on your endpoint for each stage:
 
 ```json
 {
   "research": {
     "base_url": "https://your-openai-compatible-endpoint/v1/",
     "api_key": "your-api-key",
-    "template_format": "neurips2025",
+    "template_format": "neurips",
     "execution_profile": "local_quick",
     "writing_mode": "hybrid",
     "max_retries": 2,
@@ -305,7 +313,7 @@ The IDEATION stage uses OpenAlex and Semantic Scholar to search academic papers.
 | [OpenAlex](https://developers.openalex.org/) | Free — get your key at [openalex.org/settings/api-key](https://openalex.org/settings/api-key) | `openalex_api_key` | `OPENALEX_API_KEY` |
 | [Semantic Scholar](https://www.semanticscholar.org/product/api#api-key) | Free — request at [semanticscholar.org](https://www.semanticscholar.org/product/api#api-key) | `s2_api_key` | `S2_API_KEY` |
 
-Add to `~/.nanobot/config.json`:
+Add to `~/.nanoresearch/config.json`:
 
 ```json
 {
@@ -332,19 +340,19 @@ nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
 ### 4) Run the full pipeline
 
 ```bash
-nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips2025 --verbose
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips --verbose
 ```
 
 ### 5) Resume if a stage fails
 
 ```bash
-nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --verbose
+nanoresearch resume --workspace ~/.nanoresearch/workspace/research/{session_id} --verbose
 ```
 
 ### 6) Export a clean output folder
 
 ```bash
-nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
+nanoresearch export --workspace ~/.nanoresearch/workspace/research/{session_id} --output ./my_paper
 ```
 
 ## Claude Code Mode
@@ -458,7 +466,7 @@ export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 ```
 
-Or add to `~/.nanobot/config.json`:
+Or add to `~/.nanoresearch/config.json`:
 
 ```json
 {
@@ -518,7 +526,7 @@ my_paper/
 A live workspace contains the full intermediate state as well:
 
 ```text
-~/.nanobot/workspace/research/{session_id}/
+~/.nanoresearch/workspace/research/{session_id}/
 ├── manifest.json
 ├── papers/
 ├── plans/
@@ -557,12 +565,11 @@ Current built-in formats include:
 - `arxiv`
 - `icml`
 - `neurips`
-- `neurips2025`
 
 Example:
 
 ```bash
-nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2025
+nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips
 ```
 
 ## Project structure
@@ -636,6 +643,16 @@ Treat it as a strong draft, not a final submission. The system can generate a fu
 ## Acknowledgements
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — scientific research skills for Claude Code
+- [nanobot](https://github.com/HKUDS/nanobot) — nanobot: The Ultra-Lightweight OpenClaw
+
+## Star History
+
+<a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark&v=1" />
+    <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&v=1" />
+  </picture>
+</a>
 
 ## Citation
 
@@ -650,6 +667,12 @@ If NanoResearch helps your work, cite the repository:
 }
 ```
 
-## License
+## 📄 License
 
-MIT
+This project is licensed under [MIT License](LICENSE).
+
+
+<p align="center">
+  <em> Thanks for visiting ✨ NanoResearch!</em><br><br>
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=OpenRaiser.NanoResearch&style=for-the-badge&color=00d4ff" alt="Views">
+</p>

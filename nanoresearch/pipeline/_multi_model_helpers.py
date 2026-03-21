@@ -80,7 +80,9 @@ class _MultiModelHelpersMixin:
                     raise RuntimeError(
                         f"LLM returned empty choices (model={config.model})"
                     )
-                content_img = response.choices[0].message.content or ""
+                content_img = self._strip_think_blocks(
+                    response.choices[0].message.content or ""
+                )
                 self._notify_usage(content_img, self._extract_usage(response),
                                    config.model, latency_img)
                 return content_img

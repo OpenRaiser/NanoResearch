@@ -34,7 +34,7 @@ from nanoresearch.pipeline._workspace_helpers import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
+_DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
 
 WORKSPACE_DIRS = ["papers", "plans", "drafts", "figures", "logs", "code"]
 

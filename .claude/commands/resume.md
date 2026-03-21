@@ -4,7 +4,7 @@ Resume a NanoResearch pipeline that was interrupted or failed.
 
 ## Input
 
-`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanobot/workspace/research/`.
+`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanoresearch/workspace/research/`.
 
 ## Schema Compatibility
 

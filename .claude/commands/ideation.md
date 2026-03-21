@@ -12,13 +12,13 @@ If no topic is provided, ask the user for one.
 
 1. If no active workspace exists, create one:
    ```
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/papers
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/plans
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/experiment
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/drafts
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/figures
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/logs
-   mkdir -p ~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/output
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/papers
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/plans
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/experiment
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/drafts
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/figures
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/logs
+   mkdir -p ~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}/output
    ```
    Where `topic_slug` is the topic lowercased, spaces replaced with underscores, truncated to 40 chars.
 

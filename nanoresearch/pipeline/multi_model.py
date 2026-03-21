@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from functools import partial
 from typing import Any
@@ -94,6 +95,13 @@ class ModelDispatcher(_MultiModelHelpersMixin):
             or model_name == "o3"
             or model_name.startswith("o3-")
         )
+
+    _THINK_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.DOTALL)
+
+    @classmethod
+    def _strip_think_blocks(cls, text: str) -> str:
+        """Remove ``<think>…</think>`` blocks emitted by reasoning models."""
+        return cls._THINK_RE.sub("", text).lstrip()
 
     @staticmethod
     def _normalize_messages_for_model(
@@ -256,7 +264,9 @@ class ModelDispatcher(_MultiModelHelpersMixin):
                     raise RuntimeError(
                         f"LLM returned empty choices (model={config.model})"
                     )
-                content = response.choices[0].message.content or ""
+                content = self._strip_think_blocks(
+                    response.choices[0].message.content or ""
+                )
                 usage = self._extract_usage(response)
                 result = LLMResult(
                     content=content, usage=usage,

@@ -73,7 +73,7 @@ class _FeishuBotCoreMixin:
         self._chat_model_config = StageModelConfig(
             model=self._config.ideation.model,
             temperature=0.3,
-            max_tokens=800,
+            max_tokens=8000,
             base_url=self._config.ideation.base_url,
             api_key=self._config.ideation.api_key,
         )

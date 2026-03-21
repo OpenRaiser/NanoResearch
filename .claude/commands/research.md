@@ -63,7 +63,7 @@ Multi-perspective review and revision:
 
 Create workspace at first stage:
 ```bash
-WORKSPACE=~/.nanobot/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}
+WORKSPACE=~/.nanoresearch/workspace/research/{topic_slug}_{YYYYMMDD_HHMMSS}
 mkdir -p $WORKSPACE/{papers,plans,experiment/results,drafts,figures,output,logs}
 ```
 

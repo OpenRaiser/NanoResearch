@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -416,7 +417,7 @@ def health_check(
         checks.append(("GPU", "[yellow]NONE[/yellow]", "nvidia-smi not found"))
 
     # 8. Disk usage
-    ws_root = Path.home() / ".nanobot" / "workspace" / "research"
+    ws_root = Path.home() / ".nanoresearch" / "workspace" / "research"
     if ws_root.is_dir():
         total_size = sum(f.stat().st_size for f in ws_root.rglob("*") if f.is_file())
         size_mb = total_size / (1024 * 1024)

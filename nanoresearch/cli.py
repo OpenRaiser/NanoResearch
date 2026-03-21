@@ -48,7 +48,7 @@ app = typer.Typer(
 )
 console = Console()
 
-_DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
+_DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
 
 
 def _version_callback(value: bool) -> None:
@@ -65,6 +65,18 @@ def main(
     ),
 ) -> None:
     """NanoResearch — AI-powered research paper generation pipeline."""
+    # Auto-create ~/.nanoresearch directory structure if it doesn't exist
+    _ensure_nanoresearch_home()
+
+
+def _ensure_nanoresearch_home() -> None:
+    """Create ~/.nanoresearch and its subdirectories if they don't exist."""
+    nanoresearch_home = Path.home() / ".nanoresearch"
+    subdirs = ["workspace/research", "chat_memory", "cache/models", "cache/data"]
+
+    nanoresearch_home.mkdir(parents=True, exist_ok=True)
+    for subdir in subdirs:
+        (nanoresearch_home / subdir).mkdir(parents=True, exist_ok=True)
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -91,7 +103,7 @@ def _load_config_safe(config_path: Path | None) -> ResearchConfig:
 
 def _propagate_api_keys(config_path: Path | None) -> None:
     """Read optional API keys from config.json and set as env vars."""
-    path = config_path or Path.home() / ".nanobot" / "config.json"
+    path = config_path or Path.home() / ".nanoresearch" / "config.json"
     if not path.is_file():
         return
     try:
