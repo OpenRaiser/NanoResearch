@@ -11,6 +11,146 @@ logger = logging.getLogger(__name__)
 
 MAX_PAPERS_FOR_CITATIONS = 50
 
+# Survey section prompts: maps section label -> writing instructions string.
+# Used by run() to look up instructions when dispatching based on paper_mode.
+SURVEY_SECTION_PROMPTS: dict[str, str] = {
+    "sec:intro": (
+        "Write 4-5 paragraphs:\n"
+        "(1) Opening: establish the importance and scope of the topic. "
+        "Cover the breath of work in this area and why it matters.\n"
+        "(2) Coverage: state the number of papers reviewed, the year range, "
+        "and the number of thematic clusters identified.\n"
+        "(3) Taxonomy brief: briefly preview the main categories of methods/approaches "
+        "covered in this survey.\n"
+        "(4) Contributions: state what this survey provides (e.g., systematic review, "
+        "unified taxonomy, comparative analysis, open challenges). Use a bullet list "
+        "with 2-3 \\item entries.\n"
+        "Use assertive language throughout. Cite key papers establishing importance."
+    ),
+    "sec:related": (
+        "Write 5-7 paragraphs organized by THEMATIC CLUSTERS.\n"
+        "For each cluster: summarize 3-5 representative papers, show the evolution of ideas, "
+        "and highlight the key differences between approaches.\n"
+        "Organize by theme (e.g., by architecture, by task, by training paradigm), "
+        "NOT chronologically.\n"
+        "IMPORTANT: Every \\cite{} or \\citet{} key MUST be from the provided CITATION KEYS list. "
+        "Do NOT invent citation keys.\n"
+        "MUST-CITE ENFORCEMENT: If the context includes a 'MUST-CITE PAPERS' section, "
+        "you MUST cite ALL of those papers in this section.\n"
+        "FAIRNESS: discuss the STRONGEST and most influential works, not just peripheral ones.\n"
+        "Use \\citet{key} when author is subject, \\citep{key} for parenthetical."
+    ),
+    "sec:taxonomy": (
+        "Write 6-8 paragraphs presenting a structured taxonomy of methods/approaches "
+        "in this area.\n"
+        "Structure:\n"
+        "(1) Overview: describe the organizing principles of the taxonomy and list "
+        "the top-level categories.\n"
+        "(2-5) One \\subsection{} per major category. For each:\n"
+        "  - Define the category and its distinguishing characteristics\n"
+        "  - List sub-categories or variants with representative works (cite them)\n"
+        "  - Explain the relationship between this category and others in the taxonomy\n"
+        "  - Note strengths and weaknesses of approaches in this category\n"
+        "(6) Comparative overview: a summary table or paragraph contrasting categories "
+        "on key dimensions (e.g., scalability, data efficiency, generalization).\n"
+        "Cite representative papers using \\citep{key}. Use the theme clusters from "
+        "the context as your organizing structure."
+    ),
+    "sec:method": (
+        "Write 6-8 paragraphs systematically analyzing the METHODOLOGICAL designs "
+        "across reviewed papers.\n"
+        "Structure:\n"
+        "(1) Overview: frame the problem formally and describe the space of solution designs.\n"
+        "(2-4) Detailed analysis of key technical components:\n"
+        "  - For each major component, compare how different categories implement it\n"
+        "  - Use numbered equations to illustrate key formulations where illuminating\n"
+        "  - Reference equations in text: 'as defined in Eq.~\\eqref{eq:xxx}'\n"
+        "  - Explain design trade-offs and why different schools of thought make different choices\n"
+        "(5) Training and optimization: compare training objectives, optimizers, and "
+        "regularization strategies across approaches.\n"
+        "(6) Complexity and efficiency: discuss computational costs, FLOPs, or inference "
+        "time comparisons where available.\n"
+        "Use \\begin{align} for multi-line equations (NEVER eqnarray).\n"
+        "Do NOT include \\begin{figure} blocks --- figures are inserted automatically."
+    ),
+    "sec:applications": (
+        "Write 5-6 paragraphs covering where and how these methods have been applied.\n"
+        "Structure:\n"
+        "(1) Overview: summarize the range of application domains and tasks addressed "
+        "by methods in this survey.\n"
+        "(2-3) Domain-specific analysis: for each major application domain, "
+        "discuss which methods have been applied, what datasets are used, "
+        "and what performance levels are achieved (cite original papers).\n"
+        "(4) Task taxonomy: classify the types of tasks addressed (e.g., classification, "
+        "generation, prediction, optimization) and which methodological categories "
+        "excel at each.\n"
+        "(5) Emerging applications: note newly emerging or underexplored application "
+        "areas identified across the literature.\n"
+        "IMPORTANT: Do NOT fabricate numbers. Only cite results that appear in the "
+        "provided evidence or citation data. Mark areas with insufficient data as 'limited "
+        "empirical evaluation' rather than citing vague performance claims."
+    ),
+    "sec:challenges": (
+        "Write 5-6 paragraphs analyzing the key challenges and open problems.\n"
+        "Structure:\n"
+        "(1) Overview: synthesize the main difficulties identified across the literature "
+        "into 3-5 high-level challenge categories.\n"
+        "(2-4) One \\subsection{} per major challenge category. For each:\n"
+        "  - Describe the challenge in technical terms\n"
+        "  - Show how different methods attempt to address it (and where they fall short)\n"
+        "  - Illustrate with specific examples from reviewed papers (cite them)\n"
+        "  - Discuss trade-offs between addressing this challenge and others\n"
+        "(5) Cross-cutting challenges: discuss challenges that span multiple categories "
+        "or application domains.\n"
+        "Draw directly from the key_challenges provided in the context. "
+        "Do NOT invent challenges not supported by the literature."
+    ),
+    "sec:systematic": (
+        "Write 6-8 paragraphs providing a deep critical analysis of trends, assumptions, "
+        "and methodological quality across the literature.\n"
+        "Structure:\n"
+        "(1) Overview: frame what this analysis covers and its goals.\n"
+        "(2) Trend analysis: identify 2-3 major evolutionary trends in methodology "
+        "(e.g., how problem formulation, model architecture, or evaluation practice "
+        "has changed over time).\n"
+        "(3) Evaluation practices: analyze how methods are evaluated across the literature "
+        "- are benchmarks consistent? Are metrics meaningful? Are comparisons fair?\n"
+        "  - Identify cases where evaluation is inconsistent or incomparable across papers\n"
+        "  - Note gaps in empirical coverage (e.g., methods only tested on small-scale data)\n"
+        "(4) Reproducibility: assess the reproducibility of reported results based on "
+        "methodological detail provided in original papers.\n"
+        "(5) Theoretical foundations: analyze the theoretical grounding of different "
+        "approaches — which are well-motivated vs. purely empirical?\n"
+        "(6) Synthesis: draw overall lessons about the state of the field.\n"
+        "Support claims with specific citations from the literature. Be critical but fair."
+    ),
+    "sec:future": (
+        "Write 4-5 paragraphs outlining promising future research directions.\n"
+        "Structure:\n"
+        "(1) Overview: frame future directions based on identified gaps and open challenges.\n"
+        "(2-3) Specific directions (one \\subsection{} per direction): for each direction\n"
+        "  - State the specific problem or opportunity\n"
+        "  - Explain why it is promising or necessary given current limitations\n"
+        "  - Connect it to specific trends or gaps identified in the Systematic Analysis\n"
+        "  - Mention relevant prior work that motivates this direction (cite it)\n"
+        "(4) High-impact opportunities: highlight 1-2 directions that could have "
+        "broad impact across multiple application areas.\n"
+        "Draw directly from the future_directions provided in the context. "
+        "Be concrete and specific — vague directions are not useful."
+    ),
+    "sec:conclusion": (
+        "Write 3-4 paragraphs:\n"
+        "(1) Summarize the overall landscape --- main themes, methodological trends, "
+        "and key findings from the survey.\n"
+        "(2) Open challenges: 3-4 concrete, specific research problems that remain unsolved "
+        "or underexplored (draw from the key_challenges in context).\n"
+        "(3) Future directions: 2-3 promising research trajectories based on the "
+        "identified gaps and future_directions from the literature.\n"
+        "(4) Closing: briefly position the survey's contribution to the field.\n"
+        "Do NOT introduce new results or citations here."
+    ),
+}
+
 from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
 from nanoresearch.agents.writing.latex_assembler import _strip_llm_thinking
 from nanoresearch.skill_prompts import get_writing_system_prompt, ABSTRACT_SYSTEM, TITLE_SYSTEM
