@@ -85,6 +85,11 @@ class PipelineOrchestrator(BaseOrchestrator):
             exp_out = accumulated.get("experiment_output", {})
             inputs["experiment_results"] = exp_out.get("experiment_results", {})
             inputs["experiment_status"] = exp_out.get("experiment_status", "pending")
+            # Pass survey blueprint if available (for survey paper figures)
+            try:
+                inputs["survey_blueprint"] = self.workspace.read_json("plans/survey_blueprint.json")
+            except FileNotFoundError:
+                inputs["survey_blueprint"] = {}
 
         elif stage == PipelineStage.WRITING:
             inputs["ideation_output"] = accumulated.get("ideation_output", {})

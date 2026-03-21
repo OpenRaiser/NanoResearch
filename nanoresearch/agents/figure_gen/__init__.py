@@ -47,48 +47,84 @@ class FigureAgent(
         ideation_output: dict = inputs.get("ideation_output", {})
         experiment_results: dict = inputs.get("experiment_results", {})
         experiment_status: str = inputs.get("experiment_status", "pending")
+        survey_blueprint: dict = inputs.get("survey_blueprint", {})
         # ANALYSIS no longer generates figures; FIGURE_GEN owns all 4 figures.
         existing_figures: dict = {}
-        self.log("Starting figure generation (dynamic planning + hybrid)")
+
+        # Detect survey mode: no experiment blueprint but survey_blueprint exists
+        is_survey = bool(survey_blueprint) and not blueprint
+        if is_survey:
+            self.log("Survey mode detected: using survey-specific figure planning")
+        else:
+            self.log("Starting figure generation (dynamic planning + hybrid)")
+
         if experiment_results:
             self.log(f"Using REAL experiment results (status: {experiment_status})")
         else:
             self.log(f"No real experiment results available (status: {experiment_status})")
 
-        method = blueprint.get("proposed_method") or {}
-        method_name = method.get("name", "Proposed Method")
-        components = ", ".join(method.get("key_components") or [])
-        baselines_list = blueprint.get("baselines") or []
-        baselines = ", ".join(b.get("name", "") for b in baselines_list)
-        metrics_list = blueprint.get("metrics") or []
-        metrics = ", ".join(m.get("name", "") for m in metrics_list)
-        ablation_groups = ", ".join(
-            a.get("group_name", "") for a in (blueprint.get("ablation_groups") or [])
-        )
-        primary_metric = next(
-            (m.get("name", "") for m in metrics_list if m.get("primary")),
-            metrics_list[0].get("name", "Score") if metrics_list else "Score",
-        )
-        datasets = ", ".join(d.get("name", "") for d in (blueprint.get("datasets") or []))
+        # Build context and plan figures based on mode
+        if is_survey:
+            # Survey context from ideation_output
+            theme_clusters = ideation_output.get("theme_clusters", [])
+            key_challenges = ideation_output.get("key_challenges", [])
+            future_directions = ideation_output.get("future_directions", [])
+            survey_size = survey_blueprint.get("survey_size", "standard")
 
-        context = (
-            f"Research title: {blueprint.get('title', '')}\n"
-            f"Method: {method_name}\n"
-            f"Components: {components}\n"
-            f"Datasets: {datasets}\n"
-            f"Baselines: {baselines}\n"
-            f"Metrics: {metrics}\n"
-            f"Ablation groups: {ablation_groups}\n"
-            f"Primary metric: {primary_metric}\n"
-        )
+            survey_context = (
+                f"Survey topic: {blueprint.get('title', 'Survey Paper')}\n"
+                f"Survey size: {survey_size}\n"
+                f"Theme clusters ({len(theme_clusters)}): {', '.join(theme_clusters[:10])}\n"
+                f"Key challenges ({len(key_challenges)}): {', '.join(key_challenges[:5])}\n"
+                f"Future directions ({len(future_directions)}): {', '.join(future_directions[:5])}\n"
+            )
+            evidence_block = self._build_evidence_block(
+                ideation_output, blueprint, experiment_results, experiment_status
+            )
+            # Plan survey figures
+            figure_plan = await self._plan_survey_figures(survey_context, evidence_block, survey_size)
+            context = survey_context
+            # Survey figure generation uses these with survey-specific defaults
+            method_name = "Surveyed Methods"
+            baselines = "N/A"
+            metrics = "Benchmark metrics"
+            ablation_groups = "N/A"
+            primary_metric = "Performance"
+        else:
+            method = blueprint.get("proposed_method") or {}
+            method_name = method.get("name", "Proposed Method")
+            components = ", ".join(method.get("key_components") or [])
+            baselines_list = blueprint.get("baselines") or []
+            baselines = ", ".join(b.get("name", "") for b in baselines_list)
+            metrics_list = blueprint.get("metrics") or []
+            metrics = ", ".join(m.get("name", "") for m in metrics_list)
+            ablation_groups = ", ".join(
+                a.get("group_name", "") for a in (blueprint.get("ablation_groups") or [])
+            )
+            primary_metric = next(
+                (m.get("name", "") for m in metrics_list if m.get("primary")),
+                metrics_list[0].get("name", "Score") if metrics_list else "Score",
+            )
+            datasets = ", ".join(d.get("name", "") for d in (blueprint.get("datasets") or []))
 
-        # Build evidence block for chart prompts
-        evidence_block = self._build_evidence_block(
-            ideation_output, blueprint, experiment_results, experiment_status
-        )
+            context = (
+                f"Research title: {blueprint.get('title', '')}\n"
+                f"Method: {method_name}\n"
+                f"Components: {components}\n"
+                f"Datasets: {datasets}\n"
+                f"Baselines: {baselines}\n"
+                f"Metrics: {metrics}\n"
+                f"Ablation groups: {ablation_groups}\n"
+                f"Primary metric: {primary_metric}\n"
+            )
 
-        # Step 1: LLM plans which figures to generate
-        figure_plan = await self._plan_figures(context, evidence_block)
+            # Build evidence block for chart prompts
+            evidence_block = self._build_evidence_block(
+                ideation_output, blueprint, experiment_results, experiment_status
+            )
+
+            # Step 1: LLM plans which figures to generate
+            figure_plan = await self._plan_figures(context, evidence_block)
         self.log(f"Figure plan: {len(figure_plan)} figures")
 
         figure_results = {}
@@ -295,6 +331,167 @@ class FigureAgent(
                 "caption": "Ablation study showing contribution of each component.",
             },
         ]
+
+    # -----------------------------------------------------------------------
+    # Survey figure planning
+    # -----------------------------------------------------------------------
+
+    async def _plan_survey_figures(
+        self, context: str, evidence_block: str, survey_size: str = "standard"
+    ) -> list[dict]:
+        """Ask LLM to plan which figures to generate for a survey paper."""
+        # Size-based figure count: short=2, standard=3, long=4
+        size_fig_counts = {"short": 2, "standard": 3, "long": 4}
+        target_figs = size_fig_counts.get(survey_size, 3)
+
+        prompt = (
+            f"Plan the figures for this survey paper.\n\n"
+            f"Survey context:\n{context}\n\n"
+            f"{evidence_block}\n\n"
+            f"INSTRUCTIONS:\n"
+            f"1. Identify the research domain (nlp/cv/llm/multimodal/general_ml)\n"
+            f"2. Select EXACTLY {target_figs} figures appropriate for a survey paper:\n"
+            f"   - One taxonomy/overview diagram (ai_image, ai_image_type='system_overview')\n"
+            f"   - One benchmark comparison chart (code_chart, e.g. grouped_bar or line)\n"
+            f"   - Additional figures as appropriate for the survey size\n"
+            f"3. For ai_image: use 'system_overview' or 'qualitative_comparison' types\n"
+            f"4. For code_chart: use meaningful chart types (grouped_bar, line, heatmap)\n"
+            f"5. Every code_chart must use a DIFFERENT chart_type — NO duplicates\n\n"
+            f"Return the figure plan as JSON with 'domain' and 'figures' fields."
+        )
+
+        try:
+            figure_prompt_config = self.config.for_stage("figure_prompt")
+            result = await self.generate_json(
+                FIGURE_PLAN_SYSTEM, prompt, stage_override=figure_prompt_config
+            )
+            figures = result.get("figures", [])
+            if not figures:
+                self.log("Survey figure plan returned empty, using default plan")
+                return self._default_survey_figure_plan(survey_size)
+            # Validate and normalize
+            validated = []
+            seen_chart_types: set[str] = set()
+            for fig in figures:
+                if "fig_key" not in fig:
+                    continue
+                fig.setdefault("fig_type", "ai_image")
+                fig.setdefault("chart_type", None)
+                fig.setdefault("caption", fig.get("description", ""))
+                if fig["fig_type"] == "ai_image":
+                    img_type = fig.get("ai_image_type", "system_overview")
+                    if img_type not in AI_FIGURE_TEMPLATES:
+                        fig["ai_image_type"] = "system_overview"
+                    fig["caption"] = _clean_ai_image_caption(
+                        fig["caption"], fig.get("title", ""),
+                    )
+                elif fig["fig_type"] == "code_chart":
+                    ct = fig.get("chart_type", "grouped_bar")
+                    if ct in seen_chart_types:
+                        logger.warning(
+                            "Duplicate chart_type %r in survey figure plan, skipping %s",
+                            ct, fig.get("fig_key"),
+                        )
+                        continue
+                    seen_chart_types.add(ct)
+                validated.append(fig)
+            if not validated:
+                return self._default_survey_figure_plan(survey_size)
+            return validated[:target_figs]
+        except Exception as e:
+            logger.warning("Survey figure planning failed: %s", e, exc_info=True)
+            self.log(f"Survey figure planning failed ({e}), using default plan")
+            return self._default_survey_figure_plan(survey_size)
+
+    def _default_survey_figure_plan(self, survey_size: str = "standard") -> list[dict]:
+        """Fallback figure plan for survey papers."""
+        # Size-based figures: short=2, standard=3, long=4
+        if survey_size == "short":
+            return [
+                {
+                    "fig_key": "fig1_taxonomy",
+                    "fig_type": "ai_image",
+                    "ai_image_type": "system_overview",
+                    "chart_type": None,
+                    "title": "Taxonomy of Methods",
+                    "description": "Taxonomy diagram showing the categorization of methods in the field.",
+                    "caption": "Taxonomy of surveyed methods organized by approach and methodology.",
+                },
+                {
+                    "fig_key": "fig2_benchmark",
+                    "fig_type": "code_chart",
+                    "chart_type": "grouped_bar",
+                    "title": "Benchmark Comparison",
+                    "description": "Comparison of methods on key benchmarks.",
+                    "caption": "Performance comparison of representative methods on standard benchmarks.",
+                },
+            ]
+        elif survey_size == "long":
+            return [
+                {
+                    "fig_key": "fig1_taxonomy",
+                    "fig_type": "ai_image",
+                    "ai_image_type": "system_overview",
+                    "chart_type": None,
+                    "title": "Taxonomy of Methods",
+                    "description": "Comprehensive taxonomy diagram showing the categorization of methods in the field.",
+                    "caption": "Taxonomy of surveyed methods organized by approach and methodology.",
+                },
+                {
+                    "fig_key": "fig2_benchmark",
+                    "fig_type": "code_chart",
+                    "chart_type": "grouped_bar",
+                    "title": "Benchmark Comparison",
+                    "description": "Comparison of methods on key benchmarks.",
+                    "caption": "Performance comparison of representative methods on standard benchmarks.",
+                },
+                {
+                    "fig_key": "fig3_evolution",
+                    "fig_type": "ai_image",
+                    "ai_image_type": "qualitative_comparison",
+                    "chart_type": None,
+                    "title": "Field Evolution",
+                    "description": "Timeline showing how the field evolved over time.",
+                    "caption": "Evolution of the field over time, highlighting key developments.",
+                },
+                {
+                    "fig_key": "fig4_method_comparison",
+                    "fig_type": "code_chart",
+                    "chart_type": "heatmap",
+                    "title": "Method Comparison Matrix",
+                    "description": "Comparison matrix showing methods vs characteristics.",
+                    "caption": "Method comparison matrix showing capabilities across different dimensions.",
+                },
+            ]
+        else:  # standard (default)
+            return [
+                {
+                    "fig_key": "fig1_taxonomy",
+                    "fig_type": "ai_image",
+                    "ai_image_type": "system_overview",
+                    "chart_type": None,
+                    "title": "Taxonomy of Methods",
+                    "description": "Taxonomy diagram showing the categorization of methods in the field.",
+                    "caption": "Taxonomy of surveyed methods organized by approach and methodology.",
+                },
+                {
+                    "fig_key": "fig2_benchmark",
+                    "fig_type": "code_chart",
+                    "chart_type": "grouped_bar",
+                    "title": "Benchmark Comparison",
+                    "description": "Comparison of methods on key benchmarks.",
+                    "caption": "Performance comparison of representative methods on standard benchmarks.",
+                },
+                {
+                    "fig_key": "fig3_evolution",
+                    "fig_type": "ai_image",
+                    "ai_image_type": "qualitative_comparison",
+                    "chart_type": None,
+                    "title": "Field Evolution",
+                    "description": "Timeline showing how the field evolved over time.",
+                    "caption": "Evolution of the field over time, highlighting key developments.",
+                },
+            ]
 
     # -----------------------------------------------------------------------
     # Chart prompt builder
