@@ -7,7 +7,8 @@ import re
 from typing import Any
 
 from ._types import ContributionContract, GroundingPacket
-from .import _check_global_consistency, PAPER_SECTIONS
+from .import _check_global_consistency, PAPER_SECTIONS, PAPER_MODE_SECTIONS
+from .section_writer import SURVEY_SECTION_PROMPTS
 from nanoresearch.schemas.paper import PaperSkeleton, Section
 
 logger = logging.getLogger(__name__)
@@ -26,6 +27,23 @@ class _WritingAgentMixin:
         experiment_summary: str = inputs.get("experiment_summary", "")
         experiment_status: str = inputs.get("experiment_status", "pending")
         authors: list[str] = inputs.get("authors", None) or ["NanoResearch"]
+
+        # Detect paper mode from ideation output
+        paper_mode_str: str = ideation.get("paper_mode", "original_research")
+        is_survey = paper_mode_str != "original_research"
+        self.log(f"Paper mode: {paper_mode_str} (survey={is_survey})")
+
+        # Select section list based on paper_mode
+        if is_survey:
+            # Resolve paper_mode string to PaperMode enum for PAPER_MODE_SECTIONS lookup
+            from nanoresearch.schemas.manifest import PaperMode
+            try:
+                paper_mode_enum = PaperMode(paper_mode_str)
+            except ValueError:
+                paper_mode_enum = PaperMode.ORIGINAL_RESEARCH
+            section_list = PAPER_MODE_SECTIONS.get(paper_mode_enum, PAPER_SECTIONS)
+        else:
+            section_list = PAPER_SECTIONS
 
         self.log("Starting paper writing")
 
@@ -74,20 +92,36 @@ class _WritingAgentMixin:
 
         sections = []
         prior_sections_summary: list[str] = []
-        for heading, label, instructions, fig_keys in PAPER_SECTIONS:
+        for heading, label, section_instructions, fig_keys in section_list:
+            # For surveys: use survey-specific prompts (stored separately) and skip experiment results
+            if is_survey:
+                instructions = SURVEY_SECTION_PROMPTS.get(label, section_instructions)
+                # Surveys do not have experiment results — pass None/defaults to context builders
+                ctx_experiment_results: dict | None = None
+                ctx_experiment_status: str = "pending"
+                ctx_experiment_analysis: dict | None = None
+                ctx_experiment_summary: str = ""
+            else:
+                instructions = section_instructions
+                ctx_experiment_results = experiment_results
+                ctx_experiment_status = experiment_status
+                ctx_experiment_analysis = experiment_analysis
+                ctx_experiment_summary = experiment_summary
+
             self.log(f"Writing section: {heading}")
 
             _prior_content = {s.heading: s.content for s in sections}
             section_ctx = self._build_section_context(
                 label, core_ctx, grounding=grounding,
-                experiment_results=experiment_results,
-                experiment_status=experiment_status,
-                experiment_analysis=experiment_analysis,
-                experiment_summary=experiment_summary,
+                experiment_results=ctx_experiment_results,
+                experiment_status=ctx_experiment_status,
+                experiment_analysis=ctx_experiment_analysis,
+                experiment_summary=ctx_experiment_summary,
                 prior_sections=_prior_content,
             )
 
-            if contribution_contract and label != "sec:intro":
+            # Contribution contract is only for original research (not surveys)
+            if not is_survey and contribution_contract and label != "sec:intro":
                 contract_block = contribution_contract.for_section(label)
                 if contract_block:
                     section_ctx = section_ctx + "\n\n" + contract_block
@@ -136,7 +170,23 @@ class _WritingAgentMixin:
 
             conclusion_binding = ""
             if label == "sec:conclusion":
-                if grounding.has_real_results and grounding.final_metrics:
+                if is_survey:
+                    # Surveys bind to key_challenges and future_directions instead of experiment results
+                    ideation = inputs.get("ideation_output", {})
+                    key_challenges = ideation.get("key_challenges", []) if isinstance(ideation, dict) else []
+                    future_directions = ideation.get("future_directions", []) if isinstance(ideation, dict) else []
+                    if key_challenges or future_directions:
+                        challenges_str = "\n".join(f"  - {t}" for t in key_challenges) if key_challenges else "  (none provided)"
+                        directions_str = "\n".join(f"  - {t}" for t in future_directions) if future_directions else "  (none provided)"
+                        conclusion_binding = (
+                            "\n\n=== CONCLUSION RESULT BINDING (SURVEY) ===\n"
+                            "Key Challenges:\n" + challenges_str + "\n\n"
+                            "Future Directions:\n" + directions_str + "\n\n"
+                            "Use these to summarize open challenges and future research trajectories.\n"
+                            "Do NOT cite specific experiment performance numbers.\n"
+                            "=== END BINDING ==="
+                        )
+                elif grounding.has_real_results and grounding.final_metrics:
                     metric_strs = [f"{k}={v}" for k, v in list(grounding.final_metrics.items())[:5]]
                     conclusion_binding = (
                         "\n\n=== CONCLUSION RESULT BINDING ===\n"
@@ -203,8 +253,8 @@ class _WritingAgentMixin:
             snippet = content[:200].replace("\n", " ").strip()
             prior_sections_summary.append(f"[{heading}]: {snippet}...")
 
-            # P0-B: Extract contribution contract after Introduction
-            if label == "sec:intro" and not contribution_contract:
+            # P0-B: Extract contribution contract after Introduction (original research only)
+            if not is_survey and label == "sec:intro" and not contribution_contract:
                 contribution_contract = self._extract_contribution_contract(content, method_name)
                 if contribution_contract.claims:
                     self.log(

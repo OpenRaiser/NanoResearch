@@ -1,6 +1,6 @@
 """Setup agent — searches GitHub for relevant code, clones repos, downloads models/data.
 
-Uses a global cache at ~/.nanobot/cache/ so models/data are shared across pipeline runs.
+Uses a global cache at ~/.nanoresearch/cache/ so models/data are shared across pipeline runs.
 Downloads models from ModelScope first (faster in China), falls back to HuggingFace.
 """
 
@@ -27,7 +27,7 @@ from .setup_github import _SetupGithubMixin
 logger = logging.getLogger(__name__)
 
 # Global cache directory — shared across all pipeline runs
-GLOBAL_CACHE_DIR = Path.home() / ".nanobot" / "cache"
+GLOBAL_CACHE_DIR = Path.home() / ".nanoresearch" / "cache"
 GLOBAL_MODELS_DIR = GLOBAL_CACHE_DIR / "models"
 GLOBAL_DATA_DIR = GLOBAL_CACHE_DIR / "data"
 SUCCESS_RESOURCE_STATUSES = {"downloaded", "full", "config_only"}

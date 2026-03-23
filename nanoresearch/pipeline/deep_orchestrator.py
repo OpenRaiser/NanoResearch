@@ -166,6 +166,11 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
             )
             # Pass ANALYSIS-generated figures so FIGURE_GEN can skip duplicates
             inputs["existing_figures"] = analysis_output.get("figures", {})
+            # Pass survey blueprint for survey paper figure generation
+            try:
+                inputs["survey_blueprint"] = self.workspace.read_json("plans/survey_blueprint.json")
+            except FileNotFoundError:
+                inputs["survey_blueprint"] = {}
 
         elif stage == PipelineStage.WRITING:
             inputs["ideation_output"] = accumulated.get("ideation_output", {})

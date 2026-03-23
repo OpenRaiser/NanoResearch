@@ -136,6 +136,19 @@ class IdeationOutput(BaseModel):
         default_factory=list,
         description="Must-cite titles matched to paper indices (title, paper_index, matched)",
     )
+    # Survey-specific fields (only used when paper_mode is survey_*)
+    theme_clusters: list[str] = Field(
+        default_factory=list,
+        description="Topic categories/themes discovered in literature (for surveys)",
+    )
+    key_challenges: list[str] = Field(
+        default_factory=list,
+        description="Open problems identified across papers (for surveys, replaces hypotheses)",
+    )
+    future_directions: list[str] = Field(
+        default_factory=list,
+        description="Future research directions extracted from paper future work sections (for surveys)",
+    )
 
     @field_validator("topic", "survey_summary", "selected_hypothesis", "rationale", mode="before")
     @classmethod

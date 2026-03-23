@@ -32,6 +32,12 @@ class _ContextSectionsMixin:
             "sec:method": self._ctx_method,
             "sec:experiments": self._ctx_experiments,
             "sec:conclusion": self._ctx_conclusion,
+            # survey sections
+            "sec:taxonomy": self._ctx_taxonomy,
+            "sec:applications": self._ctx_applications,
+            "sec:challenges": self._ctx_challenges,
+            "sec:systematic": self._ctx_systematic,
+            "sec:future": self._ctx_future,
         }
         builder = dispatcher.get(section_label, self._ctx_default)
         ctx = builder(
@@ -277,6 +283,181 @@ class _ContextSectionsMixin:
             experiment_summary,
             grounding,
         )
+
+    # ---- survey-specific context builders ----
+    # These draw from IdeationOutput.theme_clusters, key_challenges,
+    # future_directions instead of experiment results.
+
+    def _ctx_taxonomy(
+        self,
+        core: dict[str, Any],
+        **_kwargs: Any,
+    ) -> str:
+        """Taxonomy: theme clusters as organizing categories, survey summary as overview."""
+        ideation = core["ideation"]
+        theme_clusters = ideation.get("theme_clusters", []) if isinstance(ideation, dict) else []
+        survey_str = core["survey"][:4000] if core["survey"] else ""
+        if not isinstance(theme_clusters, list):
+            theme_clusters = []
+
+        clusters_block = ""
+        if theme_clusters:
+            clusters_block = "\n".join(
+                f"  - Theme {i + 1}: {t}" for i, t in enumerate(theme_clusters)
+            )
+        else:
+            clusters_block = "  [No theme clusters provided — derive taxonomy from the literature survey]"
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Theme Clusters (use as top-level taxonomy categories):\n{clusters_block}",
+            "",
+            f"Literature Survey (for background on each theme):\n{survey_str}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_applications(
+        self,
+        core: dict[str, Any],
+        **_kwargs: Any,
+    ) -> str:
+        """Applications: extract domains/tasks from theme clusters and evidence."""
+        ideation = core["ideation"]
+        theme_clusters = ideation.get("theme_clusters", []) if isinstance(ideation, dict) else []
+        survey_str = core["survey"][:4000] if core["survey"] else ""
+        evidence_lines = self._build_evidence_context(core["ideation"], core["blueprint"])
+        if not isinstance(theme_clusters, list):
+            theme_clusters = []
+
+        clusters_block = ""
+        if theme_clusters:
+            clusters_block = "\n".join(
+                f"  - {t}" for t in theme_clusters
+            )
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Application Domains / Tasks (from theme clusters):\n{clusters_block}",
+            "",
+            f"Literature Survey:\n{survey_str}",
+            "",
+            evidence_lines,
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_challenges(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        """Challenges: key_challenges from ideation as organizing structure."""
+        ideation = core["ideation"]
+        key_challenges = ideation.get("key_challenges", []) if isinstance(ideation, dict) else []
+        gaps_str = json.dumps(core["gaps"], indent=2, ensure_ascii=False)[:3000]
+        if not isinstance(key_challenges, list):
+            key_challenges = []
+
+        challenges_block = ""
+        if key_challenges:
+            challenges_block = "\n".join(
+                f"  {i + 1}. {t}" for i, t in enumerate(key_challenges)
+            )
+        else:
+            challenges_block = "  [No key challenges provided — derive from research gaps and literature]"
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Key Challenges (use as organizing structure for this section):\n{challenges_block}",
+            "",
+            f"Research Gaps (cross-reference with challenges):\n{gaps_str}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+            "",
+            self._build_grounding_status_context(grounding),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_systematic(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        """Systematic Analysis: evaluate trends, evaluation quality, reproducibility."""
+        ideation = core["ideation"]
+        theme_clusters = ideation.get("theme_clusters", []) if isinstance(ideation, dict) else []
+        key_challenges = ideation.get("key_challenges", []) if isinstance(ideation, dict) else []
+        survey_str = core["survey"][:4000] if core["survey"] else ""
+        if not isinstance(theme_clusters, list):
+            theme_clusters = []
+        if not isinstance(key_challenges, list):
+            key_challenges = []
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Theme Clusters (for trend analysis):\n" + (
+                "\n".join(f"  - {t}" for t in theme_clusters) if theme_clusters else "  [derive from literature]"
+            ),
+            "",
+            f"Key Challenges (for cross-cutting analysis):\n" + (
+                "\n".join(f"  - {t}" for t in key_challenges) if key_challenges else "  [derive from literature]"
+            ),
+            "",
+            f"Literature Survey:\n{survey_str}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
+
+    def _ctx_future(
+        self,
+        core: dict[str, Any],
+        grounding: GroundingPacket | None = None,
+        **_kwargs: Any,
+    ) -> str:
+        """Future Directions: future_directions from ideation as primary source."""
+        ideation = core["ideation"]
+        future_directions = ideation.get("future_directions", []) if isinstance(ideation, dict) else []
+        key_challenges = ideation.get("key_challenges", []) if isinstance(ideation, dict) else []
+        gaps_str = json.dumps(core["gaps"], indent=2, ensure_ascii=False)[:3000]
+        if not isinstance(future_directions, list):
+            future_directions = []
+        if not isinstance(key_challenges, list):
+            key_challenges = []
+
+        directions_block = ""
+        if future_directions:
+            directions_block = "\n".join(
+                f"  {i + 1}. {t}" for i, t in enumerate(future_directions)
+            )
+        else:
+            directions_block = "  [No future directions provided — derive from gaps and literature]"
+
+        challenges_block = ""
+        if key_challenges:
+            challenges_block = "\n".join(f"  - {t}" for t in key_challenges)
+
+        parts = [
+            f"Topic: {core['topic']}",
+            "",
+            f"Future Directions (use as primary organizing structure):\n{directions_block}",
+            "",
+            f"Key Challenges (connect directions to specific challenges):\n{challenges_block}",
+            "",
+            f"Research Gaps:\n{gaps_str}",
+            "",
+            self._cite_keys_block(core["ref_lines"]),
+        ]
+        return "\n".join(p for p in parts if p is not None)
 
     @staticmethod
     def _cite_keys_block(ref_lines: list[str]) -> str:

@@ -4,7 +4,7 @@ You are the Review Agent for NanoResearch. Your job is to critically review the 
 
 ## Input
 
-`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanobot/workspace/research/`.
+`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanoresearch/workspace/research/`.
 
 ## Prerequisites
 

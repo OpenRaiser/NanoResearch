@@ -15,6 +15,7 @@ from pathlib import Path
 from nanoresearch.schemas.manifest import (
     ArtifactRecord,
     DEEP_ONLY_STAGES,
+    PaperMode,
     PipelineMode,
     PipelineStage,
     StageRecord,
@@ -34,7 +35,7 @@ from nanoresearch.pipeline._workspace_helpers import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
-_DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
+_DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
 
 WORKSPACE_DIRS = ["papers", "plans", "drafts", "figures", "logs", "code"]
 
@@ -57,6 +58,7 @@ class Workspace(_WorkspaceExportMixin):
         root: Path = _DEFAULT_ROOT,
         session_id: str | None = None,
         pipeline_mode: PipelineMode = PipelineMode.STANDARD,
+        paper_mode: PaperMode = PaperMode.ORIGINAL_RESEARCH,
     ) -> "Workspace":
         sid = session_id or uuid.uuid4().hex[:12]
         ws_path = root / sid
@@ -73,6 +75,7 @@ class Workspace(_WorkspaceExportMixin):
             session_id=sid,
             topic=topic,
             pipeline_mode=pipeline_mode,
+            paper_mode=paper_mode,
             current_stage=PipelineStage.INIT,
             stages={
                 stage.value: StageRecord(stage=stage)

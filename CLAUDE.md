@@ -11,7 +11,7 @@ You drive a 9-stage research pipeline entirely through Claude Code's native capa
 
 ## Workspace Convention
 
-All research sessions live under `~/.nanobot/workspace/research/`. Each session has:
+All research sessions live under `~/.nanoresearch/workspace/research/`. Each session has:
 
 ```
 {session_dir}/
@@ -71,7 +71,7 @@ All research sessions live under `~/.nanobot/workspace/research/`. Each session 
 
 ## Manifest Format
 
-Two manifest schemas exist in `~/.nanobot/workspace/research/`. **All commands must handle both.**
+Two manifest schemas exist in `~/.nanoresearch/workspace/research/`. **All commands must handle both.**
 
 ### New schema (Claude Code commands — use this for new workspaces)
 

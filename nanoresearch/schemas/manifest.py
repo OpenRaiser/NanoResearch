@@ -34,6 +34,41 @@ class PipelineMode(str, Enum):
     DEEP = "deep"
 
 
+class PaperMode(str, Enum):
+    """Paper type/mode for the research pipeline."""
+
+    ORIGINAL_RESEARCH = "original_research"
+    SURVEY_SHORT = "survey_short"
+    SURVEY_STANDARD = "survey_standard"
+    SURVEY_LONG = "survey_long"
+
+    @classmethod
+    def from_string(cls, s: str) -> "PaperMode":
+        """Parse from string like 'survey:short:' or 'original:' prefix."""
+        s = s.strip().lower()
+        if s.startswith("survey:short:"):
+            return cls.SURVEY_SHORT
+        if s.startswith("survey:long:"):
+            return cls.SURVEY_LONG
+        if s.startswith("survey:"):
+            return cls.SURVEY_STANDARD
+        return cls.ORIGINAL_RESEARCH
+
+    @property
+    def is_survey(self) -> bool:
+        return self != PaperMode.ORIGINAL_RESEARCH
+
+    @property
+    def survey_size(self) -> str | None:
+        if not self.is_survey:
+            return None
+        return {
+            PaperMode.SURVEY_SHORT: "short",
+            PaperMode.SURVEY_STANDARD: "standard",
+            PaperMode.SURVEY_LONG: "long",
+        }[self]
+
+
 STANDARD_PROCESSING_STAGES: list[PipelineStage] = [
     PipelineStage.IDEATION,
     PipelineStage.PLANNING,
@@ -143,6 +178,7 @@ class WorkspaceManifest(BaseModel):
     session_id: str
     topic: str
     pipeline_mode: PipelineMode = PipelineMode.STANDARD
+    paper_mode: PaperMode = PaperMode.ORIGINAL_RESEARCH
     current_stage: PipelineStage = PipelineStage.INIT
     stages: dict[str, StageRecord] = Field(default_factory=dict)
     artifacts: list[ArtifactRecord] = Field(default_factory=list)

@@ -4,7 +4,7 @@ You are the Planning Agent for NanoResearch. Your job is to design a detailed ex
 
 ## Input
 
-`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanobot/workspace/research/`.
+`$ARGUMENTS` — workspace path (optional). If not provided, use the most recent workspace under `~/.nanoresearch/workspace/research/`.
 
 ## Prerequisites
 
@@ -105,3 +105,93 @@ Write to `{workspace}/plans/experiment_blueprint.json`:
 Update manifest: set planning stage to "completed" with timestamp.
 
 Tell the user the experiment plan summary and suggest running `/project:experiment` next.
+
+---
+
+## Survey Path
+
+When `paper_mode` is set to a survey mode, skip the experiment blueprint design and follow this path instead.
+
+### Step S1: Read Ideation Output
+Read `{workspace}/papers/ideation_output.json` to get:
+- Theme clusters and their suggested sections
+- Papers assigned to each cluster
+- Key challenges and future directions
+
+### Step S2: Determine Survey Size Structure
+Based on `paper_mode` and citation targets:
+
+| Size | Pages | Citations | Sections |
+|------|-------|-----------|----------|
+| short | 8-15 | 80-150 | 4-6 |
+| standard | 15-30 | 150-300 | 6-8 |
+| long | 30+ | 300-500+ | 8-12+ |
+
+### Step S3: Map Papers to Sections
+For each section:
+- Assign papers from corresponding theme cluster
+- Add additional papers to fill gaps (search if needed)
+- Ensure smooth narrative flow between sections
+
+### Step S4: Plan Comparison Matrices
+Survey papers use comparison matrices instead of experiment results:
+- Identify what dimensions to compare across methods
+- List the methods/papers that will appear in each matrix
+- Plan 2-4 comparison matrices per survey
+
+### Step S5: Systematic Analysis (Long Survey Only)
+For long surveys, plan a dedicated analysis section:
+- Quantitative synthesis (citation trends, method popularity)
+- Temporal analysis (evolution of the field)
+- Gap analysis across all theme clusters
+
+## Survey Output
+
+Write to `{workspace}/plans/survey_blueprint.json`:
+
+```json
+{
+  "paper_mode": "survey_standard",
+  "survey_size": "standard",
+  "target_pages": 20,
+  "target_citations": 200,
+  "organization_structure": [
+    {
+      "section": "1. Introduction",
+      "purpose": "Motivate the field, define scope",
+      "papers": ["intro_paper1", "intro_paper2"]
+    },
+    {
+      "section": "2. Background",
+      "purpose": "Foundational concepts",
+      "papers": ["background_paper1"]
+    },
+    {
+      "section": "3. Theme Cluster A",
+      "purpose": "...",
+      "papers": ["paper_a1", "paper_a2"],
+      "comparison_matrix": {
+        "rows": ["Method A", "Method B", "Method C"],
+        "cols": ["Accuracy", "Speed", "Scalability"]
+      }
+    }
+  ],
+  "comparison_matrices": [
+    {
+      "id": "matrix_1",
+      "title": "Method Comparison on X",
+      "methods": ["Method A", "Method B", "Method C"],
+      "dimensions": ["Accuracy", "Speed", "Scalability", "Usability"]
+    }
+  ],
+  "papers_by_section": {
+    "1. Introduction": ["paper1", "paper2"],
+    "2. Background": ["paper3"],
+    "3. Theme A": ["paper4", "paper5", "paper6"]
+  }
+}
+```
+
+Update manifest: set planning stage to "completed" with timestamp.
+
+Tell the user the survey blueprint summary and suggest running `/project:writing` next.

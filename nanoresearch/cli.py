@@ -39,7 +39,7 @@ from nanoresearch.config import ExecutionProfile, ResearchConfig
 from nanoresearch.pipeline.orchestrator import PipelineOrchestrator
 from nanoresearch.pipeline.unified_orchestrator import UnifiedPipelineOrchestrator
 from nanoresearch.pipeline.workspace import Workspace
-from nanoresearch.schemas.manifest import PipelineMode, PipelineStage
+from nanoresearch.schemas.manifest import PaperMode, PipelineMode, PipelineStage
 
 app = typer.Typer(
     name="nanoresearch",
@@ -48,7 +48,7 @@ app = typer.Typer(
 )
 console = Console()
 
-_DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
+_DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
 
 
 def _version_callback(value: bool) -> None:
@@ -65,6 +65,18 @@ def main(
     ),
 ) -> None:
     """NanoResearch — AI-powered research paper generation pipeline."""
+    # Auto-create ~/.nanoresearch directory structure if it doesn't exist
+    _ensure_nanoresearch_home()
+
+
+def _ensure_nanoresearch_home() -> None:
+    """Create ~/.nanoresearch and its subdirectories if they don't exist."""
+    nanoresearch_home = Path.home() / ".nanoresearch"
+    subdirs = ["workspace/research", "chat_memory", "cache/models", "cache/data"]
+
+    nanoresearch_home.mkdir(parents=True, exist_ok=True)
+    for subdir in subdirs:
+        (nanoresearch_home / subdir).mkdir(parents=True, exist_ok=True)
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -91,7 +103,7 @@ def _load_config_safe(config_path: Path | None) -> ResearchConfig:
 
 def _propagate_api_keys(config_path: Path | None) -> None:
     """Read optional API keys from config.json and set as env vars."""
-    path = config_path or Path.home() / ".nanobot" / "config.json"
+    path = config_path or Path.home() / ".nanoresearch" / "config.json"
     if not path.is_file():
         return
     try:
@@ -143,6 +155,15 @@ def run(
         raise typer.Exit(1)
     topic = topic.strip()
 
+    # Parse paper_mode from topic prefix (e.g. "survey:short: LLM Reasoning")
+    paper_mode = PaperMode.from_string(topic)
+    if paper_mode.is_survey:
+        # Strip the prefix from topic to get clean topic string
+        for prefix in ["survey:short:", "survey:standard:", "survey:long:", "original:"]:
+            if topic.lower().startswith(prefix):
+                topic = topic[len(prefix):].strip()
+                break
+
     config = _load_config_safe(config_path)
     if profile is not None:
         config.execution_profile = profile
@@ -176,6 +197,7 @@ def run(
         topic=topic,
         config_snapshot=config.snapshot(),
         pipeline_mode=PipelineMode.DEEP,
+        paper_mode=paper_mode,
     )
     console.print(Panel(
         f"[bold]Topic:[/bold] {topic}\n"

@@ -29,8 +29,8 @@ from nanoresearch.pipeline.workspace import Workspace
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_ROOT = Path.home() / ".nanobot" / "workspace" / "research"
-_CHAT_MEMORY_DIR = Path.home() / ".nanobot" / "chat_memory"
+_DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
+_CHAT_MEMORY_DIR = Path.home() / ".nanoresearch" / "chat_memory"
 
 
 class _FeishuBotHandlersMixin:

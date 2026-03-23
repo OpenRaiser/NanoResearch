@@ -1,0 +1,86 @@
+<# Survey paper template for NanoResearch #>
+<# Uses custom Jinja2 delimiters: <% %> for blocks, << >> for variables, <# #> for comments #>
+<# survey_size: short | standard | long #>
+<# All sizes: Introduction, Related Work, Taxonomy/Framework, Methods, Conclusion #>
+<# Standard+ adds: Applications/Use Cases, Challenges/Open Problems #>
+<# Long adds: Systematic Analysis, Future Directions #>
+\documentclass[11pt]{article}
+
+%% ---- Standard Packages ----
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[a4paper, margin=1in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{natbib}
+\usepackage{booktabs}
+\usepackage{xcolor}
+\usepackage{float}
+\usepackage[section]{placeins}
+\usepackage{multirow}
+\usepackage{lscape}   % for landscape tables
+\usepackage{longtable}% for long tables spanning multiple pages
+
+%% ---- Bibliography Setup for Large Surveys ----
+% Scale bib to 100-500+ citations
+\bibliographystyle{plainnat}
+setlength{\bibsep}{0.5pt}  % compact bibliography spacing
+\setlength{\bibhang}{1.2em}
+
+\title{<< title >>}
+\author{NanoResearch}
+\date{}
+
+\begin{document}
+
+\maketitle
+
+%% ---- Abstract ----
+\begin{abstract}
+<< abstract >>
+\end{abstract}
+
+%% ---- Sections ----
+<% for section in sections %>
+\section{<< section.heading >>}\label{<< section.label >>}
+
+<< section.content >>
+
+<% for subsection in section.subsections %>
+\subsection{<< subsection.heading >>}\label{<< subsection.label >>}
+
+<< subsection.content >>
+
+<% endfor %>
+<% endfor %>
+
+%% ---- Supplementary: Literature Overview Table ----
+<% if literature_table %>
+\section*{Supplementary: Literature Overview}
+\label{supp:literature_overview}
+
+\begin{landscape}
+\begin{longtable}{p{2.5cm}<{\raggedright} p{3cm}<{\raggedright} p{3cm}<{\raggedright} p{2cm}<{\centering} p{6cm}<{\raggedright}}
+\caption{Paper $\times$ Approach $\times$ Dataset overview of surveyed literature.} \label{tab:literature_overview} \\
+\toprule
+\textbf{Paper} & \textbf{Year} & \textbf{Approach} & \textbf{Dataset} & \textbf{Key Contribution} \\
+\midrule
+\endhead
+\bottomrule
+\endlastfoot
+<% for row in literature_table.rows %>
+<% for cell in row.cells %>
+<< cell >><% if not loop.last %> & <% endif %>
+<% endfor %> \\
+<% endfor %>
+\end{longtable}
+\end{landscape}
+<% endif %>
+
+%% ---- References ----
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}

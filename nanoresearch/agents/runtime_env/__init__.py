@@ -191,8 +191,8 @@ class RuntimeEnvironmentManager(
         return python_path
 
     def _save_python_to_config(self, python_path: str) -> None:
-        """Persist experiment_python to ~/.nanobot/config.json."""
-        cfg_path = Path.home() / ".nanobot" / "config.json"
+        """Persist experiment_python to ~/.nanoresearch/config.json."""
+        cfg_path = Path.home() / ".nanoresearch" / "config.json"
         cfg_data: dict[str, Any] = {}
         if cfg_path.exists():
             try:
