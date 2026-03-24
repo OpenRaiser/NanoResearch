@@ -435,8 +435,6 @@ cd NanoResearch
 
 Codex entrypoint: `AGENTS.md`
 
-Shared agent workflow reference: `docs/agent_integration.md`
-
 ### How Codex should interpret the repo
 
 - Treat the repository as an end-to-end autonomous research pipeline, not a generic coding project

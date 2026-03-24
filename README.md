@@ -387,8 +387,6 @@ cd NanoResearch
 
 Codex 入口文档：`AGENTS.md`
 
-共享 agent 工作流说明：`docs/agent_integration.md`
-
 ### Codex 会如何理解这个仓库
 
 - 将仓库视为一个端到端自主科研流水线，而不是普通代码仓库

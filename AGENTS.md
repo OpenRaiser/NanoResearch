@@ -1,22 +1,70 @@
 # NanoResearch — Codex Integration Mode
 
-This file is the Codex entrypoint for NanoResearch.
+NanoResearch is an end-to-end autonomous AI research engine. In Codex integration mode, Codex should drive the existing pipeline rather than inventing a second workflow.
 
-For shared project workflow, paper modes, workspace conventions, and stage semantics, read [`docs/agent_integration.md`](docs/agent_integration.md).
+## Core Goal
 
-## Codex Role
+Given a research topic, NanoResearch should produce a resumable research workspace containing:
+- literature artifacts
+- planning artifacts
+- runnable experiment code when needed
+- execution or literature-analysis evidence
+- figures
+- a LaTeX paper draft
+- review output and final exported assets
 
-When working in this repository, Codex should behave like a NanoResearch operator rather than a generic coding assistant.
+## Pipeline
 
-Codex should:
-- understand the repo as an end-to-end autonomous research pipeline
-- prefer the existing CLI, workspace, and orchestrator behavior over inventing a second workflow
-- map user requests onto NanoResearch's existing research, planning, experiment, analysis, writing, review, status, and resume flows
-- preserve the repo's grounding guarantees for results and citations
+NanoResearch uses a 9-stage pipeline:
+
+```text
+IDEATION -> PLANNING -> SETUP -> CODING -> EXECUTION -> ANALYSIS -> FIGURE_GEN -> WRITING -> REVIEW
+```
+
+Stage meanings:
+- `ideation`: literature search, gap finding, hypothesis or theme extraction
+- `planning`: experiment blueprint or survey blueprint generation
+- `setup`: environment and resource preparation
+- `coding`: runnable experiment generation
+- `execution`: local or SLURM-backed experiment execution
+- `analysis`: structured evidence extraction from outputs
+- `figure_gen`: figure generation for paper assets
+- `writing`: LaTeX paper drafting
+- `review`: critique, verification, and revision
+
+## Workspace Convention
+
+Workspaces live under `~/.nanoresearch/workspace/research/`.
+A typical workspace contains:
+
+```text
+{session_dir}/
+├── manifest.json
+├── papers/
+├── plans/
+├── experiment/
+├── drafts/
+├── figures/
+├── output/
+└── logs/
+```
+
+Reuse an existing workspace when the user asks to continue, inspect status, resume, or revise a prior run.
+
+## Paper Modes
+
+Topic prefixes:
+- `original: Topic` -> `original_research`
+- `survey:short: Topic` -> `survey_short`
+- `survey:standard: Topic` -> `survey_standard`
+- `survey:long: Topic` -> `survey_long`
+
+Behavior:
+- original research follows the full 9-stage pipeline
+- survey modes skip experiment-heavy stages and use literature-grounded planning, writing, and review
+- the prefix is parsed by the existing CLI and manifest logic; Codex should reuse that behavior
 
 ## Codex Intent Mapping
-
-Use this mapping when translating user requests into repo behavior:
 
 | If the user asks for... | Codex should interpret it as... | Preferred repo entry / behavior |
 | --- | --- | --- |
@@ -30,18 +78,13 @@ Use this mapping when translating user requests into repo behavior:
 | status | inspect the active workspace | read and normalize `manifest.json` |
 | resume | continue an interrupted run | restart from the first non-completed stage |
 
-## Paper Mode Handling
+## Grounding Rules
 
-Codex should preserve the existing topic prefix convention:
-- `original: Topic`
-- `survey:short: Topic`
-- `survey:standard: Topic`
-- `survey:long: Topic`
-
-Interpretation:
-- original research uses the full pipeline
-- survey modes reuse the repo's existing survey-aware planning, writing, and review behavior
-- Codex should not invent a separate survey API; it should rely on the existing `PaperMode` parsing and workspace behavior already implemented in the repo
+- never fabricate experiment results
+- never fabricate citations
+- prefer existing CLI / orchestrator behavior over ad hoc scripts
+- keep paper claims tied to actual outputs or verified literature
+- preserve checkpoint and resume semantics via `manifest.json`
 
 ## Codex Operating Rules
 
@@ -49,4 +92,4 @@ Interpretation:
 2. Do not introduce a separate Codex-specific pipeline mode.
 3. Keep outputs compatible with existing workspaces and manifests.
 4. Never fabricate results or citations.
-5. When a user asks for pipeline work, operate through the existing workspace artifacts and stage boundaries described in the shared integration reference.
+5. When a user asks for pipeline work, operate through the existing workspace artifacts and stage boundaries described above.
