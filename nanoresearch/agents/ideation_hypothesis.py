@@ -139,7 +139,7 @@ class _IdeationHypothesisMixin:
         return registry
 
     async def _analyze_and_hypothesize(
-        self, topic: str, queries: list[str], papers: list[dict]
+        self, topic: str, queries: list[str], papers: list[dict], adaptive_context: str = ""
     ) -> IdeationOutput:
         paper_summaries = []
         for i, p in enumerate(papers[:MAX_PAPERS_FOR_ANALYSIS]):
@@ -161,7 +161,8 @@ class _IdeationHypothesisMixin:
 
         papers_text = "\n\n".join(paper_summaries)
 
-        prompt = f"""Research Topic: "{topic}"
+        adaptive_prefix = f"{adaptive_context}\n\n" if adaptive_context else ""
+        prompt = f"""{adaptive_prefix}Research Topic: "{topic}"
 
 I searched using these queries: {json.dumps(queries)}
 

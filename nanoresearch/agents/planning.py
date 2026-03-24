@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
+from nanoresearch.evolution.memory import MemoryType
 from nanoresearch.schemas.experiment import ExperimentBlueprint
 from nanoresearch.schemas.manifest import PipelineStage
 
@@ -49,6 +50,20 @@ class PlanningAgent(BaseResearchAgent):
         topic = ideation_data.get("topic", "")
         selected_hyp = ideation_data.get("selected_hypothesis", "")
         rationale = ideation_data.get("rationale", "")
+        adaptive_context = self.build_adaptive_context(
+            "planning",
+            topic=topic,
+            text=json.dumps(ideation_data, ensure_ascii=False)[:4000],
+            tags=[topic, selected_hyp, self.workspace.manifest.paper_mode.value],
+        )
+        retry_error = str(inputs.get("_retry_error", "")).strip()
+        if retry_error:
+            self.learn_from_trace(
+                "planning",
+                "planning_retry",
+                retry_error,
+                tags=[topic, selected_hyp, "retry"],
+            )
 
         # Find the selected hypothesis details
         hyp_detail = ""
@@ -78,7 +93,8 @@ class PlanningAgent(BaseResearchAgent):
         # Build evidence block from extracted metrics
         evidence_block = self._build_evidence_block(ideation_data)
 
-        prompt = f"""Research Topic: "{topic}"
+        adaptive_prefix = f"{adaptive_context}\n\n" if adaptive_context else ""
+        prompt = f"""{adaptive_prefix}Research Topic: "{topic}"
 
 Selected Hypothesis: {selected_hyp}
 {hyp_detail}
@@ -179,6 +195,25 @@ Return ONLY valid JSON."""
         )
         self.workspace.register_artifact(
             "experiment_blueprint", output_path, self.stage
+        )
+        primary_metrics = [m.name for m in blueprint.metrics if m.primary] or [m.name for m in blueprint.metrics[:3]]
+        primary_metrics_text = ", ".join(primary_metrics)
+        dataset_names = ", ".join(ds.name for ds in blueprint.datasets[:3])
+        self.remember_context(
+            MemoryType.PROJECT_CONTEXT,
+            f"Planning blueprint for {topic}: method={blueprint.proposed_method.name}, datasets={dataset_names}, primary metrics={primary_metrics_text}",
+            importance=0.78,
+            tags=[topic, blueprint.proposed_method.name, "planning"],
+            source="experiment_blueprint",
+            topic=topic,
+        )
+        self.remember_context(
+            MemoryType.DECISION_HISTORY,
+            f"Planning constraints for {topic}: include {len(blueprint.ablation_groups)} ablation groups and compute estimate {blueprint.compute_requirements.num_gpus}x {blueprint.compute_requirements.gpu_type} for {blueprint.compute_requirements.estimated_hours}h.",
+            importance=0.72,
+            tags=[topic, "ablation", "compute"],
+            source="experiment_blueprint",
+            topic=topic,
         )
         logger.info("[%s] Blueprint generated: %s", self.stage.value, blueprint.title)
         return blueprint.model_dump(mode="json")

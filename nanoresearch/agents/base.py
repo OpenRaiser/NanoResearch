@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 from abc import ABC, abstractmethod
 from typing import Any
 
@@ -14,6 +15,8 @@ from nanoresearch.exceptions import LLMError
 from nanoresearch.pipeline.multi_model import ModelDispatcher
 from nanoresearch.pipeline.workspace import Workspace
 from nanoresearch.schemas.manifest import PipelineStage
+from nanoresearch.evolution.memory import MemoryScope, MemoryStore, MemoryType
+from nanoresearch.skills import UnifiedSkillMatcher
 
 # Import all free functions from the helpers module so they remain accessible
 # at their original locations (e.g. ``from nanoresearch.agents.base import detect_truncation``).
@@ -50,6 +53,17 @@ class BaseResearchAgent(ABC):
         self.workspace = workspace
         self.config = config
         self._dispatcher = ModelDispatcher(config)
+        static_skills_dir = getattr(config, "static_skills_dir", "") or None
+        self._memory_store = MemoryStore(
+            enabled=getattr(config, "memory_enabled", True),
+            top_k=getattr(config, "memory_retrieval_top_k", 5),
+            decay_factor=getattr(config, "memory_decay_factor", 0.08),
+        )
+        self._skill_matcher = UnifiedSkillMatcher(
+            Path(static_skills_dir) if static_skills_dir else None,
+            retrieval_top_k=getattr(config, "skill_retrieval_top_k", 5),
+            autorun_policy=getattr(config, "script_skill_autorun_policy", "safe_only"),
+        )
 
     def _remember_mutation_snapshot_entry(self, entry: dict[str, Any] | None) -> None:
         self._last_mutation_snapshot_entry = dict(entry) if isinstance(entry, dict) else None
@@ -58,6 +72,126 @@ class BaseResearchAgent(ABC):
         entry = getattr(self, "_last_mutation_snapshot_entry", None)
         self._last_mutation_snapshot_entry = None
         return dict(entry) if isinstance(entry, dict) else None
+
+    def _project_key(self, topic: str = "") -> str:
+        raw = (topic or self.workspace.manifest.topic or self.workspace.manifest.session_id).strip().lower()
+        slug = re.sub(r"[^a-z0-9]+", "-", raw).strip("-")
+        return slug or self.workspace.manifest.session_id
+
+    def build_adaptive_context(
+        self,
+        task_type: str,
+        *,
+        topic: str = "",
+        blueprint: dict | None = None,
+        text: str = "",
+        tags: list[str] | None = None,
+        template_format: str = "",
+        include_script_recommendations: bool = True,
+    ) -> str:
+        tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()]
+        blocks: list[str] = []
+        payload: dict[str, Any] = {"task_type": task_type, "topic": topic, "tags": tags}
+        try:
+            if getattr(self.config, "memory_enabled", True):
+                memory_context = self._memory_store.render_prompt_context(
+                    task_type,
+                    topic=topic,
+                    tags=tags,
+                    text=text,
+                    project_key=self._project_key(topic),
+                    top_k=getattr(self.config, "memory_retrieval_top_k", 5),
+                )
+                if memory_context:
+                    blocks.append(memory_context)
+                    payload["memory_context"] = memory_context
+            if getattr(self.config, "skill_evolution_enabled", True):
+                skill_context = self._skill_matcher.build_context(
+                    task_type,
+                    topic=topic,
+                    blueprint=blueprint,
+                    text=text,
+                    tags=tags,
+                    template_format=template_format,
+                )
+                if not include_script_recommendations:
+                    combined = "\n\n".join(part for part in (skill_context.static_context, skill_context.evolved_context) if part)
+                else:
+                    combined = skill_context.combined_context
+                if combined:
+                    blocks.append(combined)
+                    payload["matched_skills"] = skill_context.matched_skills
+                    payload["skill_context"] = combined
+        except Exception as exc:
+            logger.warning("Failed to build adaptive context for %s/%s: %s", self.stage.value, task_type, exc)
+
+        combined_context = "\n\n".join(blocks)
+        if combined_context:
+            payload["combined_context"] = combined_context
+            try:
+                self.workspace.write_json(f"logs/adaptive_context_{self.stage.value.lower()}_{task_type}.json", payload)
+            except Exception as exc:
+                logger.debug("Failed to persist adaptive context trace: %s", exc)
+        return combined_context
+
+    def remember_context(
+        self,
+        memory_type: MemoryType | str,
+        content: str,
+        *,
+        importance: float = 0.6,
+        tags: list[str] | None = None,
+        source: str = "",
+        scope: MemoryScope | str = MemoryScope.WORKSPACE_DERIVED,
+        topic: str = "",
+    ) -> None:
+        if not getattr(self.config, "memory_enabled", True):
+            return
+        try:
+            self._memory_store.remember(
+                memory_type,
+                content,
+                scope=scope,
+                source=source or f"{self.stage.value.lower()}:{self.workspace.manifest.session_id}",
+                importance=importance,
+                tags=tags,
+                project_key=self._project_key(topic),
+                workspace_id=self.workspace.manifest.session_id,
+            )
+        except Exception as exc:
+            logger.warning("Failed to write memory for %s: %s", self.stage.value, exc)
+
+    def learn_from_trace(
+        self,
+        domain: str,
+        trigger_pattern: str,
+        source_trace: str,
+        *,
+        tags: list[str] | None = None,
+        rule_text: str | None = None,
+        confidence: float = 0.55,
+    ) -> None:
+        if not getattr(self.config, "skill_evolution_enabled", True):
+            return
+        trace = (source_trace or "").strip()
+        if not trace:
+            return
+        try:
+            skill = self._skill_matcher.evolution_store.synthesize_nl_skill(
+                domain=domain,
+                trigger_pattern=trigger_pattern,
+                source_trace=trace,
+                rule_text=rule_text,
+                confidence=confidence,
+                tags=tags,
+            )
+            if skill is not None:
+                self.workspace.write_json(
+                    f"logs/evolved_skill_{self.stage.value.lower()}_{trigger_pattern}.json",
+                    skill.model_dump(mode="json"),
+                )
+        except Exception as exc:
+            logger.warning("Failed to evolve skill for %s/%s: %s", self.stage.value, domain, exc)
 
     @property
     def stage_config(self) -> StageModelConfig:

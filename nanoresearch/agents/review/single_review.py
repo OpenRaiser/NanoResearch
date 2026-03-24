@@ -87,7 +87,9 @@ class _SingleReviewMixin:
         # Per-section specialized system prompt
         section_review_system = get_review_system_prompt(heading)
 
-        prompt = f"""Review the following section of an academic paper for a top-tier AI venue.
+        adaptive_guidance = getattr(self, "_adaptive_review_context", "")
+        adaptive_prefix = f"{adaptive_guidance}\n\n" if adaptive_guidance else ""
+        prompt = f"""{adaptive_prefix}Review the following section of an academic paper for a top-tier AI venue.
 
 Section: {heading}
 

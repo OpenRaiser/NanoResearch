@@ -15,6 +15,7 @@ from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
 from nanoresearch.agents.tools import ToolDefinition, ToolRegistry
+from nanoresearch.evolution.memory import MemoryType
 from nanoresearch.schemas.evidence import EvidenceBundle, ExtractedMetric
 from nanoresearch.schemas.ideation import IdeationOutput, PaperReference
 from nanoresearch.schemas.manifest import PipelineStage
@@ -117,6 +118,20 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
         if not topic:
             raise ValueError("IdeationAgent requires a non-empty 'topic' in inputs")
         logger.info("[%s] Starting ideation for topic: %s", self.stage.value, topic)
+        adaptive_context = self.build_adaptive_context(
+            "literature",
+            topic=topic,
+            text=topic,
+            tags=[topic, self.workspace.manifest.paper_mode.value],
+        )
+        retry_error = str(inputs.get("_retry_error", "")).strip()
+        if retry_error:
+            self.learn_from_trace(
+                "literature",
+                "ideation_retry",
+                retry_error,
+                tags=[topic, "retry", self.workspace.manifest.paper_mode.value],
+            )
 
         # Check for cached search results (from a previous failed attempt)
         cache_path = self.workspace.path / "logs" / "ideation_search_cache.json"
@@ -147,7 +162,7 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
                 )
         else:
             # Step 1: Generate search queries
-            queries = await self._generate_queries(topic)
+            queries = await self._generate_queries(topic, adaptive_context=adaptive_context)
             logger.info("[%s] Generated %d search queries", self.stage.value, len(queries))
 
             # Step 2: Search literature
@@ -227,7 +242,9 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
                 logger.warning("Failed to cache search results: %s", e)
 
         # Step 3: LLM analysis -- gaps + hypotheses (with ReAct tool use)
-        output = await self._analyze_and_hypothesize(topic, queries, papers)
+        output = await self._analyze_and_hypothesize(
+            topic, queries, papers, adaptive_context=adaptive_context
+        )
 
         # Store must-cite titles and match to actual papers
         output.must_cites = must_cites
@@ -257,10 +274,30 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
         self.workspace.register_artifact(
             "ideation_output", output_path, self.stage
         )
+        gap_descriptions = [gap.description for gap in output.gaps[:3]]
+        gap_summary = "; ".join(gap_descriptions)
+        self.remember_context(
+            MemoryType.PROJECT_CONTEXT,
+            f"Ideation for {topic} selected {output.selected_hypothesis} with rationale: {output.rationale}",
+            importance=0.74,
+            tags=[topic, "ideation", self.workspace.manifest.paper_mode.value],
+            source="ideation_output",
+            topic=topic,
+        )
+        if gap_summary:
+            self.remember_context(
+                MemoryType.DECISION_HISTORY,
+                f"Key gaps for {topic}: {gap_summary}",
+                importance=0.8,
+                tags=[topic, "gaps", "literature"],
+                source="ideation_output",
+                topic=topic,
+            )
         return output.model_dump(mode="json")
 
-    async def _generate_queries(self, topic: str) -> list[str]:
-        prompt = f"""Given the research topic: "{topic}"
+    async def _generate_queries(self, topic: str, adaptive_context: str = "") -> list[str]:
+        adaptive_prefix = f"{adaptive_context}\n\n" if adaptive_context else ""
+        prompt = f"""{adaptive_prefix}Given the research topic: "{topic}"
 
 Generate {MAX_SEARCH_QUERIES} diverse search queries to find relevant academic papers.
 Include queries for:

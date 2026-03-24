@@ -6,6 +6,7 @@ import logging
 import re
 from typing import Any
 
+from nanoresearch.evolution.memory import MemoryType
 from ._types import ContributionContract, GroundingPacket
 from .import _check_global_consistency, PAPER_SECTIONS, PAPER_MODE_SECTIONS
 from .section_writer import SURVEY_SECTION_PROMPTS
@@ -46,6 +47,27 @@ class _WritingAgentMixin:
             section_list = PAPER_SECTIONS
 
         self.log("Starting paper writing")
+        adaptive_context = self.build_adaptive_context(
+            "writing",
+            topic=ideation.get("topic", ""),
+            blueprint=blueprint,
+            text=json.dumps({
+                "paper_mode": paper_mode_str,
+                "topic": ideation.get("topic", ""),
+                "selected_hypothesis": ideation.get("selected_hypothesis", ""),
+            }, ensure_ascii=False),
+            tags=[ideation.get("topic", ""), paper_mode_str, template_format],
+            template_format=template_format,
+            include_script_recommendations=True,
+        )
+        retry_error = str(inputs.get("_retry_error", "")).strip()
+        if retry_error:
+            self.learn_from_trace(
+                "writing",
+                "writing_retry",
+                retry_error,
+                tags=[ideation.get("topic", ""), paper_mode_str, "retry"],
+            )
 
         # Step 0a: Build grounding packet
         grounding = self._build_grounding_packet(
@@ -68,6 +90,8 @@ class _WritingAgentMixin:
 
         # Build per-section context primitives (P0-A)
         core_ctx = self._build_core_context(ideation, blueprint, cite_keys)
+        if adaptive_context:
+            core_ctx = f"{core_ctx}\n\n{adaptive_context}"
 
         # Title & abstract need a broad context
         title_abstract_ctx = self._ctx_introduction(core_ctx, grounding=grounding)
@@ -387,6 +411,16 @@ class _WritingAgentMixin:
             result["pdf_error"] = pdf_result.get("error", "Unknown error")
             self.log(f"PDF compilation failed: {result['pdf_error']}")
 
+        topic_name = ideation.get("topic", "unknown topic")
+        pdf_ready = "yes" if "pdf_path" in result else "no"
+        self.remember_context(
+            MemoryType.PROJECT_CONTEXT,
+            f"Writing completed for {topic_name} in mode {paper_mode_str} with template {template_format}. PDF={pdf_ready}.",
+            importance=0.7,
+            tags=[ideation.get("topic", ""), paper_mode_str, "writing", template_format],
+            source="writing_output",
+            topic=ideation.get("topic", ""),
+        )
         self.log("Writing stage complete")
         return result
 

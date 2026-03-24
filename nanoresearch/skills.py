@@ -12,11 +12,14 @@ public methods return empty/no-op results and the agents run unchanged.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
+
+from nanoresearch.evolution.skills import SkillDomain, SkillEvolutionStore
 
 logger = logging.getLogger(__name__)
 
@@ -414,3 +417,72 @@ class SkillMatcher:
 
         combined = " ".join(parts).lower()
         return _extract_keywords(combined, max_lines=10000)
+
+
+
+@dataclass
+class UnifiedSkillContext:
+    """Combined static and evolved skill context for prompt injection."""
+
+    matched_skills: list[str] = field(default_factory=list)
+    static_context: str = ""
+    evolved_context: str = ""
+    script_context: str = ""
+
+    @property
+    def combined_context(self) -> str:
+        parts = [part for part in (self.static_context, self.evolved_context, self.script_context) if part]
+        return "\n\n".join(parts)
+
+
+class UnifiedSkillMatcher:
+    """Compose K-Dense static skills with evolved NL/script skills."""
+
+    _TASK_TO_DOMAIN = {
+        "literature": SkillDomain.LITERATURE,
+        "ideation": SkillDomain.LITERATURE,
+        "planning": SkillDomain.PLANNING,
+        "experiment": SkillDomain.EXPERIMENT,
+        "coding": SkillDomain.CODING,
+        "writing": SkillDomain.WRITING,
+        "review": SkillDomain.REVIEW,
+    }
+
+    def __init__(self, skills_dir: Path | None = None, *, evolution_store: SkillEvolutionStore | None = None, retrieval_top_k: int = 5, autorun_policy: str = "safe_only") -> None:
+        self._static = SkillMatcher(skills_dir)
+        self.evolution_store = evolution_store or SkillEvolutionStore(enabled=True)
+        self._retrieval_top_k = max(1, retrieval_top_k)
+        self._autorun_policy = autorun_policy
+
+    def _domain_for_task(self, task_type: str) -> SkillDomain:
+        return self._TASK_TO_DOMAIN.get(task_type, SkillDomain.PLANNING)
+
+    def build_context(self, task_type: str, *, topic: str = "", blueprint: dict | None = None, text: str = "", tags: list[str] | None = None, template_format: str = "") -> UnifiedSkillContext:
+        domain = self._domain_for_task(task_type)
+        ctx = UnifiedSkillContext()
+
+        if task_type in {"planning", "experiment", "coding"} and blueprint:
+            matches = self._static.match(blueprint)
+            static_ctx = self._static.extract_context(matches)
+            ctx.static_context = "\n\n".join(part for part in (static_ctx.phase1_context, static_ctx.phase2_context) if part)
+            ctx.matched_skills.extend(static_ctx.matched_skills)
+        elif task_type in {"writing", "review"}:
+            matches = self._static.match_writing_skills(topic=topic, template_format=template_format)
+            ctx.static_context = self._static.extract_writing_context(matches)
+            ctx.matched_skills.extend([entry.name for entry, _ in matches])
+
+        text_payload = text
+        if blueprint and not text_payload:
+            try:
+                text_payload = json.dumps(blueprint, ensure_ascii=False)
+            except TypeError:
+                text_payload = str(blueprint)
+
+        ctx.evolved_context = self.evolution_store.render_nl_context(domain, topic=topic, text=text_payload, tags=tags, top_k=self._retrieval_top_k)
+        ctx.script_context = self.evolution_store.render_script_context(domain, tags=tags, top_k=min(3, self._retrieval_top_k), autorun_policy=self._autorun_policy)
+
+        nl_matches = self.evolution_store.match_nl_skills(domain, topic=topic, text=text_payload, tags=tags, top_k=self._retrieval_top_k)
+        ctx.matched_skills.extend(skill.skill_id for skill in nl_matches)
+        script_matches = self.evolution_store.match_script_skills(domain, tags=tags, top_k=min(3, self._retrieval_top_k), autorun_policy=self._autorun_policy)
+        ctx.matched_skills.extend(skill.name for skill in script_matches)
+        return ctx

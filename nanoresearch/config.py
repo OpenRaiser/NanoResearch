@@ -142,6 +142,15 @@ class ResearchConfig(BaseModel):
     runtime_auto_install_max_nltk_downloads: int = 50
     runtime_auto_install_allowlist: list[str] = Field(default_factory=list)
 
+    # Adaptive memory and skill evolution settings
+    memory_enabled: bool = True
+    memory_retrieval_top_k: int = 5
+    memory_decay_factor: float = 0.08
+    skill_evolution_enabled: bool = True
+    skill_retrieval_top_k: int = 5
+    script_skill_autorun_policy: str = "safe_only"
+    static_skills_dir: str = ""
+
     # Environment backend for experiment execution.
     # "auto" — prefer conda/mamba when available, fall back to venv.
     # "conda" — force conda (error if not installed).

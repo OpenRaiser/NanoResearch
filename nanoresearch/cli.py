@@ -72,7 +72,14 @@ def main(
 def _ensure_nanoresearch_home() -> None:
     """Create ~/.nanoresearch and its subdirectories if they don't exist."""
     nanoresearch_home = Path.home() / ".nanoresearch"
-    subdirs = ["workspace/research", "chat_memory", "cache/models", "cache/data"]
+    subdirs = [
+        "workspace/research",
+        "chat_memory",
+        "cache/models",
+        "cache/data",
+        "memory",
+        "skills",
+    ]
 
     nanoresearch_home.mkdir(parents=True, exist_ok=True)
     for subdir in subdirs:

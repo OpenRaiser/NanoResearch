@@ -10,6 +10,7 @@ from typing import Any
 
 from nanoresearch.agents.cluster_executor import ClusterExecutor
 from nanoresearch.agents.feedback_analyzer import FeedbackAnalyzer
+from nanoresearch.evolution.memory import MemoryType
 from nanoresearch.agents.preflight import PreflightChecker
 from nanoresearch.schemas.iteration import (
     ExperimentHypothesis,
@@ -37,6 +38,22 @@ class _ExperimentAgentMixin:
         self.log(f"Starting iterative experiment (max {max_rounds} rounds)")
 
         title = blueprint_data.get("title", "")
+        adaptive_context = self.build_adaptive_context(
+            "experiment",
+            topic=title,
+            blueprint=blueprint_data,
+            text=json.dumps(blueprint_data, ensure_ascii=False)[:5000],
+            tags=[title, "experiment", self.workspace.manifest.paper_mode.value],
+            include_script_recommendations=True,
+        )
+        retry_error = str(inputs.get("_retry_error", "")).strip()
+        if retry_error:
+            self.learn_from_trace(
+                "experiment",
+                "experiment_retry",
+                retry_error,
+                tags=[title, "retry", "experiment"],
+            )
         method = blueprint_data.get("proposed_method", {})
         datasets = blueprint_data.get("datasets", [])
         metrics = blueprint_data.get("metrics", [])
@@ -50,6 +67,8 @@ class _ExperimentAgentMixin:
         }, indent=2, ensure_ascii=False)
 
         repo_context = self._build_repo_context(reference_repos)
+        if adaptive_context:
+            repo_context = f"{adaptive_context}\n\n{repo_context}" if repo_context else adaptive_context
         if repo_context:
             self.log(f"Using {len(reference_repos)} reference repos for code grounding")
 
@@ -115,6 +134,15 @@ class _ExperimentAgentMixin:
                 )
                 iteration_state.rounds.append(round_result)
                 self.log(f"Preflight failed, will retry in next round ({round_num}/{max_rounds})")
+                failure_summary = "; ".join(preflight.blocking_failures)
+                fix_summary = "; ".join(preflight.suggested_fixes[:5])
+                self.learn_from_trace(
+                    "experiment",
+                    "preflight_failure",
+                    f"Round {round_num} preflight failures: {failure_summary} | suggested fixes: {fix_summary}",
+                    tags=[title, "preflight", "experiment"],
+                    confidence=0.6,
+                )
                 continue
 
             # ---- Phase 3 & 4: execution ----
@@ -214,6 +242,33 @@ class _ExperimentAgentMixin:
             "iteration_state": iteration_state.model_dump(),
         }
         self.workspace.write_json("logs/experiment_output.json", result)
+        metrics_summary = str(best_round_data["metrics"])
+        self.remember_context(
+            MemoryType.PROJECT_CONTEXT,
+            f"Experiment status for {title}: final_status={iteration_state.final_status}, best_round={iteration_state.best_round}, metrics={metrics_summary}",
+            importance=0.82,
+            tags=[title, "experiment", iteration_state.final_status or "completed"],
+            source="experiment_output",
+            topic=title,
+        )
+        quick_eval_status = best_round_data["quick_eval_status"]
+        execution_status = best_round_data["execution_status"]
+        self.remember_context(
+            MemoryType.DECISION_HISTORY,
+            f"Experiment loop for {title} ended with execution={execution_status} and quick_eval={quick_eval_status} after {len(iteration_state.rounds)} rounds.",
+            importance=0.75,
+            tags=[title, "iteration", str(quick_eval_status)],
+            source="experiment_output",
+            topic=title,
+        )
+        if len(iteration_state.rounds) > 1 and iteration_state.best_round > 1:
+            self.learn_from_trace(
+                "experiment",
+                "retry_success",
+                f"Best result for {title} emerged at round {iteration_state.best_round} after iterative retries. Preserve successful fixes from earlier failed rounds.",
+                tags=[title, "iteration", "success"],
+                confidence=0.65,
+            )
         return result
 
     # ------------------------------------------------------------------

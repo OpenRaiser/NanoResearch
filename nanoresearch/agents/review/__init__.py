@@ -7,6 +7,7 @@ import logging
 from typing import Any
 
 from nanoresearch.agents.base import BaseResearchAgent
+from nanoresearch.evolution.memory import MemoryType
 from nanoresearch.schemas.manifest import PipelineStage
 from nanoresearch.schemas.review import (
     ConsistencyIssue,
@@ -76,6 +77,23 @@ class ReviewAgent(
             return ReviewOutput().model_dump(mode="json")
 
         self.log("Starting automated review")
+        adaptive_review_context = self.build_adaptive_context(
+            "review",
+            topic=ideation_output.get("topic", ""),
+            blueprint=experiment_blueprint,
+            text=paper_tex[:3000],
+            tags=[ideation_output.get("topic", ""), self._experiment_status, "review"],
+            include_script_recommendations=False,
+        )
+        self._adaptive_review_context = adaptive_review_context
+        retry_error = str(inputs.get("_retry_error", "")).strip()
+        if retry_error:
+            self.learn_from_trace(
+                "review",
+                "review_retry",
+                retry_error,
+                tags=[ideation_output.get("topic", ""), "review", "retry"],
+            )
 
         # Step 1: LLM review — multi-model if committee configured, else single
         committee = getattr(self.config, "review_committee", [])
@@ -192,6 +210,25 @@ class ReviewAgent(
             self.workspace.path / "drafts" / "review_output.json",
             self.stage,
         )
+        low_score_sections = [sr.section for sr in review.section_reviews if sr.score < MIN_SECTION_SCORE]
+        issue_text = "; ".join(issue.description for issue in review.consistency_issues[:6])
+        topic_name = ideation_output.get("topic", "unknown topic")
+        if issue_text or low_score_sections:
+            self.remember_context(
+                MemoryType.DECISION_HISTORY,
+                f"Review feedback for {topic_name}: low_score_sections={low_score_sections}; issues={issue_text}",
+                importance=0.86,
+                tags=[ideation_output.get("topic", ""), "review", "feedback"],
+                source="review_output",
+                topic=ideation_output.get("topic", ""),
+            )
+            self.learn_from_trace(
+                "review",
+                "review_feedback",
+                f"Low-score sections: {low_score_sections}; consistency issues: {issue_text}",
+                tags=[ideation_output.get("topic", ""), "review", "feedback"],
+                confidence=0.66,
+            )
 
         # If we have revised sections, write revised paper back to paper.tex
         # current_tex already has all revisions applied from the loop above.
