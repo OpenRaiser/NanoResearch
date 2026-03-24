@@ -49,6 +49,7 @@ Built for **grounded autonomous research**: NanoResearch turns a topic into lite
 - [How it works](#how-it-works)
 - [Quick start](#quick-start)
 - [Claude Code Mode](#claude-code-mode)
+- [Codex Integration](#codex-integration)
 - [Execution profiles](#execution-profiles)
 - [Common CLI commands](#common-cli-commands)
 - [Output structure](#output-structure)
@@ -416,6 +417,43 @@ claude
 - **Compatible with Python CLI**: Workspaces created in Claude Code mode are fully compatible with the Python CLI, and vice versa.
 
 ---
+
+## Codex Integration
+
+In addition to Claude Code, NanoResearch now exposes a project-level entrypoint for **Codex**. Codex does not need a second pipeline or a dedicated `--mode codex` flag. It should reuse the existing CLI, workspace, manifest, and `PaperMode` behavior already implemented in the repo.
+
+### How to use it
+
+```bash
+# 1. Clone the project
+git clone https://github.com/OpenRaiser/NanoResearch.git
+cd NanoResearch
+
+# 2. Open the repo in Codex
+# 3. Ask Codex to read AGENTS.md first
+```
+
+Codex entrypoint: `AGENTS.md`
+
+Shared agent workflow reference: `docs/agent_integration.md`
+
+### How Codex should interpret the repo
+
+- Treat the repository as an end-to-end autonomous research pipeline, not a generic coding project
+- Prefer the existing `nanoresearch` CLI / workspace / orchestrator behavior
+- Map user intent onto the existing `research`, `ideation`, `planning`, `experiment`, `analysis`, `writing`, `review`, `status`, and `resume` flows
+- Keep outputs compatible with the existing workspaces and `manifest.json`
+
+### Survey and original modes
+
+Codex should follow the same topic-prefix convention used by the CLI:
+
+- `original: Topic`
+- `survey:short: Topic`
+- `survey:standard: Topic`
+- `survey:long: Topic`
+
+These prefixes already feed the repo's `PaperMode` parsing logic. Codex should reuse that behavior rather than introducing a new interface.
 
 ## Execution profiles
 

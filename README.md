@@ -70,6 +70,7 @@ NanoResearch 是一个端到端的自主科研系统。与传统的"AI 写论文
 - [Key Capabilities](#key-capabilities)
 - [Quick Start](#quick-start)
 - [Claude Code Mode](#claude-code-mode)
+- [Codex Integration](#codex-integration)
 - [Execution Profiles](#execution-profiles)
 - [CLI Commands](#cli-commands)
 - [Output Structure](#output-structure)
@@ -368,6 +369,43 @@ claude
 - **与 Python CLI 兼容**：Claude Code 模式生成的工作空间与 Python CLI 完全兼容，可混合使用两种模式。
 
 ---
+
+## Codex Integration
+
+除了 Claude Code，NanoResearch 现在也提供了面向 **Codex** 的项目级入口。Codex 不需要第二套 pipeline 或额外的 `--mode codex` 参数；它应直接复用仓库现有的 CLI、workspace、manifest 和 `PaperMode` 逻辑。
+
+### 如何使用
+
+```bash
+# 1. Clone 项目
+git clone https://github.com/OpenRaiser/NanoResearch.git
+cd NanoResearch
+
+# 2. 在 Codex 中打开仓库
+# 3. 让 Codex 先读取 AGENTS.md
+```
+
+Codex 入口文档：`AGENTS.md`
+
+共享 agent 工作流说明：`docs/agent_integration.md`
+
+### Codex 会如何理解这个仓库
+
+- 将仓库视为一个端到端自主科研流水线，而不是普通代码仓库
+- 优先走已有的 `nanoresearch` CLI / workspace / orchestrator 行为
+- 将用户意图映射到现有的 `research`、`ideation`、`planning`、`experiment`、`analysis`、`writing`、`review`、`status`、`resume` 流程
+- 保持与现有工作空间和 `manifest.json` 兼容
+
+### Survey / Original 模式
+
+Codex 使用与 CLI 相同的 topic 前缀约定：
+
+- `original: Topic`
+- `survey:short: Topic`
+- `survey:standard: Topic`
+- `survey:long: Topic`
+
+这些前缀会进入仓库现有的 `PaperMode` 解析逻辑；Codex 只需要遵循这一约定，而不需要发明新的接口。
 
 ## Execution Profiles
 
