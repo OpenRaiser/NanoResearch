@@ -200,18 +200,19 @@ class BaseResearchAgent(ABC):
         if not trace:
             return
         try:
-            skill = self._skill_matcher.evolution_store.synthesize_nl_skill(
+            lifecycle = self._skill_matcher.evolution_store.synthesize_nl_skill(
                 domain=domain,
                 trigger_pattern=trigger_pattern,
                 source_trace=trace,
                 rule_text=rule_text,
                 confidence=confidence,
                 tags=tags,
+                source_stage=self.stage.value.lower(),
             )
-            if skill is not None:
+            if lifecycle is not None:
                 self.workspace.write_json(
                     f"logs/evolved_skill_{self.stage.value.lower()}_{trigger_pattern}.json",
-                    skill.model_dump(mode="json"),
+                    lifecycle.model_dump(mode="json"),
                 )
         except Exception as exc:
             logger.warning("Failed to evolve skill for %s/%s: %s", self.stage.value, domain, exc)

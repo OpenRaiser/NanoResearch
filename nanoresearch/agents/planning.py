@@ -223,6 +223,21 @@ Return ONLY valid JSON."""
             source_stage="planning",
             source="experiment_blueprint",
         )
+        planning_trace = (
+            f"Blueprint for {topic}: method={blueprint.proposed_method.name}; "
+            f"datasets={[ds.name for ds in blueprint.datasets]}; "
+            f"primary_metrics={primary_metrics}; "
+            f"ablation_groups={len(blueprint.ablation_groups)}; "
+            f"compute={blueprint.compute_requirements.num_gpus}x {blueprint.compute_requirements.gpu_type} "
+            f"for {blueprint.compute_requirements.estimated_hours}h."
+        )
+        self.learn_from_trace(
+            "planning",
+            "planning_blueprint",
+            planning_trace,
+            tags=[topic, blueprint.proposed_method.name, "planning", "blueprint"],
+            confidence=0.68,
+        )
         logger.info("[%s] Blueprint generated: %s", self.stage.value, blueprint.title)
         return blueprint.model_dump(mode="json")
 

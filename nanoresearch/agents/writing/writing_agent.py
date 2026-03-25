@@ -421,6 +421,18 @@ class _WritingAgentMixin:
             source="writing_output",
             topic=ideation.get("topic", ""),
         )
+        writing_trace = (
+            f"Writing completed for {topic_name}: paper_mode={paper_mode_str}; template={template_format}; "
+            f"pdf_ready={pdf_ready}; consistency_issues={len(consistency_issues)}; "
+            f"must_cite_missing={len(citation_report.get('missing_must_cites', []))}."
+        )
+        self.learn_from_trace(
+            "writing",
+            "writing_completion",
+            writing_trace,
+            tags=[ideation.get("topic", ""), paper_mode_str, "writing", template_format],
+            confidence=0.64,
+        )
         self.log("Writing stage complete")
         return result
 

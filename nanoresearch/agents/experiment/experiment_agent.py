@@ -269,13 +269,26 @@ class _ExperimentAgentMixin:
                 tags=[title, "iteration", "success"],
                 confidence=0.65,
             )
-        self.remember_experiment_strategies(
+        strategy_summary = self.remember_experiment_strategies(
             topic=title,
             blueprint=blueprint_data,
             iteration_state=iteration_state.model_dump(),
             artifact_path="logs/experiment_strategy_summary.json",
             source_stage="experiment",
             source="experiment_output",
+        )
+        experiment_trace = (
+            f"Experiment summary for {title}: final_status={iteration_state.final_status}; "
+            f"best_round={iteration_state.best_round}; execution={execution_status}; "
+            f"quick_eval={quick_eval_status}; rounds={len(iteration_state.rounds)}; "
+            f"strategy_summary={json.dumps(strategy_summary, ensure_ascii=False) if strategy_summary else 'none'}."
+        )
+        self.learn_from_trace(
+            "experiment",
+            "experiment_strategy_summary",
+            experiment_trace,
+            tags=[title, "experiment", iteration_state.final_status or "completed"],
+            confidence=0.72,
         )
         failure_reasons: list[str] = []
         if iteration_state.final_status in {"failed", "max_rounds", "plateau", "degradation"}:

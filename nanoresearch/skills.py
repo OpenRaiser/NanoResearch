@@ -482,7 +482,7 @@ class UnifiedSkillMatcher:
         ctx.script_context = self.evolution_store.render_script_context(domain, tags=tags, top_k=min(3, self._retrieval_top_k), autorun_policy=self._autorun_policy)
 
         nl_matches = self.evolution_store.match_nl_skills(domain, topic=topic, text=text_payload, tags=tags, top_k=self._retrieval_top_k)
-        ctx.matched_skills.extend(skill.skill_id for skill in nl_matches)
+        ctx.matched_skills.extend((skill.stable_id or skill.skill_id) for skill in nl_matches)
         script_matches = self.evolution_store.match_script_skills(domain, tags=tags, top_k=min(3, self._retrieval_top_k), autorun_policy=self._autorun_policy)
         ctx.matched_skills.extend(skill.name for skill in script_matches)
         return ctx

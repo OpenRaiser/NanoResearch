@@ -14,8 +14,12 @@ from .skills import (
     ScriptSkill,
     ScriptSkillCategory,
     ScriptTestStatus,
+    SkillCandidate,
     SkillDomain,
     SkillEvolutionStore,
+    SkillLifecycleResult,
+    SkillReview,
+    SkillReviewDecision,
 )
 
 __all__ = [
@@ -30,6 +34,10 @@ __all__ = [
     "ScriptSkill",
     "ScriptSkillCategory",
     "ScriptTestStatus",
+    "SkillCandidate",
     "SkillDomain",
     "SkillEvolutionStore",
+    "SkillLifecycleResult",
+    "SkillReview",
+    "SkillReviewDecision",
 ]
