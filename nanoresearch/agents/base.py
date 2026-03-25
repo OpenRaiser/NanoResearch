@@ -16,6 +16,7 @@ from nanoresearch.pipeline.multi_model import ModelDispatcher
 from nanoresearch.pipeline.workspace import Workspace
 from nanoresearch.schemas.manifest import PipelineStage
 from nanoresearch.evolution.memory import MemoryScope, MemoryStore, MemoryType
+from nanoresearch.evolution.memory_analyzer import MemoryEvolutionAnalyzer
 from nanoresearch.skills import UnifiedSkillMatcher
 
 # Import all free functions from the helpers module so they remain accessible
@@ -59,6 +60,7 @@ class BaseResearchAgent(ABC):
             top_k=getattr(config, "memory_retrieval_top_k", 5),
             decay_factor=getattr(config, "memory_decay_factor", 0.08),
         )
+        self._memory_analyzer = MemoryEvolutionAnalyzer(self._memory_store)
         self._skill_matcher = UnifiedSkillMatcher(
             Path(static_skills_dir) if static_skills_dir else None,
             retrieval_top_k=getattr(config, "skill_retrieval_top_k", 5),
@@ -93,13 +95,35 @@ class BaseResearchAgent(ABC):
         blocks: list[str] = []
         payload: dict[str, Any] = {"task_type": task_type, "topic": topic, "tags": tags}
         try:
+            project_key = self._project_key(topic)
+            if getattr(self.config, "memory_enabled", True) and getattr(self.config, "memory_evolution_enabled", True):
+                research_conditions: dict[str, Any] = {
+                    "paper_mode": self.workspace.manifest.paper_mode.value,
+                }
+                if blueprint:
+                    research_conditions["has_blueprint"] = "yes"
+                research_top_k = getattr(self.config, "direction_memory_top_k", 4)
+                if task_type == "experiment":
+                    research_top_k = getattr(self.config, "strategy_memory_top_k", 4)
+                research_context = self._memory_store.render_research_context(
+                    task_type,
+                    topic=topic,
+                    tags=tags,
+                    text=text,
+                    conditions=research_conditions,
+                    project_key=project_key,
+                    top_k=research_top_k,
+                )
+                if research_context:
+                    blocks.append(research_context)
+                    payload["research_memory_context"] = research_context
             if getattr(self.config, "memory_enabled", True):
                 memory_context = self._memory_store.render_prompt_context(
                     task_type,
                     topic=topic,
                     tags=tags,
                     text=text,
-                    project_key=self._project_key(topic),
+                    project_key=project_key,
                     top_k=getattr(self.config, "memory_retrieval_top_k", 5),
                 )
                 if memory_context:
@@ -124,7 +148,6 @@ class BaseResearchAgent(ABC):
                     payload["skill_context"] = combined
         except Exception as exc:
             logger.warning("Failed to build adaptive context for %s/%s: %s", self.stage.value, task_type, exc)
-
         combined_context = "\n\n".join(blocks)
         if combined_context:
             payload["combined_context"] = combined_context
@@ -192,6 +215,98 @@ class BaseResearchAgent(ABC):
                 )
         except Exception as exc:
             logger.warning("Failed to evolve skill for %s/%s: %s", self.stage.value, domain, exc)
+
+    def remember_promising_direction(
+        self,
+        *,
+        topic: str,
+        ideation_output: dict | None = None,
+        planning_output: dict | None = None,
+        artifact_path: str | None = None,
+        source_stage: str = "",
+        source: str = "",
+    ) -> dict[str, Any] | None:
+        if not getattr(self.config, "memory_enabled", True) or not getattr(self.config, "memory_evolution_enabled", True):
+            return None
+        try:
+            payload = self._memory_analyzer.summarize_promising_direction(
+                topic=topic,
+                paper_mode=self.workspace.manifest.paper_mode.value,
+                ideation_output=ideation_output,
+                planning_output=planning_output,
+                source=source or f"{self.stage.value.lower()}:{self.workspace.manifest.session_id}",
+                source_stage=source_stage or self.stage.value.lower(),
+                project_key=self._project_key(topic),
+                workspace_id=self.workspace.manifest.session_id,
+            )
+            if payload and artifact_path:
+                self.workspace.write_json(artifact_path, payload)
+            return payload
+        except Exception as exc:
+            logger.warning("Failed to remember promising direction for %s: %s", self.stage.value, exc)
+            return None
+
+    def remember_failed_direction(
+        self,
+        *,
+        topic: str,
+        blueprint: dict | None = None,
+        iteration_state: dict | None = None,
+        failure_reason: str = "",
+        artifact_path: str | None = None,
+        source_stage: str = "",
+        source: str = "",
+    ) -> dict[str, Any] | None:
+        if not getattr(self.config, "memory_enabled", True) or not getattr(self.config, "memory_evolution_enabled", True):
+            return None
+        try:
+            payload = self._memory_analyzer.summarize_failed_direction(
+                topic=topic,
+                paper_mode=self.workspace.manifest.paper_mode.value,
+                blueprint=blueprint,
+                iteration_state=iteration_state,
+                failure_reason=failure_reason,
+                source=source or f"{self.stage.value.lower()}:{self.workspace.manifest.session_id}",
+                source_stage=source_stage or self.stage.value.lower(),
+                project_key=self._project_key(topic),
+                workspace_id=self.workspace.manifest.session_id,
+            )
+            if payload and artifact_path:
+                self.workspace.write_json(artifact_path, payload)
+            return payload
+        except Exception as exc:
+            logger.warning("Failed to remember failed direction for %s: %s", self.stage.value, exc)
+            return None
+
+    def remember_experiment_strategies(
+        self,
+        *,
+        topic: str,
+        blueprint: dict | None = None,
+        iteration_state: dict | None = None,
+        artifact_path: str | None = None,
+        source_stage: str = "",
+        source: str = "",
+    ) -> dict[str, Any] | None:
+        if not getattr(self.config, "memory_enabled", True) or not getattr(self.config, "memory_evolution_enabled", True):
+            return None
+        try:
+            payload = self._memory_analyzer.summarize_experiment_strategies(
+                topic=topic,
+                paper_mode=self.workspace.manifest.paper_mode.value,
+                blueprint=blueprint,
+                iteration_state=iteration_state,
+                source=source or f"{self.stage.value.lower()}:{self.workspace.manifest.session_id}",
+                source_stage=source_stage or self.stage.value.lower(),
+                project_key=self._project_key(topic),
+                workspace_id=self.workspace.manifest.session_id,
+            )
+            if payload and artifact_path:
+                self.workspace.write_json(artifact_path, payload)
+            return payload
+        except Exception as exc:
+            logger.warning("Failed to remember experiment strategies for %s: %s", self.stage.value, exc)
+            return None
 
     @property
     def stage_config(self) -> StageModelConfig:

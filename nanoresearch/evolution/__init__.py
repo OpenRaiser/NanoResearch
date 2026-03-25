@@ -1,6 +1,14 @@
 """Adaptive memory and skill-evolution primitives for NanoResearch."""
 
-from .memory import MemoryRecord, MemoryScope, MemoryStore, MemoryType
+from .memory import (
+    MemoryRecord,
+    MemoryScope,
+    MemoryStore,
+    MemoryType,
+    ResearchMemoryKind,
+    ResearchMemoryRecord,
+)
+from .memory_analyzer import MemoryEvolutionAnalyzer
 from .skills import (
     NaturalLanguageSkill,
     ScriptSkill,
@@ -15,6 +23,9 @@ __all__ = [
     "MemoryScope",
     "MemoryStore",
     "MemoryType",
+    "ResearchMemoryKind",
+    "ResearchMemoryRecord",
+    "MemoryEvolutionAnalyzer",
     "NaturalLanguageSkill",
     "ScriptSkill",
     "ScriptSkillCategory",

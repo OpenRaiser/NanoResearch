@@ -144,7 +144,10 @@ class ResearchConfig(BaseModel):
 
     # Adaptive memory and skill evolution settings
     memory_enabled: bool = True
+    memory_evolution_enabled: bool = True
     memory_retrieval_top_k: int = 5
+    direction_memory_top_k: int = 4
+    strategy_memory_top_k: int = 4
     memory_decay_factor: float = 0.08
     skill_evolution_enabled: bool = True
     skill_retrieval_top_k: int = 5

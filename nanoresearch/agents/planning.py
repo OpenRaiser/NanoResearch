@@ -215,6 +215,14 @@ Return ONLY valid JSON."""
             source="experiment_blueprint",
             topic=topic,
         )
+        self.remember_promising_direction(
+            topic=topic,
+            ideation_output=ideation_data,
+            planning_output=blueprint.model_dump(mode="json"),
+            artifact_path="logs/promising_direction_summary_planning.json",
+            source_stage="planning",
+            source="experiment_blueprint",
+        )
         logger.info("[%s] Blueprint generated: %s", self.stage.value, blueprint.title)
         return blueprint.model_dump(mode="json")
 

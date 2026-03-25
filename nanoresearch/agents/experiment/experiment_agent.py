@@ -269,6 +269,31 @@ class _ExperimentAgentMixin:
                 tags=[title, "iteration", "success"],
                 confidence=0.65,
             )
+        self.remember_experiment_strategies(
+            topic=title,
+            blueprint=blueprint_data,
+            iteration_state=iteration_state.model_dump(),
+            artifact_path="logs/experiment_strategy_summary.json",
+            source_stage="experiment",
+            source="experiment_output",
+        )
+        failure_reasons: list[str] = []
+        if iteration_state.final_status in {"failed", "max_rounds", "plateau", "degradation"}:
+            failure_reasons.append(f"final_status={iteration_state.final_status}")
+        if best_round_data["execution_status"] in {"failed", "skipped"}:
+            failure_reasons.append(f"execution={best_round_data['execution_status']}")
+        if best_round_data["quick_eval_status"] in {"failed", "skipped"}:
+            failure_reasons.append(f"quick_eval={best_round_data['quick_eval_status']}")
+        if failure_reasons:
+            self.remember_failed_direction(
+                topic=title,
+                blueprint=blueprint_data,
+                iteration_state=iteration_state.model_dump(),
+                failure_reason="; ".join(failure_reasons),
+                artifact_path="logs/failed_direction_summary.json",
+                source_stage="experiment",
+                source="experiment_output",
+            )
         return result
 
     # ------------------------------------------------------------------

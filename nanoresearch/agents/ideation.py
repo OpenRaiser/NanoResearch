@@ -293,6 +293,13 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
                 source="ideation_output",
                 topic=topic,
             )
+        self.remember_promising_direction(
+            topic=topic,
+            ideation_output=output.model_dump(mode="json"),
+            artifact_path="logs/promising_direction_summary_ideation.json",
+            source_stage="ideation",
+            source="ideation_output",
+        )
         return output.model_dump(mode="json")
 
     async def _generate_queries(self, topic: str, adaptive_context: str = "") -> list[str]:
