@@ -60,8 +60,11 @@ class ResearchMemoryRecord(BaseModel):
     direction_ref: str = ""
     conditions: dict[str, str] = Field(default_factory=dict)
     evidence_summary: str = ""
+    trajectory_summary: list[str] = Field(default_factory=list)
+    uncertainty_note: str = ""
     confidence: float = Field(default=0.6, ge=0.0, le=1.0)
     support_count: int = Field(default=1, ge=1)
+    contradiction_count: int = Field(default=0, ge=0)
     source: str = ""
     source_stage: str = ""
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -116,9 +119,9 @@ _RESEARCH_KIND_PRIORS: dict[str, dict[ResearchMemoryKind, float]] = {
     },
     "experiment": {
         ResearchMemoryKind.PROMISING_DIRECTION: 0.7,
-        ResearchMemoryKind.FAILED_DIRECTION: 0.9,
-        ResearchMemoryKind.DATA_STRATEGY: 1.55,
-        ResearchMemoryKind.TRAINING_STRATEGY: 1.5,
+        ResearchMemoryKind.FAILED_DIRECTION: 0.95,
+        ResearchMemoryKind.DATA_STRATEGY: 1.6,
+        ResearchMemoryKind.TRAINING_STRATEGY: 1.55,
     },
     "writing": {
         ResearchMemoryKind.PROMISING_DIRECTION: 0.85,
@@ -235,6 +238,20 @@ class MemoryStore:
         return normalized
 
     @staticmethod
+    def _merge_trajectory(existing: list[str], incoming: list[str] | None, *, limit: int = 6) -> list[str]:
+        merged: list[str] = []
+        seen: set[str] = set()
+        for item in [*(existing or []), *((incoming or [])[:limit])]:
+            item_norm = " ".join(str(item).strip().split())
+            if not item_norm or item_norm in seen:
+                continue
+            seen.add(item_norm)
+            merged.append(item_norm)
+            if len(merged) >= limit:
+                break
+        return merged
+
+    @staticmethod
     def _tokenize(text: str) -> set[str]:
         return set(_WORD_RE.findall((text or "").lower()))
 
@@ -322,8 +339,11 @@ class MemoryStore:
         direction_ref: str = "",
         conditions: dict[str, Any] | None = None,
         evidence_summary: str = "",
+        trajectory_summary: list[str] | None = None,
+        uncertainty_note: str = "",
         confidence: float = 0.6,
         support_count: int = 1,
+        contradiction_count: int = 0,
         source: str = "",
         source_stage: str = "",
         importance: float = 0.7,
@@ -359,8 +379,11 @@ class MemoryStore:
                 "timestamp": now,
                 "content": content if len(content) >= len(record.content) else record.content,
                 "evidence_summary": evidence_summary or record.evidence_summary,
+                "trajectory_summary": self._merge_trajectory(record.trajectory_summary, trajectory_summary),
+                "uncertainty_note": uncertainty_note or record.uncertainty_note,
                 "confidence": max(record.confidence, self._clamp(confidence, 0.0, 1.0)),
                 "support_count": max(1, record.support_count + max(1, support_count)),
+                "contradiction_count": max(0, record.contradiction_count + max(0, contradiction_count)),
                 "importance": max(record.importance, self._clamp(importance, 0.0, 1.0)),
                 "recency_weight": min(1.5, max(record.recency_weight, recency_weight)),
                 "conditions": merged_conditions,
@@ -382,8 +405,11 @@ class MemoryStore:
             direction_ref=direction_ref,
             conditions=conditions_norm,
             evidence_summary=evidence_summary,
+            trajectory_summary=self._merge_trajectory([], trajectory_summary),
+            uncertainty_note=uncertainty_note,
             confidence=self._clamp(confidence, 0.0, 1.0),
             support_count=max(1, support_count),
+            contradiction_count=max(0, contradiction_count),
             source=source,
             source_stage=source_stage,
             importance=self._clamp(importance, 0.0, 1.0),
@@ -492,6 +518,7 @@ class MemoryStore:
                 ]
             )
         )
+        query_condition_keys = set(query_conditions)
         scored: list[tuple[float, ResearchMemoryRecord]] = []
         for record in self._load_research_records():
             if project_key and record.project_key and record.project_key != project_key:
@@ -499,26 +526,40 @@ class MemoryStore:
             prior = priors.get(record.memory_kind, 0.75)
             content_tokens = self._tokenize(record.content)
             evidence_tokens = self._tokenize(record.evidence_summary)
+            trajectory_tokens = self._tokenize(" ".join(record.trajectory_summary))
             condition_tokens = self._tokenize(" ".join(f"{key} {value}" for key, value in record.conditions.items()))
-            token_overlap = len((content_tokens | evidence_tokens) & query_tokens)
+            token_overlap = len((content_tokens | evidence_tokens | trajectory_tokens) & query_tokens)
             condition_overlap = len(condition_tokens & query_tokens)
             tag_overlap = len(set(record.tags) & query_tags)
             exact_condition_matches = sum(
                 1 for key, value in query_conditions.items()
                 if record.conditions.get(key, "").lower() == value.lower()
             )
+            missing_condition_keys = sum(1 for key in query_condition_keys if key not in record.conditions)
+            mismatch_count = sum(
+                1 for key, value in query_conditions.items()
+                if key in record.conditions and record.conditions.get(key, "").lower() != value.lower()
+            )
             project_bonus = 0.55 if project_key and record.project_key == project_key else 0.0
             support_bonus = min(record.support_count, 5) * 0.2
+            contradiction_penalty = 0.35 * min(record.contradiction_count, 4)
+            condition_bonus = 0.9 * exact_condition_matches + 0.75 * condition_overlap
+            mismatch_penalty = 0.55 * mismatch_count + 0.15 * missing_condition_keys
+            if record.memory_kind == ResearchMemoryKind.FAILED_DIRECTION:
+                mismatch_penalty *= 1.35
+                if exact_condition_matches:
+                    condition_bonus += 0.45
             score = (
                 prior * (1.15 + record.importance + record.recency_weight + record.confidence)
                 + 0.45 * token_overlap
-                + 0.75 * condition_overlap
-                + 0.9 * exact_condition_matches
                 + 0.7 * tag_overlap
+                + condition_bonus
                 + support_bonus
                 + project_bonus
+                - contradiction_penalty
+                - mismatch_penalty
             )
-            if score >= 1.65:
+            if score >= 1.45:
                 scored.append((score, record))
         scored.sort(key=lambda item: (item[0], item[1].support_count, item[1].timestamp), reverse=True)
         limit = max(1, top_k or self.top_k)
@@ -599,8 +640,10 @@ class MemoryStore:
             source = f" [{record.source_stage or record.source}]" if (record.source_stage or record.source) else ""
             condition_bits = ", ".join(f"{key}={value}" for key, value in list(record.conditions.items())[:4])
             evidence = f" | evidence: {record.evidence_summary}" if record.evidence_summary else ""
+            trajectory = f" | trajectory: {'; '.join(record.trajectory_summary[:2])}" if record.trajectory_summary else ""
+            uncertainty = f" | uncertainty: {record.uncertainty_note}" if record.uncertainty_note else ""
             suffix = f" | conditions: {condition_bits}" if condition_bits else ""
-            lines.append(f"- ({record.memory_kind.value}){source} {record.content}{suffix}{evidence}")
+            lines.append(f"- ({record.memory_kind.value}){source} {record.content}{suffix}{evidence}{trajectory}{uncertainty}")
         return (
             f"\n\n=== {title} ===\n"
             f"{instruction}\n"
