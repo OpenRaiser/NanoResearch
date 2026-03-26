@@ -110,8 +110,8 @@
 NanoResearch **命令行（CLI）** 提供 **TUI 全屏界面** 与 **传统流式日志** 两种呈现方式。下方为 CLI 端 **TUI 主题与界面** 演示视频（配色切换与布局优化）。其他入口（如 Claude Code、飞书机器人）见文档对应章节。
 
 <div align="center" style="max-width: 720px; margin: 0 auto;">
-  <video src="imgs/demo_cli_tui_theme.mp4" controls muted playsinline loop width="100%" style="max-width: 100%; border-radius: 8px;">
-    <a href="imgs/demo_cli_tui_theme.mp4">下载 / 播放 CLI 演示视频</a>
+  <video src="https://raw.githubusercontent.com/OpenRaiser/NanoResearch/main/imgs/demo_cli_tui_theme.mp4" controls muted playsinline loop width="100%" style="max-width: 100%; border-radius: 8px;">
+    <a href="https://raw.githubusercontent.com/OpenRaiser/NanoResearch/main/imgs/demo_cli_tui_theme.mp4">下载 / 播放 CLI 演示视频</a>
   </video>
   <br /><sub><i>演示：TUI 界面、配色主题切换与信息布局优化</i></sub>
 </div>
