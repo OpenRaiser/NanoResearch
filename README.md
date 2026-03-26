@@ -1,62 +1,122 @@
+<a id="top"></a>
+
 <div align="center">
-  <img src="https://github.com/user-attachments/assets/dc05697b-c256-4d9e-be7b-18591963bc46" alt="NanoResearch Logo" width="500"/>
+
+<div style="margin: 20px 0;">
+  <img src="imgs/logo.png" alt="NanoResearch Logo" width="500" style="border-radius: 20px;">
+</div>
 
 # NanoResearch
 
-**中文** | [English](README_en.md)
+<p>
+  <a href="README.md"><img src="https://img.shields.io/badge/🇨🇳_中文-1a1a2e?style=for-the-badge" alt="中文"></a>
+  <a href="README_en.md"><img src="https://img.shields.io/badge/🇺🇸_English-1a1a2e?style=for-the-badge" alt="English"></a>
+</p>
 
-**端到端自主 AI 科研引擎**
-
-NanoResearch 是一个端到端的自主科研系统。与传统的"AI 写论文"工具不同，NanoResearch **真正运行计算实验**——它不仅生成代码，还能将代码提交到 GPU 集群执行训练，收集真实实验结果，生成论文配图，最终输出一篇有实验数据支撑的完整 LaTeX 论文。
+**端到端自主 AI 科研引擎 — 从研究想法到完整论文，全程自动化**
 
 <p>
-  <a href="#quick-start"><b>Quick Start</b></a> ·
-  <a href="#showcase"><b>Showcase</b></a> ·
-  <a href="#pipeline"><b>Pipeline</b></a>
+  <a href="https://github.com/OpenRaiser/NanoResearch"><img src="https://img.shields.io/badge/🔥_Project-Page-00d9ff?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e" alt="Project"></a>
+  <a href="https://github.com/OpenRaiser/NanoResearch/stargazers"><img src="https://img.shields.io/github/stars/OpenRaiser/NanoResearch?color=00d9ff&style=for-the-badge&logo=star&logoColor=white&labelColor=1a1a2e" alt="Stars"></a>
+  <a href="https://github.com/OpenRaiser/NanoResearch/issues"><img src="https://img.shields.io/badge/🐛_Issues-ff6b6b?style=for-the-badge&logo=github&logoColor=white&labelColor=1a1a2e" alt="Issues"></a>
 </p>
 
 <p>
-  <a href="https://github.com/OpenRaiser/NanoResearch"><img alt="Repository" src="https://img.shields.io/badge/GitHub-OpenRaiser%2FNanoResearch-181717?logo=github"></a>
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
-  <img alt="License" src="https://img.shields.io/badge/License-MIT-16A34A">
-  <img alt="Pipeline" src="https://img.shields.io/badge/Pipeline-Unified%20Deep-7C3AED">
-  <img alt="Execution" src="https://img.shields.io/badge/Execution-Local%20%7C%20SLURM-0EA5E9">
+  <img src="https://img.shields.io/badge/Python-3.10%2B-4ecdc4?style=for-the-badge&logo=python&logoColor=white&labelColor=1a1a2e" alt="Python">
+  <img src="https://img.shields.io/badge/License-MIT-16A34A?style=for-the-badge&labelColor=1a1a2e" alt="License">
+  <img src="https://img.shields.io/badge/Pipeline-9_Stage_Deep-7C3AED?style=for-the-badge&labelColor=1a1a2e" alt="Pipeline">
+  <img src="https://img.shields.io/badge/Execution-Local_|_SLURM-0EA5E9?style=for-the-badge&labelColor=1a1a2e" alt="Execution">
 </p>
+
+<p>
+  <a href="#快速开始"><b>快速开始</b></a> ·
+  <a href="#效果展示"><b>效果展示</b></a> ·
+  <a href="#流水线"><b>流水线</b></a> ·
+  <a href="#claude-code-模式"><b>Claude Code</b></a> ·
+  <a href="#飞书机器人"><b>飞书机器人</b></a>
+</p>
+
 </div>
 
 ---
 
-## Highlights
-
-大多数 AI 科研工具只能生成文本大纲或论文草稿。**NanoResearch 的核心差异在于它能真正执行计算实验：**
-
-```text
-💡 Idea Generation        自动检索文献、发现研究空白、提出假说
-        ↓
-📋 Experiment Planning    设计详细的实验方案和技术路线
-        ↓
-💻 Code Generation        生成完整可运行的实验代码（含训练脚本、数据加载、模型定义）
-        ↓
-🚀 GPU Execution          自动提交到 SLURM 集群或本地 GPU 执行训练
-        ↓
-📊 Results Analysis       解析训练日志，提取指标，生成结构化实验证据
-        ↓
-📈 Figure Generation      根据真实实验数据自动生成论文配图（结果图、消融图、架构图）
-        ↓
-✍️ Paper Writing          基于真实实验结果撰写 LaTeX 论文（非凭空生成）
-        ↓
-🔍 Review & Revision      自动审稿并修订
-```
-
-> **关键区别**：论文中的每一个数据、表格、图表都来自实际运行的实验结果，而非 LLM 编造。
+> 🔬 NanoResearch **真正运行计算实验**——它不仅生成代码，还能将代码提交到 GPU 集群执行训练，收集真实实验结果，生成论文配图，最终输出一篇有实验数据支撑的完整 LaTeX 论文。论文中的每一个数据、表格、图表都来自实际运行的实验结果，**而非 LLM 编造**。
 
 ---
 
-<div align="center">
-  <img src="https://github.com/OpenRaiser/NanoResearch/releases/download/assets/before_after.png" alt="Before and After NanoResearch" width="90%" />
-  <p><b>🦀 告别手动科研的痛苦循环</b></p>
-  <p>不再反复调试失败的实验、手动整理数据、从零写论文——<br/>NanoResearch 将完整科研流程自动化，让你专注于真正的研究创新。</p>
+## 📖 目录
+
+- [📊 论文实测展示](#-论文实测展示)
+- [⚡ CLI 演示](#cli-demo)
+- [📢 最新动态](#-最新动态)
+- [✨ 核心特性](#-核心特性)
+- [🆚 为何选择 NanoResearch](#-为何选择-nanoresearch)
+- [🎯 应用场景](#-应用场景)
+- [🖼️ 效果展示](#️-效果展示)
+- [CLI：标准输出与 TUI 对比](#cli-tui-vs-plain)
+- [🔬 流水线](#-流水线)
+- [📦 快速开始](#-快速开始)
+- [🧩 Claude Code 模式](#-claude-code-模式)
+- [⚙️ 配置](#️-配置)
+- [💻 CLI 参考](#-cli-参考)
+- [🍪 示例与 Demo](#-示例与-demo)
+- [📂 输出结构](#-输出结构)
+- [💬 飞书机器人](#-飞书机器人)
+- [🏗️ 项目结构](#-项目结构)
+- [❓ 常见问题](#-常见问题)
+- [🎯 路线图](#-路线图)
+- [📋 环境要求](#-环境要求)
+- [🙏 致谢](#-致谢)
+- [🤝 贡献](#-贡献)
+- [📝 引用](#-引用)
+- [📄 许可证](#-许可证)
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
+
+---
+
+## 📊 论文实测展示
+
+以下为 NanoResearch 自动生成论文中的**真实配图**，所有数据、曲线、表格均来自实际运行的实验结果，**非 LLM 虚构**。
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%">
+      <img src="imgs/recognition_1.jpg" height="200" alt="实验结果"/>
+      <br />
+      <sub><b>实验结果展示</b></sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="imgs/recognition_2.jpg" height="200" alt="主结果对比"/>
+      <br />
+      <sub><b>方法对比 / 主结果</b></sub>
+    </td>
+    <td align="center" valign="top" width="33%">
+      <img src="imgs/recognition_3.jpg" height="200" alt="消融与可视化"/>
+      <br />
+      <sub><b>消融与可视化</b></sub>
+    </td>
+  </tr>
+</table>
+
+> 以上配图均为流水线自动生成，数据来源于真实训练日志与实验结果。
+
+---
+
+<a id="cli-demo"></a>
+
+## ⚡ CLI 演示
+
+NanoResearch **命令行（CLI）** 提供 **TUI 全屏界面** 与 **传统流式日志** 两种呈现方式。下方为 CLI 端 **TUI 主题与界面** 演示视频（配色切换与布局优化）。其他入口（如 Claude Code、飞书机器人）见文档对应章节。
+
+<div align="center" style="max-width: 720px; margin: 0 auto;">
+  <video src="imgs/demo_cli_tui_theme.mp4" controls muted playsinline loop width="100%" style="max-width: 100%; border-radius: 8px;">
+    <a href="imgs/demo_cli_tui_theme.mp4">下载 / 播放 CLI 演示视频</a>
+  </video>
+  <br /><sub><i>演示：TUI 界面、配色主题切换与信息布局优化</i></sub>
 </div>
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
 
 ---
 
@@ -89,81 +149,98 @@ NanoResearch 是一个端到端的自主科研系统。与传统的"AI 写论文
 | 文献检索 | 部分支持 | ✅ OpenAlex + Semantic Scholar 自动检索 |
 | 实验设计 | ❌ | ✅ 自动生成实验方案 |
 | 代码生成 | 部分支持 | ✅ 完整可运行的实验代码 |
-| **实验执行** | ❌ | ✅ **自动提交 GPU 训练（本地/SLURM）** |
-| 结果分析 | ❌ | ✅ 解析真实训练日志和指标 |
-| 论文配图 | ❌ | ✅ 基于真实数据生成图表 |
-| 论文撰写 | 大纲/草稿 | ✅ 基于实验证据的完整 LaTeX 论文 |
-| 断点续跑 | ❌ | ✅ 任意阶段失败可恢复 |
-| 多模型协作 | 单一模型 | ✅ 每个阶段可配置不同模型 |
+| **GPU 实验执行** | ❌ | ✅ **本地 / SLURM 自动训练** |
+| 结果分析 | ❌ | ✅ 解析真实训练日志 |
+| 论文配图 | ❌ | ✅ 基于真实数据 |
+| 论文撰写 | 大纲/草稿 | ✅ 完整 LaTeX 论文 |
+| 断点续跑 | ❌ | ✅ 任意阶段可恢复 |
+| 多模型协作 | 单一模型 | ✅ 按阶段路由 |
 
-## Use Cases
+---
 
-- **科研原型验证** — 快速将一个研究想法变成完整的实验+论文工作空间
-- **自主实验** — 让系统自动生成代码、提交 GPU 训练、分析结果
+## 🎯 应用场景
+
+- **科研原型验证** — 快速将研究想法变成完整的实验 + 论文工作空间
+- **自主实验** — 系统自动生成代码、提交 GPU 训练、分析结果
 - **Benchmark 批量生成** — 对多个课题批量运行，生成可复现的实验结果
 - **论文初稿辅助** — 基于真实实验数据产出 LaTeX 草稿，加速写作
-- **科研流程审计** — 完整的工作空间、中间产物和日志，可追溯每一步
+- **科研流程审计** — 完整工作空间、中间产物和日志，可追溯每一步
 
-## Showcase
+---
 
-### Generated Research Workspace
+## 🖼️ 效果展示
 
-一次典型的 NanoResearch 运行会产出一个完整、可检查的工作空间：
+<div align="center">
+  <img src="imgs/before_after.png" alt="告别手动科研" width="90%" />
+  <p><b>告别手动科研的痛苦循环</b></p>
+  <p>不再反复调试失败的实验、手动整理数据、从零写论文——<br/>NanoResearch 将完整科研流程自动化，让你专注于真正的研究创新。</p>
+</div>
 
-- 文献检索与实验规划产物
-- 可运行的实验代码
-- 自动生成的论文配图
-- LaTeX 论文源码和参考文献
-- 可导出的论文打包文件
+<a id="cli-tui-vs-plain"></a>
 
-### Example Outputs
+### CLI：标准输出与 TUI 模式对比
+
+CLI 支持 **传统流式日志（非 TUI）** 与 **全屏 TUI 面板** 两种呈现方式，可按习惯切换。
+
+<div align="center" style="max-width: 720px; margin: 0 auto;">
+  <p><b>标准输出（非 TUI）</b></p>
+  <img src="imgs/demo_no_tui_mode.png" width="100%" alt="NanoResearch CLI 标准输出模式" style="max-width: 100%; border-radius: 8px;" />
+  <p><sub><b>非 TUI</b>：经典终端日志流，便于重定向与脚本集成</sub></p>
+</div>
+<div align="center" style="max-width: 720px; margin: 0 auto; margin-top: 1.5em;">
+  <p><b>TUI 模式</b></p>
+  <img src="imgs/demo_tui_mode.png" width="100%" alt="NanoResearch CLI TUI 模式" style="max-width: 100%; border-radius: 8px;" />
+  <p><sub><b>TUI</b>：结构化面板与状态分区，适合交互式监控</sub></p>
+</div>
+
+### 示例输出
 
 <table>
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/user-attachments/assets/107daa4a-775e-4168-a12a-128b4680141b" alt="Framework Overview" width="95%" />
+      <img src="imgs/framework_overview.png" alt="框架概览" width="95%" />
       <br />
-      <sub><b>Framework Overview</b></sub>
+      <sub><b>框架概览</b></sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/user-attachments/assets/2491d8ba-c263-4402-b8bb-52e355b5cec1" alt="Examples" width="95%" />
+      <img src="imgs/examples.png" alt="生成论文示例" width="95%" />
       <br />
-      <sub><b>Examples</b></sub>
+      <sub><b>生成论文示例</b></sub>
     </td>
   </tr>
-</table>
-
-<table>
   <tr>
     <td align="center" width="50%">
-      <img src="https://github.com/user-attachments/assets/e6f397cb-02cb-46e6-9c77-0e5aa3ba6486" alt="Main Results" width="95%" />
+      <img src="imgs/main_results.png" alt="主结果" width="95%" />
       <br />
-      <sub><b>Main Results</b></sub>
+      <sub><b>主结果（真实实验数据）</b></sub>
     </td>
     <td align="center" width="50%">
-      <img src="https://github.com/user-attachments/assets/ce930071-176a-4708-a09d-a80e607e68c8" alt="Ablation" width="95%" />
+      <img src="imgs/ablation.png" alt="消融实验" width="95%" />
       <br />
-      <sub><b>Ablation</b></sub>
+      <sub><b>消融实验</b></sub>
     </td>
   </tr>
 </table>
 
-## Pipeline
+---
+
+## 🔬 流水线
 
 ```text
 Research Topic
-  ↓
-IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
-  ↓
-Exported workspace: paper.pdf / paper.tex / references.bib / figures / code / data
+     ↓
+ IDEATION → PLANNING → SETUP → CODING → EXECUTION → ANALYSIS → FIGURE_GEN → WRITING → REVIEW
+     ↓
+ Exported: paper.pdf / paper.tex / references.bib / figures / code / data
 ```
 
-### Stage Summary
+<details>
+<summary><b>📋 各阶段详细说明</b></summary>
 
 | Stage | 功能 | 说明 |
 |-------|------|------|
 | `IDEATION` | 文献检索与创意生成 | 搜索学术文献、发现研究空白、提出假说、收集必引文献 |
-| `PLANNING` | 实验方案设计 | 将研究想法转化为详细的实验蓝图 |
+| `PLANNING` | 实验方案设计 | 将研究想法转化为详细的实验蓝图（数据集、基线、指标、消融） |
 | `SETUP` | 环境准备 | 准备代码仓库、依赖环境、模型和数据集 |
 | `CODING` | 代码生成 | 生成完整可运行的实验项目（含训练脚本、数据处理、模型定义） |
 | `EXECUTION` | **实验执行** | **在本地 GPU 或 SLURM 集群上运行训练，支持自动重试和调试** |
@@ -172,40 +249,28 @@ Exported workspace: paper.pdf / paper.tex / references.bib / figures / code / da
 | `WRITING` | 论文撰写 | 基于实验证据和引用撰写 LaTeX 论文 |
 | `REVIEW` | 审稿与修订 | 自动审阅各章节，检测问题并修订 |
 
-### Execution Details
+</details>
+
+<details>
+<summary><b>🚀 EXECUTION 阶段核心能力</b></summary>
 
 `EXECUTION` 阶段是 NanoResearch 的核心差异化能力：
 
-- **自动提交 SLURM 作业**：生成 sbatch 脚本，提交到集群，监控作业状态
-- **本地 GPU 执行**：自动检测可用 GPU，管理训练进程
-- **自动调试与重试**：训练失败时自动分析错误日志，修复代码并重新执行
-- **实时日志监控**：追踪训练进度和指标变化
-- **混合执行模式**：可根据任务复杂度在本地和集群之间自动切换
+- **自动提交 SLURM 作业** — 生成 sbatch 脚本，提交到集群，监控作业状态
+- **本地 GPU 执行** — 自动检测可用 GPU，管理训练进程
+- **自动调试与重试** — 训练失败时自动分析错误日志，修复代码并重新执行
+- **实时日志监控** — 追踪训练进度和指标变化
+- **混合执行模式** — 可根据任务复杂度在本地和集群之间自动切换
 
-## Key Capabilities
+</details>
 
-### Grounded Writing
-- 论文内容基于结构化实验证据、引用和实验产物，而非纯文本生成
-- 追踪必引文献及引用质量
-- 输出带 BibTeX 支持的 LaTeX 论文
+---
 
-### Real Experiment Evidence
-- 写作和配图消费真实的实验输出和分析产物
-- 表格、数据声明和图表绑定到实际实验结果
-- 保留中间 JSON 产物，便于调试和审计
+## 📦 快速开始
 
-### Hybrid Figure Generation
-- 架构图可由图像模型生成
-- 结果图和消融图由代码生成（基于真实数据）
-- 图表提示、脚本和输出均保存在工作空间中
+遵循以下步骤，约 5 分钟即可完成从安装到首次运行的完整流程。
 
-### Checkpoint & Resume
-- 每个阶段的产物写入磁盘，失败可从上次断点恢复
-- 避免从头重跑整个流水线
-
-## Quick Start
-
-### 1) Install
+### 步骤一：安装
 
 ```bash
 git clone https://github.com/OpenRaiser/NanoResearch.git
@@ -213,16 +278,20 @@ cd NanoResearch
 pip install -e ".[dev]"
 ```
 
-### 2) Configure
+### 步骤二：配置
 
-创建 `~/.nanoresearch/config.json`。**需替换 `base_url` 和 `api_key` 为你自己的 OpenAI 兼容 API 端点**，并为每个阶段选择可用的模型：
+> [!TIP]
+> 创建 `~/.nanobot/config.json`，替换 `base_url` 和 `api_key` 为你自己的 OpenAI 兼容 API 端点。
+
+<details>
+<summary><b>查看完整配置示例</b></summary>
 
 ```json
 {
   "research": {
     "base_url": "https://your-openai-compatible-endpoint/v1/",
     "api_key": "your-api-key",
-    "template_format": "neurips",
+    "template_format": "neurips2025",
     "execution_profile": "local_quick",
     "writing_mode": "hybrid",
     "max_retries": 2,
@@ -243,76 +312,85 @@ pip install -e ".[dev]"
 }
 ```
 
-#### Recommended Models
+</details>
+
+环境变量覆盖：`NANORESEARCH_BASE_URL` / `NANORESEARCH_API_KEY` / `NANORESEARCH_TIMEOUT`
+
+### 步骤三：验证与运行
+
+```bash
+# 验证配置
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
+
+# 启动完整流水线
+nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips2025 --verbose
+
+# 从断点恢复（若某阶段失败）
+nanoresearch resume --workspace ~/.nanobot/workspace/research/{session_id} --verbose
+
+# 导出论文
+nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./my_paper
+```
+
+### 步骤四：预期输出
+
+完成流水线后，你将得到包含真实实验数据的论文配图与 LaTeX 源码。以下为实测输出示例：
+
+<table>
+  <tr>
+    <td align="center" width="33%">
+      <img src="imgs/recognition_1.jpg" width="95%" alt="实验结果"/>
+      <br /><sub><b>实验结果</b></sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="imgs/recognition_2.jpg" width="95%" alt="主结果对比"/>
+      <br /><sub><b>主结果对比</b></sub>
+    </td>
+    <td align="center" width="33%">
+      <img src="imgs/recognition_3.jpg" width="95%" alt="消融与可视化"/>
+      <br /><sub><b>消融与可视化</b></sub>
+    </td>
+  </tr>
+</table>
+
+> <!-- 可选：添加配置截图 imgs/quickstart_config.png、运行终端截图 imgs/quickstart_run.png 以增强说明 -->
+
+---
+
+## 🤖 推荐模型
 
 | Stage | 任务 | 推荐模型 | 经济型 |
 |-------|------|---------|-------|
-| `ideation` | 文献检索+假说生成 | DeepSeek-V3.2 | DeepSeek-V3.2 |
+| `ideation` | 文献检索 + 假说生成 | DeepSeek-V3.2 | DeepSeek-V3.2 |
 | `planning` | 实验设计 | Claude Sonnet 4.6 | DeepSeek-V3.2 |
 | `code_gen` | 代码生成 | GPT-5.2-Codex / Claude Opus 4.6 | DeepSeek-V3.2 |
 | `writing` | 论文撰写 | Claude Opus 4.6 / Claude Sonnet 4.6 | DeepSeek-V3.2 |
 | `figure_prompt` | 图表描述 | GPT-5.2 | DeepSeek-V3.2 |
 | `figure_code` | 图表绘制代码 | Claude Opus 4.6 | DeepSeek-V3.2 |
 | `figure_gen` | AI 架构图生成 | Gemini 3.1 Flash（原生图像生成） | Gemini 3.1 Flash |
-| `review` | 审稿+修订 | Claude Sonnet 4.6 / Gemini Flash | DeepSeek-V3.2 |
+| `review` | 审稿 + 修订 | Claude Sonnet 4.6 / Gemini Flash | DeepSeek-V3.2 |
 
 > **说明**：所有文本模型通过单一 OpenAI 兼容端点访问。对于不支持 temperature 的模型（如 Codex、o 系列），设置 `temperature: null`。`figure_gen` 使用 Gemini 原生图像生成 API，需设置 `"image_backend": "gemini"`。
 
-#### Estimated Cost
+### 💰 预估费用
 
 | 场景 | 模型选择 | 时间 | 预估费用 |
 |------|---------|------|---------|
 | **仅生成论文**（跳过实验） | 全部 DeepSeek-V3.2 | ~30 分钟 | ~$0.5 - $1 |
 | **仅生成论文**（跳过实验） | 混合（Claude 写作，DeepSeek 其余） | ~30 分钟 | ~$3 - $8 |
 | **完整流水线**（含实验） | 全部 DeepSeek-V3.2 | 2 - 5 小时 | ~$1 - $3 |
-| **完整流水线**（含实验） | 混合（Claude/GPT 写作+代码，DeepSeek 其余） | 2 - 5 小时 | ~$10 - $20 |
+| **完整流水线**（含实验） | 混合（Claude/GPT 代码+写作） | 2 - 5 小时 | ~$10 - $20 |
 
-> 完整流水线的执行时间取决于实验复杂度和计算资源（本地 GPU vs SLURM 集群）。"仅生成论文"模式通过 `"skip_stages": ["SETUP", "CODING", "EXECUTION", "ANALYSIS"]` 跳过实验相关阶段。
+> "仅生成论文"模式通过 `"skip_stages": ["SETUP", "CODING", "EXECUTION", "ANALYSIS"]` 跳过实验阶段。
 
-环境变量覆盖：
+---
 
-- `NANORESEARCH_BASE_URL`
-- `NANORESEARCH_API_KEY`
-- `NANORESEARCH_TIMEOUT`
-
-#### Literature Search API Keys (optional)
-
-IDEATION 阶段使用 OpenAlex 和 Semantic Scholar 检索学术文献。不配置 API Key 也能运行（匿名访问），但速率限制较低。
-
-| Service | 获取方式 | Config key | Env variable |
-|---------|---------|------------|--------------|
-| [OpenAlex](https://developers.openalex.org/) | 免费 — [openalex.org/settings/api-key](https://openalex.org/settings/api-key) | `openalex_api_key` | `OPENALEX_API_KEY` |
-| [Semantic Scholar](https://www.semanticscholar.org/product/api#api-key) | 免费 — [semanticscholar.org](https://www.semanticscholar.org/product/api#api-key) | `s2_api_key` | `S2_API_KEY` |
-
-### 3) Validate
-
-```bash
-nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --dry-run
-```
-
-### 4) Run
-
-```bash
-nanoresearch run --topic "Adaptive Sparse Attention Mechanisms" --format neurips --verbose
-```
-
-### 5) Resume
-
-```bash
-nanoresearch resume --workspace ~/.nanoresearch/workspace/research/{session_id} --verbose
-```
-
-### 6) Export
-
-```bash
-nanoresearch export --workspace ~/.nanoresearch/workspace/research/{session_id} --output ./my_paper
-```
-
-## Claude Code Mode
+## 🧩 Claude Code 模式
 
 除了 Python CLI，NanoResearch 还支持通过 **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** 直接驱动研究流水线——**无需配置任何 API Key**。
 
-### 工作原理
+<details>
+<summary><b>工作原理</b></summary>
 
 在 Claude Code 集成模式下，Claude Code 本身就是研究引擎：
 
@@ -320,25 +398,22 @@ nanoresearch export --workspace ~/.nanoresearch/workspace/research/{session_id} 
 - **Bash** 执行实验代码、提交 SLURM 作业、编译 LaTeX
 - **文件读写** 生成实验代码、论文和结构化产物
 
-### Quick Start
+</details>
+
+### 快速开始
 
 ```bash
-# 1. Clone 项目
 git clone https://github.com/OpenRaiser/NanoResearch.git
 cd NanoResearch
-
-# 2. 启动 Claude Code（确保已安装 claude CLI）
 claude
-
-# 3. 在 Claude Code 中运行完整流水线
-/project:research "Your Research Topic Here"
+/project:research "你的研究课题"
 ```
 
-### Available Commands
+### 可用命令
 
-| Command | 功能 |
+| 命令 | 功能 |
 |---------|------|
-| `/project:research <topic>` | 运行完整 9 阶段流水线 |
+| `/project:research <课题>` | 运行完整 9 阶段流水线 |
 | `/project:ideation <topic>` | Stage 1: 文献检索 + 假说生成 |
 | `/project:planning` | Stage 2: 实验方案设计 |
 | `/project:experiment` | Stages 3-5: 环境准备 + 代码生成 + 实验执行 |
@@ -348,25 +423,15 @@ claude
 | `/project:status` | 查看当前流水线状态 |
 | `/project:resume` | 从断点恢复流水线 |
 
-### Example Workflow
-
-```bash
-# 启动一个完整的研究项目
-/project:research "Dropout Regularization Comparison on Tabular Data"
-
-# 查看当前进度
-/project:status
-
-# 如果中途失败，从断点恢复
-/project:resume
-```
-
-### Tips
+<details>
+<summary><b>💡 Tips</b></summary>
 
 - **架构图生成**：推荐使用 Nano Banana 系列图像模型生成高质量架构图。Claude Code 模式下可在 `figure_gen` 阶段通过 Bash 调用图像生成 API。
-- **LaTeX 编译**：推荐使用 `tectonic` 替代 `pdflatex`。Conda 安装的 texlive 可能缺少 `pdflatex.fmt`，导致编译失败。安装 tectonic：`conda install -c conda-forge tectonic`。
+- **LaTeX 编译**：推荐使用 `tectonic` 替代 `pdflatex`。安装：`conda install -c conda-forge tectonic`。
 - **断点续跑**：所有阶段的产物保存在 `manifest.json` 中，支持任意阶段恢复。
 - **与 Python CLI 兼容**：Claude Code 模式生成的工作空间与 Python CLI 完全兼容，可混合使用两种模式。
+
+</details>
 
 ---
 
@@ -413,9 +478,57 @@ Codex 使用与 CLI 相同的 topic 前缀约定：
 | `local_quick` | 优先本地执行，需要时可升级到 SLURM |
 | `cluster_full` | 集群优先，适合重量级实验 |
 
-## CLI Commands
+### 模型路由
 
-| Command | 用途 |
+NanoResearch 通过统一配置层将不同阶段路由到不同模型，让你按任务特性混合搭配，而非强制所有阶段使用同一模型。
+
+<details>
+<summary><b>可路由的阶段</b></summary>
+
+- `ideation` — 文献检索与创意
+- `planning` — 实验设计
+- `experiment` — 实验相关
+- `code_gen` — 代码生成
+- `writing` — 论文撰写
+- `figure_prompt` — 图表描述
+- `figure_code` — 图表代码
+- `figure_gen` — 图像生成
+- `review` — 审稿
+- `revision` — 修订
+
+系统基于 **OpenAI 兼容端点**构建，支持按阶段覆盖配置。
+
+</details>
+
+### 文献检索 API Keys（可选）
+
+IDEATION 阶段使用 OpenAlex 和 Semantic Scholar 检索学术文献。不配置也能运行（匿名访问），但速率限制较低。
+
+| Service | 获取方式 | Config key | Env variable |
+|---------|---------|------------|--------------|
+| [OpenAlex](https://developers.openalex.org/) | 免费 | `openalex_api_key` | `OPENALEX_API_KEY` |
+| [Semantic Scholar](https://www.semanticscholar.org/product/api#api-key) | 免费 | `s2_api_key` | `S2_API_KEY` |
+
+### 论文格式
+
+模板从 `nanoresearch/templates/` 自动发现。内置模板：
+
+| Format | 用途 |
+|--------|------|
+| `arxiv` | arXiv 预印本 |
+| `icml` | ICML 会议 |
+| `neurips` | NeurIPS 会议 |
+| `neurips2025` | NeurIPS 2025 |
+
+```bash
+nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2025
+```
+
+---
+
+## 💻 CLI 参考
+
+| 命令 | 用途 |
 |---------|------|
 | `nanoresearch run --topic "..."` | 启动新的流水线运行 |
 | `nanoresearch resume --workspace ...` | 从上次断点恢复 |
@@ -431,9 +544,39 @@ Codex 使用与 CLI 相同的 topic 前缀约定：
 nanoresearch --help
 ```
 
-## Output Structure
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
 
-导出的论文目录：
+---
+
+## 🍪 示例与 Demo
+
+官方示例与进阶用法，助你快速上手 NanoResearch：
+
+👉 **[浏览示例与 Demo](https://github.com/OpenRaiser/NanoResearch)** <!-- TODO: 若有 docs/ 或 examples/ 目录，请替换为具体路径，如 .../blob/main/docs/README.md -->
+
+<details>
+<summary><b>快速示例命令</b></summary>
+
+```bash
+# 完整流水线 + 详细日志
+nanoresearch run --topic "Adaptive Sparse Attention" --format neurips2025 --verbose
+
+# 导出并查看
+nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --output ./paper_out
+```
+
+> 仅生成论文（跳过实验）：在 config 中设置 `"skip_stages": ["SETUP", "CODING", "EXECUTION", "ANALYSIS"]`
+
+</details>
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
+
+---
+
+## 📂 输出结构
+
+<details>
+<summary><b>导出的论文目录</b></summary>
 
 ```text
 my_paper/
@@ -446,87 +589,41 @@ my_paper/
 └── manifest.json
 ```
 
-完整工作空间（含中间产物）：
+</details>
+
+<details>
+<summary><b>完整工作空间（含中间产物）</b></summary>
 
 ```text
-~/.nanoresearch/workspace/research/{session_id}/
-├── manifest.json
-├── papers/
-├── plans/
-├── code/
-├── figures/
-├── drafts/
-├── logs/
-└── ...
+~/.nanobot/workspace/research/{session_id}/
+├── manifest.json          # 流水线状态追踪
+├── papers/                # 文献检索产物
+├── plans/                 # 实验方案和分析
+├── experiment/            # 生成的实验代码 + 结果
+├── figures/               # 生成的论文配图
+├── drafts/                # 论文草稿和审稿意见
+├── output/                # 最终导出（main.tex / main.pdf）
+└── logs/                  # 运行日志
 ```
 
-## Model Routing
+</details>
 
-NanoResearch 通过统一配置层将不同阶段路由到不同模型，让你可以按任务特性混合搭配模型，而非强制所有阶段使用同一模型。
+---
 
-可路由的阶段：
-
-- `ideation` — 文献检索与创意
-- `planning` — 实验设计
-- `experiment` — 实验相关
-- `code_gen` — 代码生成
-- `writing` — 论文撰写
-- `figure_prompt` — 图表描述
-- `figure_code` — 图表代码
-- `figure_gen` — 图像生成
-- `review` — 审稿
-- `revision` — 修订
-
-系统基于 **OpenAI 兼容端点**构建，支持按阶段覆盖配置。
-
-## Paper Formats
-
-模板从 `nanoresearch/templates/` 自动发现。当前内置模板：
-
-- `arxiv`
-- `icml`
-- `neurips`
-
-```bash
-nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips
-```
-
-## Project Structure
-
-```text
-nanoresearch/
-├── nanoresearch/
-│   ├── cli.py
-│   ├── config.py
-│   ├── agents/
-│   ├── pipeline/
-│   ├── schemas/
-│   └── templates/
-├── mcp_server/
-├── skills/
-├── outputs/
-├── PROJECT_DOCUMENTATION.md
-└── pyproject.toml
-```
-
-### Important Modules
-
-- `nanoresearch/agents/` — 各阶段 Agent（文献检索、实验设计、代码生成、执行、分析、配图、写作、审稿）
-- `nanoresearch/pipeline/` — 编排器、状态机、多模型调度、工作空间管理
-- `nanoresearch/templates/` — LaTeX 模板和会议格式
-- `mcp_server/` — 研究和文档工作流的工具服务集成
-
-## Feishu Bot
+## 💬 飞书机器人
 
 NanoResearch 内置飞书（Lark）机器人，可直接在飞书聊天中触发流水线、查看进度、接收论文——无需打开终端。
 
-### Prerequisites
+<details>
+<summary><b>配置与启动</b></summary>
+
+**1. 安装依赖**
 
 ```bash
 pip install lark-oapi
 ```
 
-### Configure
+**2. 配置**
 
 在 [open.feishu.cn](https://open.feishu.cn) 创建自定义应用并获取 App ID 和 App Secret：
 
@@ -535,7 +632,7 @@ export FEISHU_APP_ID="cli_xxx"
 export FEISHU_APP_SECRET="xxx"
 ```
 
-或写入 `~/.nanoresearch/config.json`：
+或写入 `~/.nanobot/config.json`：
 
 ```json
 {
@@ -546,7 +643,7 @@ export FEISHU_APP_SECRET="xxx"
 }
 ```
 
-### Launch
+**3. 启动**
 
 ```bash
 nanoresearch feishu          # 启动机器人
@@ -555,9 +652,11 @@ nanoresearch feishu -v       # 详细日志模式
 
 机器人通过 WebSocket 长连接通信（无需公网服务器或 Webhook URL）。按 `Ctrl+C` 停止。
 
-### Supported Commands
+</details>
 
-| Command | 描述 |
+### 支持的命令
+
+| 命令 | 描述 |
 |---------|------|
 | `/run <课题>` | 对指定课题启动研究流水线 |
 | `/status` | 查看当前任务进度 |
@@ -567,62 +666,150 @@ nanoresearch feishu -v       # 详细日志模式
 | `/new` | 清除对话记忆，重新开始 |
 | `/help` | 显示帮助信息 |
 
-### Natural Language Mode
+也可以直接自然语言聊天——机器人充当 AI 科研助手，支持对话记忆，流水线完成后自动发送 `paper.pdf`。
 
-也可以直接自然语言聊天——机器人充当 AI 科研助手：
+---
 
-- **提问科研问题**："多模态学习最新进展有哪些？"
-- **请求写论文**："帮我写一篇关于自适应稀疏注意力的论文"——机器人会引导你回答 5 个快速问题（课题、论文类型、数据场景、创新偏好、目标），然后自动启动流水线
-- **对话记忆**：机器人在对话内保持上下文记忆，使用 `/new` 重置
+## 🏗️ 项目结构
 
-流水线完成后，机器人自动将编译好的 `paper.pdf` 发送到聊天中。
+```text
+nanoresearch/
+├── nanoresearch/
+│   ├── cli.py              # 🖥️ CLI 入口
+│   ├── config.py           # ⚙️ 配置管理
+│   ├── agents/             # 🧠 各阶段 Agent
+│   │   ├── ideation.py     #    文献检索与假说
+│   │   ├── planning.py     #    实验方案设计
+│   │   ├── coding.py       #    代码生成
+│   │   ├── execution/      #    本地/集群执行
+│   │   ├── analysis/       #    结果分析
+│   │   ├── figure_gen/     #    图表生成
+│   │   ├── writing/        #    论文撰写
+│   │   └── review/         #    审稿与修订
+│   ├── pipeline/           # 🔄 编排器 & 状态机
+│   ├── schemas/            # 📋 Pydantic 数据模型
+│   ├── prompts/            # 💬 YAML 提示词模板
+│   ├── templates/          # 📄 LaTeX Jinja2 模板
+│   └── latex/              # 🔧 LaTeX 自动修复
+├── mcp_server/             # 🔌 MCP 工具服务
+├── skills/                 # 🎯 Claude Code 技能
+└── pyproject.toml
+```
 
-## FAQ
+---
 
-### NanoResearch 真的会运行实验吗？
+## ❓ 常见问题
+
+<details>
+<summary><b>NanoResearch 真的会运行实验吗？</b></summary>
 
 是的。流水线会生成可运行的代码，在本地 GPU 或 SLURM 集群上执行，并将实验产物传递给后续的分析、配图和写作阶段。**论文中的数据来自真实实验，而非模型编造。**
 
-### 可以断点续跑吗？
+</details>
+
+<details>
+<summary><b>可以断点续跑吗？</b></summary>
 
 可以。工作空间按阶段保存检查点，`nanoresearch resume --workspace ...` 会从上次未完成或失败的阶段继续。
 
-### 每个阶段都需要配置模型吗？
+</details>
 
-不需要。NanoResearch 支持按阶段配置模型路由，文献检索、代码生成、写作、配图和审稿可以使用不同模型，也可以全部使用同一个模型。
+<details>
+<summary><b>每个阶段都需要配置模型吗？</b></summary>
 
-### 生成的论文可以直接投稿吗？
+不需要。NanoResearch 支持按阶段配置模型路由，也可以全部使用同一个模型。
+
+</details>
+
+<details>
+<summary><b>生成的论文可以直接投稿吗？</b></summary>
 
 建议将其视为高质量初稿，而非最终投稿版本。系统可以生成完整的论文工作空间和编译好的 PDF，但人工审阅和修订仍然必要。
 
-## Requirements
+</details>
+
+<details>
+<summary><b>LaTeX 编译推荐什么工具？</b></summary>
+
+推荐使用 `tectonic`。Conda 安装的 texlive 可能缺少 `pdflatex.fmt`，导致编译失败且修复困难。`tectonic` 会自动下载所需的 TeX 包，无需额外配置。
+
+```bash
+conda install -c conda-forge tectonic
+```
+
+</details>
+
+---
+
+## 🎯 路线图
+
+- [x] 9 阶段统一流水线
+- [x] 本地 GPU + SLURM 集群执行
+- [x] Claude Code 集成模式
+- [x] 飞书机器人
+- [x] 多会议论文模板（NeurIPS / ICML / arXiv）
+- [x] 断点续跑与多模型路由
+- [ ] 更多 Demo 与教程
+- [ ] Benchmark 评估套件
+- [ ] Web 端工作空间 UI
+- [ ] 更多论文格式支持
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
+
+---
+
+## 🤝 贡献
+
+欢迎开发者、研究者贡献代码与创意。
+
+### 👥 社区与交流
+
+加入微信群交流、答疑、协作。扫码加入：
+
+<p align="center">
+  <img src="imgs/wechat_group.png" alt="WeChat Group QR Code" width="220"/>
+</p>
+
+<a href="https://github.com/OpenRaiser/NanoResearch/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=OpenRaiser/NanoResearch" alt="Contributors" />
+</a>
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
+
+---
+
+## 📋 环境要求
 
 - Python **3.10+**
 - **OpenAI 兼容 API 端点**（用于文本模型阶段）
 - 可选：图像模型访问权限（用于部分配图）
 - `tectonic` 或 `pdflatex`（用于 PDF 编译）
 
-> **推荐使用 `tectonic`**：Conda 安装的 texlive 可能缺少 `pdflatex.fmt`，导致编译失败且修复困难。`tectonic` 会自动下载所需的 TeX 包，无需额外配置。
+---
 
-```bash
-conda install -c conda-forge tectonic
-```
-
-## Acknowledgements
+## 🙏 致谢
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — Claude Code 的科研技能扩展
-- [nanobot](https://github.com/HKUDS/nanobot) — nanobot: 轻量级OpenClaw
 
-## Star History
+---
 
-<a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark&v=1" />
-    <img width="100%" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&v=1" />
-  </picture>
-</a>
+## ⭐ Star History
 
-## Citation
+<div align="center">
+  <a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" />
+      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" width="100%" />
+    </picture>
+  </a>
+</div>
+
+---
+
+## 📝 引用
+
+如有帮助，请引用：
 
 ```bibtex
 @software{nanoresearch2026,
@@ -633,11 +820,21 @@ conda install -c conda-forge tectonic
 }
 ```
 
-## 📄 License
+---
 
-This project is licensed under [MIT License](LICENSE).
+## 📄 许可证
 
-<p align="center">
-  <em> Thanks for visiting ✨ NanoResearch!</em><br><br>
-  <img src="https://visitor-badge.laobi.icu/badge?page_id=OpenRaiser.NanoResearch&style=for-the-badge&color=00d4ff" alt="Views">
-</p>
+MIT
+
+<p align="right"><a href="#top">🔝 返回顶部</a></p>
+
+---
+
+<div align="center">
+  <p>
+    <a href="https://github.com/OpenRaiser/NanoResearch"><img src="https://img.shields.io/badge/⭐_Star_us_on_GitHub-1a1a2e?style=for-the-badge&logo=github&logoColor=white" alt="Star"></a>
+    <a href="https://github.com/OpenRaiser/NanoResearch/issues"><img src="https://img.shields.io/badge/🐛_Report_Issues-ff6b6b?style=for-the-badge&logo=github&logoColor=white" alt="Issues"></a>
+    <a href="https://github.com/OpenRaiser/NanoResearch/discussions"><img src="https://img.shields.io/badge/💬_Discussions-4ecdc4?style=for-the-badge&logo=github&logoColor=white" alt="Discussions"></a>
+  </p>
+  <sub>NanoResearch 仅供教育、研究及技术交流使用。</sub>
+</div>
