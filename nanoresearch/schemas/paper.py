@@ -75,11 +75,17 @@ class PaperSkeleton(BaseModel):
     @field_validator("template_format")
     @classmethod
     def _check_template(cls, v: str) -> str:
+        import re
+
         from nanoresearch.templates import get_available_formats
 
         available = get_available_formats()
-        if v not in available:
-            raise ValueError(
-                f"Unknown template_format {v!r}. Available: {available}"
-            )
-        return v
+        if v in available:
+            return v
+        # Strip trailing year suffix: "neurips2025" -> "neurips"
+        base = re.sub(r"\d{4}$", "", v)
+        if base in available:
+            return base
+        raise ValueError(
+            f"Unknown template_format {v!r}. Available: {available}"
+        )

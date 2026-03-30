@@ -118,6 +118,9 @@ class DeepPipelineOrchestrator(BaseOrchestrator):
         last_error: str,
     ) -> dict[str, Any]:
         inputs: dict[str, Any] = {}
+        # Pass error context from previous attempt so agent can adapt
+        if last_error:
+            inputs["_last_error"] = last_error
 
         if stage == PipelineStage.IDEATION:
             inputs["topic"] = topic

@@ -67,6 +67,8 @@ class PipelineOrchestrator(BaseOrchestrator):
         last_error: str,
     ) -> dict[str, Any]:
         inputs: dict[str, Any] = {}
+        if last_error:
+            inputs["_last_error"] = last_error
 
         if stage == PipelineStage.IDEATION:
             inputs["topic"] = topic

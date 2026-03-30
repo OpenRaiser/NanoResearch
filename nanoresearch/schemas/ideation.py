@@ -149,6 +149,10 @@ class IdeationOutput(BaseModel):
         default_factory=list,
         description="Future research directions extracted from paper future work sections (for surveys)",
     )
+    search_warnings: list[str] = Field(
+        default_factory=list,
+        description="Warnings from search APIs that failed (non-fatal, for downstream awareness)",
+    )
 
     @field_validator("topic", "survey_summary", "selected_hypothesis", "rationale", mode="before")
     @classmethod

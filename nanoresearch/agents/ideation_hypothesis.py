@@ -293,6 +293,86 @@ Return ONLY valid JSON."""
             rationale=result.get("rationale", ""),
         )
 
+    # ── Idea Tournament: pairwise comparison for hypothesis selection ──
+
+    _TOURNAMENT_SYSTEM = (
+        "You are a research hypothesis evaluator. Compare two hypotheses and pick the stronger one.\n"
+        "Consider: novelty, feasibility, potential impact, and clarity.\n"
+        "Reply with ONLY the hypothesis_id of the winner (e.g. HYP-001). Nothing else."
+    )
+
+    async def _tournament_select(
+        self, hypotheses: list[dict], topic: str
+    ) -> str:
+        """Pairwise tournament to select the best hypothesis.
+
+        Each pair is compared via a cheap LLM call. The hypothesis with the
+        most wins is selected. Ties are broken by original order.
+
+        Returns:
+            hypothesis_id of the winner.
+        """
+        if len(hypotheses) <= 1:
+            return hypotheses[0].get("hypothesis_id", "HYP-001") if hypotheses else ""
+
+        ids = [h.get("hypothesis_id", f"HYP-{i+1:03d}") for i, h in enumerate(hypotheses)]
+        wins: dict[str, int] = {hid: 0 for hid in ids}
+
+        # Use the cheapest available model for comparisons
+        from nanoresearch.config import StageModelConfig
+        cheap_config = StageModelConfig(
+            model=self.config.evidence_extraction.model,
+            temperature=0.1,
+            max_tokens=32,
+        )
+
+        pairs = [(i, j) for i in range(len(hypotheses)) for j in range(i + 1, len(hypotheses))]
+        self.log(f"Tournament: {len(hypotheses)} hypotheses, {len(pairs)} comparisons")
+
+        async def _compare(i: int, j: int) -> str | None:
+            h_a, h_b = hypotheses[i], hypotheses[j]
+            prompt = (
+                f"Research topic: {topic}\n\n"
+                f"Hypothesis A ({ids[i]}):\n"
+                f"  Statement: {h_a.get('statement', '')}\n"
+                f"  Novelty: {h_a.get('novelty_justification', '')}\n"
+                f"  Feasibility: {h_a.get('feasibility_notes', '')}\n\n"
+                f"Hypothesis B ({ids[j]}):\n"
+                f"  Statement: {h_b.get('statement', '')}\n"
+                f"  Novelty: {h_b.get('novelty_justification', '')}\n"
+                f"  Feasibility: {h_b.get('feasibility_notes', '')}\n\n"
+                f"Which is stronger? Reply with ONLY the hypothesis_id."
+            )
+            try:
+                result = await self.generate(
+                    self._TOURNAMENT_SYSTEM, prompt, stage_override=cheap_config,
+                )
+                result = result.strip()
+                # Extract hypothesis_id from response
+                for hid in ids:
+                    if hid in result:
+                        return hid
+                return None
+            except Exception as e:
+                logger.debug("Tournament comparison failed: %s", e)
+                return None
+
+        # Run all comparisons concurrently
+        import asyncio
+        results = await asyncio.gather(*(_compare(i, j) for i, j in pairs))
+
+        for winner in results:
+            if winner and winner in wins:
+                wins[winner] += 1
+
+        # Sort by wins (descending), tie-break by original order
+        ranked = sorted(ids, key=lambda hid: -wins[hid])
+        best = ranked[0]
+
+        win_str = ", ".join(f"{hid}={wins[hid]}W" for hid in ranked)
+        self.log(f"Tournament results: {win_str} -> winner: {best}")
+        return best
+
     async def _search_github_repos(self, topic: str, queries: list[str]) -> list[dict]:
         search_repos = await _get_github_search()
         all_repos: dict[str, dict] = {}

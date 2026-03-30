@@ -147,6 +147,7 @@ def deep(
         help="Unified execution profile",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
+    dev: bool = typer.Option(False, "--dev", help="Dev mode: skip experiment stages"),
 ) -> None:
     """Compatibility alias for the unified deep-backbone pipeline."""
     _setup_logging(verbose)
@@ -156,6 +157,11 @@ def deep(
     config.template_format = format
     if profile is not None:
         config.execution_profile = profile
+    if dev:
+        for st in ["setup", "coding", "execution", "analysis"]:
+            if st not in config.skip_stages:
+                config.skip_stages.append(st)
+        console.print("[bold #d29922]DEV mode:[/bold #d29922] skipping setup/coding/execution/analysis")
 
     workspace = Workspace.create(
         topic=topic,
@@ -318,3 +324,83 @@ def select_env(
         title="Environment Selected",
         border_style="green",
     ))
+
+
+# ─── Skill management ───
+
+@app.command("skills")
+def skills_cmd(
+    action: str = typer.Argument("list", help="Action: list, install, uninstall, info"),
+    name: str = typer.Argument("", help="Skill name or GitHub URL"),
+    tag: str = typer.Option(None, "--tag", "-t", help="Filter by tag"),
+) -> None:
+    """Manage NanoResearch skills (list, install, uninstall)."""
+    from nanoresearch.skill_registry import SkillRegistry
+
+    registry = SkillRegistry()
+    registry.discover()
+
+    if action == "list":
+        skills = registry.list_skills(tag=tag)
+        if not skills:
+            console.print("[dim]No skills found.[/dim]")
+            if tag:
+                console.print(f"[dim](filtered by tag: {tag})[/dim]")
+            return
+        table = Table(title="NanoResearch Skills")
+        table.add_column("Name", style="bold cyan")
+        table.add_column("Source", width=8)
+        table.add_column("Tags")
+        table.add_column("Description")
+        for s in skills:
+            table.add_row(
+                s.name,
+                f"[green]{s.source}[/green]" if s.source == "builtin" else f"[yellow]{s.source}[/yellow]",
+                ", ".join(s.tags) if s.tags else "[dim]--[/dim]",
+                s.description[:60] if s.description else "[dim]--[/dim]",
+            )
+        console.print(table)
+
+    elif action == "install":
+        if not name:
+            console.print("[red]Usage: nanoresearch skills install <github-url-or-path>[/red]")
+            return
+        if name.startswith(("http://", "https://", "github.com")):
+            url = name if name.startswith("http") else f"https://{name}"
+            console.print(f"Installing from [cyan]{url}[/cyan]...")
+            result = registry.install_from_github(url)
+        else:
+            console.print(f"[red]Local install not yet supported. Use a GitHub URL.[/red]")
+            return
+        if result.get("success"):
+            console.print(f"[green]Installed:[/green] {', '.join(result.get('installed', []))}")
+        else:
+            console.print(f"[red]Failed:[/red] {result.get('message', 'Unknown error')}")
+
+    elif action == "uninstall":
+        if not name:
+            console.print("[red]Usage: nanoresearch skills uninstall <name>[/red]")
+            return
+        if registry.uninstall(name):
+            console.print(f"[green]Uninstalled:[/green] {name}")
+        else:
+            console.print(f"[red]Not found or cannot uninstall:[/red] {name}")
+
+    elif action == "info":
+        if not name:
+            console.print("[red]Usage: nanoresearch skills info <name>[/red]")
+            return
+        skill = registry.get_skill(name)
+        if not skill:
+            console.print(f"[red]Skill not found:[/red] {name}")
+            return
+        console.print(Panel(
+            f"[bold]Name:[/bold] {skill.name}\n"
+            f"[bold]Version:[/bold] {skill.version}\n"
+            f"[bold]Source:[/bold] {skill.source}\n"
+            f"[bold]Tags:[/bold] {', '.join(skill.tags) or 'none'}\n"
+            f"[bold]Path:[/bold] {skill.path}\n\n"
+            f"{skill.description}",
+            title=f"Skill: {skill.name}",
+            border_style="cyan",
+        ))

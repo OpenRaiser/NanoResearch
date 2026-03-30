@@ -116,6 +116,9 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
         topic: str = inputs.get("topic", "")
         if not topic:
             raise ValueError("IdeationAgent requires a non-empty 'topic' in inputs")
+        last_error = inputs.get("_last_error", "")
+        if last_error:
+            self.log(f"Retrying after previous failure: {last_error}")
         logger.info("[%s] Starting ideation for topic: %s", self.stage.value, topic)
 
         # Check for cached search results (from a previous failed attempt)
@@ -147,15 +150,17 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
                 )
         else:
             # Step 1: Generate search queries
+            self.report_substep("Generating search queries...")
             queries = await self._generate_queries(topic)
             logger.info("[%s] Generated %d search queries", self.stage.value, len(queries))
 
-            # Step 2: Search literature
-            papers = await self._search_literature(queries)
+            # Step 2: Search literature + surveys in parallel
+            self.report_substep(f"Searching literature ({len(queries)} queries)...")
+            papers, survey_papers = await asyncio.gather(
+                self._search_literature(queries),
+                self._search_surveys(topic),
+            )
             logger.info("[%s] Retrieved %d papers", self.stage.value, len(papers))
-
-            # Step 2b: Search for surveys and merge
-            survey_papers = await self._search_surveys(topic)
             logger.info("[%s] Found %d survey papers", self.stage.value, len(survey_papers))
             existing_keys = {self._dedup_key(p) for p in papers}
             for sp in survey_papers:
@@ -171,7 +176,7 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
             # Step 2c2: Enrich papers from web/PwC with citation counts
             zero_cite = [p for p in papers if (p.get("citation_count", 0) or 0) == 0]
             if zero_cite:
-                self.log(f"Enriching citation counts for {len(zero_cite)} papers")
+                self.report_substep(f"Enriching citation counts ({len(zero_cite)} papers)...")
                 await self._enrich_citation_counts(zero_cite)
                 papers = self._rank_and_filter_papers(papers, topic=topic)
 
@@ -180,6 +185,7 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
             logger.info("[%s] After citation expansion: %d papers", self.stage.value, len(papers))
 
             # Step 2d: Enrich top papers with full-text PDF reading
+            self.report_substep("Downloading top papers (full-text)...")
             papers = await self._enrich_with_full_text(papers)
 
             # Step 2d2: Search coverage self-evaluation (max 2 rounds)
@@ -227,7 +233,24 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
                 logger.warning("Failed to cache search results: %s", e)
 
         # Step 3: LLM analysis -- gaps + hypotheses (with ReAct tool use)
+        self.report_substep("Analyzing gaps & generating hypotheses...")
         output = await self._analyze_and_hypothesize(topic, queries, papers)
+
+        # Step 3b: Tournament selection — pairwise comparison for better hypothesis ranking
+        hypotheses = output.hypotheses
+        if len(hypotheses) >= 2:
+            self.report_substep("Running hypothesis tournament...")
+            try:
+                winner = await self._tournament_select(hypotheses, topic)
+                if winner and winner != output.selected_hypothesis:
+                    self.log(f"Tournament changed selection: {output.selected_hypothesis} -> {winner}")
+                    output.selected_hypothesis = winner
+                    output.rationale = (
+                        f"(Tournament-selected) {output.rationale}"
+                    )
+            except Exception as e:
+                logger.warning("[%s] Tournament failed, keeping LLM's original pick: %s",
+                               self.stage.value, e)
 
         # Store must-cite titles and match to actual papers
         output.must_cites = must_cites
@@ -238,6 +261,7 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
             self.log(f"Must-cite matching: {matched_count}/{len(must_cites)} matched to papers")
 
         # Step 4: Extract quantitative evidence from paper abstracts
+        self.report_substep("Extracting quantitative evidence...")
         evidence = await self._extract_evidence(papers)
         output.evidence = evidence
         logger.info("[%s] Extracted %d metrics from literature",
@@ -248,6 +272,13 @@ class IdeationAgent(_IdeationSearchMixin, _IdeationHypothesisMixin, BaseResearch
         logger.info("[%s] Found %d reference GitHub repos",
                     self.stage.value, len(reference_repos))
         output.reference_repos = reference_repos
+
+        # Surface search warnings so downstream stages know about data gaps
+        search_warnings = getattr(self, "_search_warnings", [])
+        if search_warnings:
+            output.search_warnings = search_warnings
+            self.log(f"Search completed with {len(search_warnings)} warning(s): "
+                     + "; ".join(search_warnings[:3]))
 
         # Save output
         output_path = self.workspace.write_json(

@@ -182,6 +182,7 @@ class FigureAgent(
 
         # Generate all planned figures
         new_specs = [spec for spec in figure_plan if isinstance(spec, dict)]
+        self.report_substep(f"Generating {len(new_specs)} figures...")
 
         results = await asyncio.gather(
             *(_gen_one(spec) for spec in new_specs),

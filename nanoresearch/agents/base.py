@@ -6,8 +6,9 @@ import asyncio
 import json
 import logging
 import re
+import traceback as _tb_mod
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Callable
 
 from nanoresearch.config import ResearchConfig, StageModelConfig
 from nanoresearch.exceptions import LLMError
@@ -50,6 +51,15 @@ class BaseResearchAgent(ABC):
         self.workspace = workspace
         self.config = config
         self._dispatcher = ModelDispatcher(config)
+        self._substep_callback: Callable[[str], None] | None = None
+
+    def report_substep(self, msg: str) -> None:
+        """Report a sub-step progress update (e.g. 'Searching paper 3/10')."""
+        if self._substep_callback is not None:
+            try:
+                self._substep_callback(msg)
+            except Exception:
+                pass  # progress is cosmetic, never crash
 
     def _remember_mutation_snapshot_entry(self, entry: dict[str, Any] | None) -> None:
         self._last_mutation_snapshot_entry = dict(entry) if isinstance(entry, dict) else None
@@ -142,6 +152,8 @@ class BaseResearchAgent(ABC):
             f"Raw output starts with: {raw[:200]!r}"
         ) from None
 
+    _MAX_JSON_RETRIES = 3
+
     async def generate_json_validated(
         self,
         system_prompt: str,
@@ -151,35 +163,38 @@ class BaseResearchAgent(ABC):
     ) -> Any:
         """Call LLM, parse as JSON, and validate against a Pydantic model.
 
-        On validation failure, feeds the error back to the LLM for one retry.
+        On validation failure, feeds accumulated errors back for up to 3 retries.
         Returns a validated Pydantic model instance.
         """
-        raw_dict = await self.generate_json(
-            system_prompt, user_prompt, stage_override=stage_override,
-        )
-        try:
-            return model_class.model_validate(raw_dict)
-        except Exception as first_exc:
-            # Single retry: feed validation error back to LLM
-            self.log(f"  JSON schema validation failed: {first_exc}, retrying...")
-            retry_prompt = (
-                f"Your previous JSON response had validation errors:\n"
-                f"{first_exc}\n\n"
-                f"Original request:\n{user_prompt}\n\n"
-                f"Fix the JSON to match the required schema and try again."
-            )
+        error_history: list[str] = []
+        prompt = user_prompt
+
+        for attempt in range(1 + self._MAX_JSON_RETRIES):
             try:
                 raw_dict = await self.generate_json(
-                    system_prompt, retry_prompt, stage_override=stage_override,
+                    system_prompt, prompt, stage_override=stage_override,
                 )
                 return model_class.model_validate(raw_dict)
-            except Exception as retry_exc:
-                logger.error(
-                    "JSON validation failed after retry: %s", retry_exc,
+            except Exception as exc:
+                error_history.append(f"Attempt {attempt + 1}: {exc}")
+                self.log(f"  JSON validation failed (attempt {attempt + 1}/{1 + self._MAX_JSON_RETRIES}): {exc}")
+
+                if attempt >= self._MAX_JSON_RETRIES:
+                    logger.error("JSON validation failed after %d retries: %s", self._MAX_JSON_RETRIES, exc)
+                    raise LLMError(
+                        f"JSON schema validation failed after {self._MAX_JSON_RETRIES} retries:\n"
+                        + "\n".join(error_history)
+                    ) from exc
+
+                # Build retry prompt with ALL accumulated errors
+                prompt = (
+                    f"Your previous JSON responses had validation errors:\n"
+                    + "\n".join(f"  - {e}" for e in error_history)
+                    + f"\n\nOriginal request:\n{user_prompt}\n\n"
+                    f"Fix the JSON to match the required schema and try again."
                 )
-                raise LLMError(
-                    f"JSON schema validation failed after retry: {retry_exc}"
-                ) from retry_exc
+
+        raise RuntimeError("Unreachable")  # pragma: no cover
 
     async def generate_with_tools(
         self,
@@ -238,11 +253,19 @@ class BaseResearchAgent(ABC):
                     args = {}
 
                 self.log(f"Tool call: {name}({args})")
+                self.report_substep(f"Tool: {name}")
                 try:
                     result = await tools.call(name, args)
                     result_str = json.dumps(result, ensure_ascii=False, default=str)
+                    status = "success"
                 except Exception as e:
-                    error_str = f"Error: {type(e).__name__}: {e}"
+                    # Structured error with traceback (EvoScientist pattern)
+                    tb = _tb_mod.format_exc()
+                    logger.error("Tool %r raised an exception:\n%s", name, tb)
+                    error_str = (
+                        f"[TOOL ERROR] Tool '{name}' failed with {type(e).__name__}: {e}\n\n"
+                        f"Traceback (most recent call last):\n{tb[-500:]}"
+                    )
                     error_sig = type(e).__name__
                     try:
                         args_hash = hash(json.dumps(args, sort_keys=True, default=str))
@@ -252,17 +275,22 @@ class BaseResearchAgent(ABC):
                     _failure_counts[fail_key] = _failure_counts.get(fail_key, 0) + 1
                     if _failure_counts[fail_key] >= _MAX_IDENTICAL_FAILURES:
                         error_str = (
-                            f"[NON-RETRYABLE] {error_str} — "
+                            f"[NON-RETRYABLE] {error_str}\n\n"
                             f"This exact call has failed {_failure_counts[fail_key]} times. "
-                            f"Do NOT retry with the same arguments. Try a different query or approach."
+                            f"Do NOT retry with the same arguments. Try a different approach."
                         )
                     result_str = error_str
+                    status = "error"
 
                 result_content = _truncate_tool_result(result_str)
                 return {
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result_content,
+                    # Status field (EvoScientist pattern) — allows agents
+                    # to distinguish success from error without string parsing.
+                    # Note: OpenAI API ignores extra fields; they're for internal use.
+                    "_status": status,
                 }
 
             if len(tool_calls) > 1:
@@ -305,6 +333,23 @@ class BaseResearchAgent(ABC):
     async def run(self, **inputs: Any) -> dict[str, Any]:
         """Execute this agent's stage. Returns output data dict."""
         ...
+
+    @staticmethod
+    def _inject_error_context(prompt: str, last_error: str | None) -> str:
+        """Prepend error context from a previous failed attempt to a prompt.
+
+        This lets agents adapt their behavior on retry instead of blindly
+        repeating the same approach.
+        """
+        if not last_error:
+            return prompt
+        return (
+            f"[PREVIOUS ATTEMPT FAILED]\n"
+            f"The previous attempt at this stage failed with:\n"
+            f"  {last_error}\n"
+            f"Adapt your approach to avoid the same failure.\n\n"
+            f"{prompt}"
+        )
 
     def log(self, msg: str) -> None:
         logger.info(f"[{self.stage.value}] {msg}")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Any
@@ -31,86 +32,76 @@ from nanoresearch.agents.ideation import (
 class _IdeationSearchMixin:
     """Mixin with literature search, filtering, and citation-expansion methods."""
 
-    async def _search_literature(self, queries: list[str]) -> list[dict]:
-        all_papers: dict[str, dict] = {}
+    def __init_search_warnings(self) -> None:
+        if not hasattr(self, "_search_warnings"):
+            self._search_warnings: list[str] = []
 
-        if not queries:
-            self.log("No search queries available, skipping literature search")
+    # ── safe wrappers for parallel search ──
+
+    async def _search_oa_safe(self, search_oa, query: str, max_results: int = MAX_RESULTS_PER_SEARCH) -> list[dict]:
+        self.__init_search_warnings()
+        try:
+            results = await search_oa(query, max_results=max_results)
+            if results:
+                logger.debug("[%s] OpenAlex returned %d results for '%s'",
+                             self.stage.value, len(results), query[:60])
+            return results or []
+        except Exception as e:
+            self._search_warnings.append(f"OpenAlex failed for '{query[:60]}': {e}")
+            logger.warning("[%s] OpenAlex search failed for '%s': %s", self.stage.value, query, e)
             return []
 
-        search_arxiv = await _get_arxiv_search()
-        search_oa = await _get_oa_search()
-        success_count = 0
+    async def _search_arxiv_safe(self, search_arxiv, query: str) -> list[dict]:
+        self.__init_search_warnings()
+        try:
+            results = await search_arxiv(
+                query, max_results=MAX_RESULTS_PER_SEARCH,
+                categories=["cs.LG", "cs.AI", "cs.CV", "cs.CL",
+                            "q-bio.BM", "q-bio.QM", "physics.chem-ph",
+                            "cond-mat.mtrl-sci", "stat.ML"],
+            )
+            return results or []
+        except Exception as e:
+            self._search_warnings.append(f"arXiv failed for '{query[:60]}': {e}")
+            logger.warning("[%s] arXiv search failed for '%s': %s", self.stage.value, query, e)
+            return []
 
-        for query in queries[:MAX_SEARCH_QUERIES]:
-            if not query or not query.strip():
-                continue
-
-            if search_oa:
-                try:
-                    oa_results = await search_oa(query, max_results=MAX_RESULTS_PER_SEARCH)
-                    for p in oa_results:
-                        key = self._dedup_key(p)
-                        if key and key not in all_papers:
-                            all_papers[key] = p
-                    if oa_results:
-                        success_count += 1
-                        logger.debug("[%s] OpenAlex returned %d results for '%s'",
-                                     self.stage.value, len(oa_results), query[:60])
-                except Exception as e:
-                    logger.warning("[%s] OpenAlex search failed for '%s': %s",
-                                   self.stage.value, query, e)
-
-            try:
-                arxiv_results = await search_arxiv(
-                    query, max_results=MAX_RESULTS_PER_SEARCH,
-                    categories=["cs.LG", "cs.AI", "cs.CV", "cs.CL",
-                                "q-bio.BM", "q-bio.QM", "physics.chem-ph",
-                                "cond-mat.mtrl-sci", "stat.ML"],
-                )
-                for p in arxiv_results:
-                    key = self._dedup_key(p)
-                    if key and key not in all_papers:
-                        all_papers[key] = p
-                if arxiv_results:
-                    success_count += 1
-            except Exception as e:
-                logger.warning("[%s] arXiv search failed for '%s': %s",
-                               self.stage.value, query, e)
-
-        if success_count == 0 and queries:
-            logger.warning("[%s] All search queries failed, literature coverage may be poor",
-                           self.stage.value)
-
+    async def _search_web_safe(self, queries: list[str]) -> list[dict]:
+        """Web search for academic papers — safe wrapper."""
+        papers: list[dict] = []
         try:
             from mcp_server.tools.web_search import search_web
-            for query in queries[:2]:
+            for query in queries:
                 web_results = await search_web(f"academic paper {query}", max_results=5)
                 for wr in web_results:
                     title = wr.get("title", "").strip()
-                    paper_dict = {
-                        "title": title,
-                        "url": wr.get("url", ""),
-                        "abstract": wr.get("snippet", ""),
-                        "authors": [],
-                        "year": None,
-                        "citation_count": 0,
-                    }
                     url_lower = wr.get("url", "").lower()
                     is_academic = any(
                         domain in url_lower
                         for domain in ("arxiv", "semanticscholar", "acl", "openreview",
                                        "neurips", "icml", "iclr", "aaai", "ieee", "acm")
                     )
-                    key = self._dedup_key(paper_dict)
-                    if key and key not in all_papers and is_academic:
-                        all_papers[key] = paper_dict
+                    if is_academic and title:
+                        papers.append({
+                            "title": title,
+                            "url": wr.get("url", ""),
+                            "abstract": wr.get("snippet", ""),
+                            "authors": [],
+                            "year": None,
+                            "citation_count": 0,
+                        })
         except Exception as e:
+            self.__init_search_warnings()
+            self._search_warnings.append(f"Web search failed: {e}")
             logger.info("[%s] Web search supplementation skipped: %s", self.stage.value, e)
+        return papers
 
+    async def _search_pwc_safe(self, queries: list[str]) -> list[dict]:
+        """PapersWithCode search — safe wrapper."""
+        papers: list[dict] = []
         try:
             from mcp_server.tools.paperswithcode import search_tasks
-            for query in queries[:2]:
+            for query in queries:
                 pwc_tasks = await search_tasks(query)
                 for task in pwc_tasks[:3]:
                     task_name = task.get("name", "")
@@ -121,7 +112,7 @@ class _IdeationSearchMixin:
                         title = (paper.get("title", "") or "").strip()
                         if not title:
                             continue
-                        paper_dict = {
+                        papers.append({
                             "title": title,
                             "url": paper.get("url", ""),
                             "abstract": paper.get("abstract", ""),
@@ -129,30 +120,75 @@ class _IdeationSearchMixin:
                             "year": paper.get("year"),
                             "citation_count": 0,
                             "source": "paperswithcode",
-                        }
-                        key = self._dedup_key(paper_dict)
-                        if key and key not in all_papers:
-                            all_papers[key] = paper_dict
+                        })
         except Exception as e:
             logger.info("[%s] PapersWithCode search skipped: %s", self.stage.value, e)
+        return papers
+
+    # ── main search (parallelized) ──
+
+    async def _search_literature(self, queries: list[str]) -> list[dict]:
+        all_papers: dict[str, dict] = {}
+
+        if not queries:
+            self.log("No search queries available, skipping literature search")
+            return []
+
+        search_arxiv = await _get_arxiv_search()
+        search_oa = await _get_oa_search()
+
+        # Phase 1: All academic searches concurrently
+        # Rate limiters inside each search function handle throttling.
+        academic_tasks = []
+        valid_queries = [q for q in queries[:MAX_SEARCH_QUERIES] if q and q.strip()]
+        for query in valid_queries:
+            if search_oa:
+                academic_tasks.append(self._search_oa_safe(search_oa, query))
+            academic_tasks.append(self._search_arxiv_safe(search_arxiv, query))
+
+        academic_results = await asyncio.gather(*academic_tasks, return_exceptions=True)
+        success_count = 0
+        for result in academic_results:
+            if isinstance(result, list):
+                for p in result:
+                    key = self._dedup_key(p)
+                    if key and key not in all_papers:
+                        all_papers[key] = p
+                if result:
+                    success_count += 1
+
+        if success_count == 0 and valid_queries:
+            logger.warning("[%s] All search queries failed, literature coverage may be poor",
+                           self.stage.value)
+
+        # Phase 2: Web + PwC in parallel
+        web_task = self._search_web_safe(valid_queries[:2])
+        pwc_task = self._search_pwc_safe(valid_queries[:2])
+        supplementary = await asyncio.gather(web_task, pwc_task, return_exceptions=True)
+        for result in supplementary:
+            if isinstance(result, list):
+                for p in result:
+                    key = self._dedup_key(p)
+                    if key and key not in all_papers:
+                        all_papers[key] = p
 
         return list(all_papers.values())
 
     async def _search_surveys(self, topic: str) -> list[dict]:
         survey_queries = [f"survey {topic}", f"review {topic}", f"comprehensive overview {topic}"]
-        survey_papers: dict[str, dict] = {}
         search_oa = await _get_oa_search()
-        for q in survey_queries:
-            if search_oa:
-                try:
-                    oa_results = await search_oa(q, max_results=5)
-                    for p in oa_results:
-                        key = self._dedup_key(p)
-                        if key and key not in survey_papers:
-                            survey_papers[key] = p
-                except Exception as e:
-                    logger.warning("[%s] OpenAlex survey search failed for '%s': %s",
-                                   self.stage.value, q, e)
+        if not search_oa:
+            return []
+        # Run all survey queries in parallel
+        tasks = [self._search_oa_safe(search_oa, q, max_results=5) for q in survey_queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        survey_papers: dict[str, dict] = {}
+        for result in results:
+            if isinstance(result, list):
+                for p in result:
+                    key = self._dedup_key(p)
+                    if key and key not in survey_papers:
+                        survey_papers[key] = p
         return list(survey_papers.values())
 
     @staticmethod
@@ -338,7 +374,9 @@ class _IdeationSearchMixin:
             reverse=True,
         )[:top_k]
 
-        for p in candidates:
+        sem = asyncio.Semaphore(3)  # limit concurrent PDF downloads
+
+        async def _download_one(p: dict) -> None:
             pdf_url = p.get("pdf_url", "")
             if not pdf_url:
                 url = p.get("url", "")
@@ -347,18 +385,21 @@ class _IdeationSearchMixin:
                     if not pdf_url.endswith(".pdf"):
                         pdf_url += ".pdf"
             if not pdf_url:
-                continue
-            try:
-                logger.info("[%s] Downloading PDF: %s...",
-                            self.stage.value, p.get("title", "Unknown")[:60])
-                extraction = await download_and_extract(pdf_url, max_pages=20)
-                p["method_text"] = extraction.get("method_text", "")
-                p["experiment_text"] = extraction.get("experiment_text", "")
-                p["full_text_available"] = True
-                logger.info("[%s]   Extracted %d chars",
-                            self.stage.value, len(extraction.get("full_text", "")))
-            except Exception as e:
-                logger.warning("[%s]   PDF extraction failed: %s", self.stage.value, e)
+                return
+            async with sem:
+                try:
+                    logger.info("[%s] Downloading PDF: %s...",
+                                self.stage.value, p.get("title", "Unknown")[:60])
+                    extraction = await download_and_extract(pdf_url, max_pages=20)
+                    p["method_text"] = extraction.get("method_text", "")
+                    p["experiment_text"] = extraction.get("experiment_text", "")
+                    p["full_text_available"] = True
+                    logger.info("[%s]   Extracted %d chars",
+                                self.stage.value, len(extraction.get("full_text", "")))
+                except Exception as e:
+                    logger.warning("[%s]   PDF extraction failed: %s", self.stage.value, e)
+
+        await asyncio.gather(*[_download_one(p) for p in candidates])
         return papers
 
     async def _evaluate_search_coverage(self, topic: str, papers: list[dict]) -> dict:

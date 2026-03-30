@@ -53,6 +53,11 @@ class _WorkspaceExportMixin:
         _copy_if_exists(self.drafts_dir / "paper.tex", dest / "paper.tex")
         _copy_if_exists(self.drafts_dir / "references.bib", dest / "references.bib")
 
+        # Copy LaTeX style files (.sty/.cls/.bst) needed for compilation
+        for ext in ("*.sty", "*.cls", "*.bst"):
+            for f in self.drafts_dir.glob(ext):
+                _copy_if_exists(f, dest / f.name)
+
         # Copy figures
         fig_dest = dest / "figures"
         if self.figures_dir.exists() and any(self.figures_dir.iterdir()):

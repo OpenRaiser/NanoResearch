@@ -351,4 +351,42 @@ def build_experiment_tools(
         handler=_cp,
     ))
 
+    # ── Think Tool: structured reflection at decision points ──
+    registry.register(ToolDefinition(
+        name="think",
+        description=(
+            "Structured reflection tool. Use at key decision points to reason "
+            "through your approach BEFORE acting. Call this when:\n"
+            "- Before starting: What do I know? What's the plan?\n"
+            "- After results: What did I learn? Is this expected?\n"
+            "- Choosing between options: What are the trade-offs?\n"
+            "- When stuck: What went wrong? What should I try differently?\n"
+            "- Before concluding: Is the evidence sufficient?\n"
+            "The thought is recorded but no action is taken."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "thought": {
+                    "type": "string",
+                    "description": (
+                        "Your structured reflection. Consider: "
+                        "(1) Progress — what's done, what remains; "
+                        "(2) Evidence quality — would a reviewer accept this?; "
+                        "(3) Strategy — continue, adjust, or pivot?; "
+                        "(4) Resources — runtime estimate, memory constraints."
+                    ),
+                },
+            },
+            "required": ["thought"],
+        },
+        handler=_think,
+    ))
+
     return registry
+
+
+async def _think(thought: str, **_kwargs: Any) -> dict[str, Any]:
+    """Record a structured thought. No side effects — just confirms receipt."""
+    logger.info("[THINK] %s", thought[:200])
+    return {"status": "recorded", "thought_length": len(thought)}

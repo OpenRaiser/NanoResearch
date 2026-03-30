@@ -24,13 +24,21 @@ from lark_oapi.api.im.v1 import (
 )
 
 from nanoresearch.config import ResearchConfig
-from nanoresearch.pipeline.orchestrator import PipelineOrchestrator
+from nanoresearch.pipeline.unified_orchestrator import UnifiedPipelineOrchestrator
 from nanoresearch.pipeline.workspace import Workspace
+from nanoresearch.schemas.manifest import PaperMode, PipelineMode, PipelineStage
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ROOT = Path.home() / ".nanoresearch" / "workspace" / "research"
 _CHAT_MEMORY_DIR = Path.home() / ".nanoresearch" / "chat_memory"
+_TASKS_FILE = Path.home() / ".nanoresearch" / "feishu_tasks.json"
+
+# Deep pipeline stages for progress summary
+_DEEP_STAGES = [
+    "ideation", "planning", "setup", "coding", "execution",
+    "analysis", "figure_gen", "writing", "review",
+]
 
 
 class _FeishuBotHandlersMixin:
@@ -49,14 +57,16 @@ class _FeishuBotHandlersMixin:
             "  「记住我偏好用 PyTorch」\n\n"
             "命令列表：\n"
             "  /run <主题>  — 启动研究 pipeline\n"
+            "  /resume     — 恢复上次中断/失败的任务\n"
             "  /status     — 查看当前任务状态\n"
             "  /list       — 列出所有历史会话\n"
             "  /stop       — 停止当前正在运行的任务\n"
             "  /export     — 重新导出最近的研究结果\n"
             "  /new        — 清除对话记忆，开始新对话\n"
             "  /help       — 显示此帮助\n\n"
-            "Pipeline 阶段：\n"
-            "  IDEATION → PLANNING → EXPERIMENT → FIGURE_GEN → WRITING → REVIEW\n"
+            "Pipeline 阶段 (Deep 9-stage)：\n"
+            "  IDEATION → PLANNING → SETUP → CODING → EXECUTION\n"
+            "  → ANALYSIS → FIGURE_GEN → WRITING → REVIEW\n"
             "完成后会自动推送 paper.pdf。"
         )
         self.reply_message(message_id, help_text)
@@ -207,6 +217,177 @@ class _FeishuBotHandlersMixin:
         except Exception as e:
             self.send_message(chat_id, f"导出失败: {e}")
 
+    # ─── task persistence ───
+
+    def _save_tasks(self) -> None:
+        """Persist running tasks to disk for resume on restart."""
+        with self._lock:
+            serializable = {}
+            for chat_id, task in self._running_tasks.items():
+                serializable[chat_id] = {
+                    "topic": task.get("topic", ""),
+                    "status": task.get("status", ""),
+                    "workspace": task.get("workspace", ""),
+                    "env_name": task.get("env_name", ""),
+                }
+        try:
+            _TASKS_FILE.parent.mkdir(parents=True, exist_ok=True)
+            _TASKS_FILE.write_text(
+                json.dumps(serializable, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError as e:
+            logger.warning("Failed to save task state: %s", e)
+
+    @staticmethod
+    def _load_tasks() -> dict[str, dict]:
+        """Load saved task state from disk."""
+        if not _TASKS_FILE.is_file():
+            return {}
+        try:
+            return json.loads(_TASKS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+
+    def _find_resumable_workspace(self) -> Path | None:
+        """Find the most recent incomplete workspace."""
+        if not _DEFAULT_ROOT.is_dir():
+            return None
+        try:
+            dirs_by_mtime = sorted(
+                [p for p in _DEFAULT_ROOT.iterdir() if p.is_dir()],
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return None
+        for session_dir in dirs_by_mtime:
+            manifest_path = session_dir / "manifest.json"
+            if manifest_path.is_file():
+                try:
+                    data = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    stage = (data.get("current_stage") or "").lower()
+                    if stage not in ("done",):
+                        return session_dir
+                except (json.JSONDecodeError, OSError):
+                    continue
+        return None
+
+    # ─── /resume command ───
+
+    def _cmd_resume(self, chat_id: str, message_id: str) -> None:
+        """Resume the most recent failed/interrupted pipeline."""
+        # Check if already running
+        with self._lock:
+            task = self._running_tasks.get(chat_id)
+            if task and task.get("status") not in ("completed", "failed", "stopped", "interrupted"):
+                self.reply_message(message_id, f"任务正在运行中: {task.get('topic', '?')[:50]}")
+                return
+
+        # Try to find a resumable workspace
+        ws_path = None
+
+        # 1. Check in-memory task
+        if task and task.get("workspace"):
+            ws_path = Path(task["workspace"])
+            if not ws_path.exists():
+                ws_path = None
+
+        # 2. Check disk-saved tasks
+        if ws_path is None:
+            saved = self._load_tasks()
+            saved_task = saved.get(chat_id)
+            if saved_task and saved_task.get("workspace"):
+                candidate = Path(saved_task["workspace"])
+                if candidate.exists():
+                    ws_path = candidate
+
+        # 3. Find most recent incomplete workspace
+        if ws_path is None:
+            ws_path = self._find_resumable_workspace()
+
+        if ws_path is None or not ws_path.exists():
+            self.reply_message(message_id, "没有找到可恢复的任务。")
+            return
+
+        try:
+            ws = Workspace.load(ws_path)
+            manifest = ws.manifest
+        except Exception as e:
+            self.reply_message(message_id, f"无法加载工作目录: {e}")
+            return
+
+        if manifest.current_stage == PipelineStage.DONE:
+            self.reply_message(message_id, "该任务已完成，无需恢复。")
+            return
+
+        # Reset failed stages
+        if manifest.current_stage == PipelineStage.FAILED:
+            for stage_name, rec in manifest.stages.items():
+                if rec.status == "failed":
+                    rec.status = "pending"
+                    manifest.current_stage = rec.stage
+                    ws.update_manifest(
+                        current_stage=manifest.current_stage,
+                        stages=manifest.stages,
+                    )
+                    break
+
+        self.reply_message(
+            message_id,
+            f"恢复任务\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"主题: {manifest.topic}\n"
+            f"当前阶段: {manifest.current_stage.value}\n"
+            f"工作目录: {ws_path}"
+        )
+
+        env_name = ""
+        if task:
+            env_name = task.get("env_name", "")
+
+        with self._lock:
+            self._running_tasks[chat_id] = {
+                "topic": manifest.topic,
+                "status": "starting",
+                "cancel": False,
+                "workspace": str(ws_path),
+                "env_name": env_name,
+            }
+        self._save_tasks()
+
+        thread = threading.Thread(
+            target=self._run_resume_thread,
+            args=(chat_id, ws_path, env_name),
+            daemon=True,
+        )
+        with self._lock:
+            self._pipeline_threads[chat_id] = thread
+        thread.start()
+
+    def _run_resume_thread(self, chat_id: str, ws_path: Path, env_name: str = "") -> None:
+        """Resume pipeline in a background thread."""
+        loop = asyncio.new_event_loop()
+        with self._lock:
+            self._pipeline_loops[chat_id] = loop
+        try:
+            loop.run_until_complete(
+                self._run_pipeline_async(chat_id, "", env_name, resume_path=ws_path)
+            )
+        except Exception as e:
+            logger.exception("Resume pipeline thread crashed: %s", e)
+            if not self._shutting_down:
+                self.send_message(chat_id, f"恢复 Pipeline 异常退出: {e}")
+            with self._lock:
+                if chat_id in self._running_tasks:
+                    self._running_tasks[chat_id]["status"] = "failed"
+            self._save_tasks()
+        finally:
+            loop.close()
+            with self._lock:
+                self._pipeline_loops.pop(chat_id, None)
+                self._pipeline_threads.pop(chat_id, None)
+
     @staticmethod
     def _discover_conda_envs() -> tuple[list[dict[str, str]], bool]:
         import subprocess
@@ -326,12 +507,13 @@ class _FeishuBotHandlersMixin:
                 "cancel": False,
                 "env_name": env_name,
             }
+        self._save_tasks()
 
         self.reply_message(
             message_id,
             f"收到！开始研究:\n{topic}\n\n"
             f"实验环境: {env_name or '自动创建'}\n"
-            f"Pipeline 已启动，我会在每个阶段结束时汇报进度。"
+            f"Pipeline 已启动（Deep 9-stage），我会在每个阶段结束时汇报进度。"
         )
 
         memory = self._get_memory(chat_id)
@@ -362,23 +544,39 @@ class _FeishuBotHandlersMixin:
             with self._lock:
                 if chat_id in self._running_tasks:
                     self._running_tasks[chat_id]["status"] = "failed"
+            self._save_tasks()
         finally:
             loop.close()
             with self._lock:
                 self._pipeline_loops.pop(chat_id, None)
                 self._pipeline_threads.pop(chat_id, None)
 
-    async def _run_pipeline_async(self, chat_id: str, topic: str, env_name: str = "") -> None:
+    async def _run_pipeline_async(
+        self, chat_id: str, topic: str, env_name: str = "",
+        resume_path: Path | None = None,
+    ) -> None:
         config = ResearchConfig.load()
         if env_name:
             config = config.model_copy(update={"experiment_conda_env": env_name})
             logger.info("Pipeline 使用用户选择的 conda 环境: %s", env_name)
-        workspace = Workspace.create(topic=topic, config_snapshot=config.snapshot())
+
+        if resume_path is not None:
+            workspace = Workspace.load(resume_path)
+            topic = workspace.manifest.topic
+        else:
+            workspace = Workspace.create(
+                topic=topic,
+                config_snapshot=config.snapshot(),
+                pipeline_mode=PipelineMode.DEEP,
+                paper_mode=PaperMode.from_string(topic),
+            )
 
         with self._lock:
             if chat_id in self._running_tasks:
                 self._running_tasks[chat_id]["workspace"] = str(workspace.path)
                 self._running_tasks[chat_id]["status"] = "running"
+                self._running_tasks[chat_id]["topic"] = topic
+        self._save_tasks()
 
         self.send_message(
             chat_id,
@@ -387,9 +585,12 @@ class _FeishuBotHandlersMixin:
         )
 
         stage_start_time: float = 0
+        stage_states: dict[str, str] = {s: "pending" for s in _DEEP_STAGES}
+        last_substep_time: float = 0
 
         def progress_callback(stage: str, status: str, message: str) -> None:
-            nonlocal stage_start_time
+            nonlocal stage_start_time, last_substep_time
+
             with self._lock:
                 task = self._running_tasks.get(chat_id, {})
                 if task.get("cancel"):
@@ -397,16 +598,41 @@ class _FeishuBotHandlersMixin:
                     raise KeyboardInterrupt("用户请求停止")
                 task["status"] = f"{stage} - {status}"
 
+            if status == "substep":
+                # Throttle substep messages (max 1 per 10 seconds)
+                now = time.monotonic()
+                if now - last_substep_time >= 10:
+                    last_substep_time = now
+                    self.send_message(chat_id, f"  {stage}: {message}")
+                return
+
             if status == "started":
                 stage_start_time = time.monotonic()
+                stage_states[stage] = "running"
                 self.send_message(chat_id, f">>> 开始 {stage}...")
             elif status == "completed":
                 elapsed = time.monotonic() - stage_start_time if stage_start_time else 0
-                self.send_message(chat_id, f"<<< {stage} 完成 ({elapsed:.0f}s)")
+                stage_states[stage] = "completed"
+                # Build progress summary
+                summary_lines = []
+                for s in _DEEP_STAGES:
+                    st = stage_states.get(s, "pending")
+                    icon = {"completed": "OK", "running": ">>", "failed": "!!"}.get(st, "--")
+                    summary_lines.append(f"  {icon} {s}")
+                progress_text = "\n".join(summary_lines)
+                self.send_message(
+                    chat_id,
+                    f"<<< {stage} 完成 ({elapsed:.0f}s)\n\n{progress_text}"
+                )
             elif status == "retrying":
+                stage_states[stage] = "retrying"
                 self.send_message(chat_id, f"!!! {stage} 重试中: {message}")
+            elif status == "skipped":
+                stage_states[stage] = "completed"
 
-        orchestrator = PipelineOrchestrator(workspace, config, progress_callback=progress_callback)
+        orchestrator = UnifiedPipelineOrchestrator(
+            workspace, config, progress_callback=progress_callback,
+        )
 
         try:
             result = await orchestrator.run(topic)
@@ -415,6 +641,7 @@ class _FeishuBotHandlersMixin:
             with self._lock:
                 if chat_id in self._running_tasks:
                     self._running_tasks[chat_id]["status"] = "completed"
+            self._save_tasks()
 
             try:
                 export_path = workspace.export()
@@ -455,6 +682,7 @@ class _FeishuBotHandlersMixin:
             with self._lock:
                 if chat_id in self._running_tasks:
                     self._running_tasks[chat_id]["status"] = "failed"
+            self._save_tasks()
             self.send_message(chat_id, f"Pipeline 失败: {e}")
 
     # ─── file upload ───

@@ -70,6 +70,8 @@ class _FeishuBotCoreMixin:
         self._pipeline_loops = {}
         self._shutting_down = False
         self._pending_env_select = {}
+        # Load persisted tasks and mark running ones as interrupted
+        self._load_interrupted_tasks()
         self._chat_model_config = StageModelConfig(
             model=self._config.ideation.model,
             temperature=0.3,
@@ -77,6 +79,18 @@ class _FeishuBotCoreMixin:
             base_url=self._config.ideation.base_url,
             api_key=self._config.ideation.api_key,
         )
+
+    def _load_interrupted_tasks(self) -> None:
+        """Load saved tasks from disk; mark any 'running' tasks as 'interrupted'."""
+        from nanoresearch.feishu_bot_handlers import _FeishuBotHandlersMixin
+        saved = _FeishuBotHandlersMixin._load_tasks()
+        for chat_id, task in saved.items():
+            if task.get("status") in ("running", "starting"):
+                task["status"] = "interrupted"
+                task["cancel"] = False
+                self._running_tasks[chat_id] = task
+                logger.info("Found interrupted task for chat %s: %s",
+                            chat_id, task.get("topic", "?")[:50])
 
     # ─── lifecycle ───
 
@@ -207,6 +221,21 @@ class _FeishuBotCoreMixin:
                     raw[:100], text[:100], text.encode('unicode_escape').decode()[:200], chat_id)
         lower = text.lower()
 
+        # Detect interrupted tasks from previous bot session
+        with self._lock:
+            task = self._running_tasks.get(chat_id)
+        if task and task.get("status") == "interrupted":
+            self.reply_message(
+                message_id,
+                f"发现上次未完成的任务:\n"
+                f"主题: {task.get('topic', '?')}\n"
+                f"工作目录: {task.get('workspace', 'N/A')}\n\n"
+                f"发送 /resume 恢复，或 /stop 取消。"
+            )
+            with self._lock:
+                task["status"] = "notified"  # only prompt once
+            return
+
         with self._lock:
             pending = self._pending_env_select.get(chat_id)
         if pending:
@@ -216,6 +245,7 @@ class _FeishuBotCoreMixin:
         _SLASH_CMDS = {
             "/help": "help", "/status": "status", "/list": "list",
             "/stop": "stop", "/export": "export", "/new": "new",
+            "/resume": "resume",
         }
         first_word = lower.split()[0] if lower.split() else ""
         cmd = _SLASH_CMDS.get(lower) or _SLASH_CMDS.get(first_word)
