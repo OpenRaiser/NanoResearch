@@ -213,31 +213,6 @@ The **command-line interface (CLI)** offers both a **full-screen TUI** and **cla
 
 <a id="cli-plain-vs-tui"></a>
 
-## Table of contents
-
-- [Overview](#overview)
-- [Why NanoResearch](#why-nanoresearch)
-- [Use cases](#use-cases)
-- [Showcase](#showcase)
-- [Pipeline](#pipeline)
-- [Key capabilities](#key-capabilities)
-- [How it works](#how-it-works)
-- [Quick start](#quick-start)
-- [Claude Code Mode](#claude-code-mode)
-- [Codex Integration](#codex-integration)
-- [Execution profiles](#execution-profiles)
-- [Common CLI commands](#common-cli-commands)
-- [Output structure](#output-structure)
-- [Model routing](#model-routing)
-- [Paper formats](#paper-formats)
-- [Project structure](#project-structure)
-- [Requirements](#requirements)
-- [Notes](#notes)
-- [FAQ](#faq)
-- [Roadmap](#roadmap)
-- [Citation](#citation)
-- [License](#license)
-
 ## Overview
  
 NanoResearch is a unified research pipeline that automates the full paper-production workflow:
@@ -426,24 +401,7 @@ nanoresearch export --workspace ~/.nanobot/workspace/research/{session_id} --out
 
 ### Step 4: Expected Output
 
-After the pipeline completes, you will have paper figures and LaTeX sources backed by real experiment data. Example outputs:
-
-<table>
-  <tr>
-    <td align="center" width="33%">
-      <img src="imgs/recognition_1.jpg" width="95%" alt="Experimental Results"/>
-      <br /><sub><b>Experimental Results</b></sub>
-    </td>
-    <td align="center" width="33%">
-      <img src="imgs/recognition_2.jpg" width="95%" alt="Main Results & Comparison"/>
-      <br /><sub><b>Main Results & Comparison</b></sub>
-    </td>
-    <td align="center" width="33%">
-      <img src="imgs/recognition_3.jpg" width="95%" alt="Ablation & Visualization"/>
-      <br /><sub><b>Ablation & Visualization</b></sub>
-    </td>
-  </tr>
-</table>
+After the pipeline completes, you will have paper figures and LaTeX sources backed by real experiment data.
 
 ---
 
