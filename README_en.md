@@ -887,11 +887,11 @@ Join our WeChat group for discussion, Q&A, and collaboration. Scan to join:
 ## ⭐ Star History
 
 <div align="center">
-  <a href="https://star-history.com/#OpenRaiser/NanoResearch&Date">
+  <a href="https://star-history.dera.page/#OpenRaiser/NanoResearch&Date">
     <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=OpenRaiser/NanoResearch&type=Date" width="100%" />
+      <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=OpenRaiser/NanoResearch&type=Date&theme=dark" />
+      <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=OpenRaiser/NanoResearch&type=Date" />
+      <img alt="Star History Chart" src="https://star-history.dera.page/svg?repos=OpenRaiser/NanoResearch&type=Date" width="100%" />
     </picture>
   </a>
 </div>
