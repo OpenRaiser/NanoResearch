@@ -457,6 +457,20 @@ Machine-checkable experiment artifacts are typically written to:
 
 The writing stage reads only measured execution results, analysis reports, and figure artifacts. If an experiment category or metric has no real artifact, NanoResearch narrows the evidence scope or writes it as a limitation / future-work item rather than filling in synthetic numbers. OpenAlex can be used anonymously; configure `OPENALEX_API_KEY` only when you need higher literature-search rate limits.
 
+### SDPO adapter training
+
+Completed `(x, y, feedback)` triples from Evo/RAM runs are stored under `~/.nanoresearch/ram_data/`. Install the optional training dependencies, then train or resume the RAM LoRA adapter:
+
+```bash
+pip install -e ".[sdpo]"
+nanoresearch ram-train \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --data-root ~/.nanoresearch/ram_data \
+  --output ~/.nanoresearch/adapters/ram-sdpo
+```
+
+After training, set `ram_checkpoint_path` to the output directory so subsequent Evo runs load the adapter.
+
 ---
 
 ## 🤖 Recommended Models
@@ -631,6 +645,7 @@ nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2
 | `nanoresearch config` | Print effective config with masked secrets |
 | `nanoresearch inspect --workspace ...` | Inspect saved artifacts |
 | `nanoresearch health` | Run environment/config health checks |
+| `nanoresearch ram-train` | Train or resume the RAM LoRA adapter from collected feedback |
 | `nanoresearch delete <session_id>` | Remove a saved session |
 
 ```bash
@@ -881,6 +896,7 @@ Join our WeChat group for discussion, Q&A, and collaboration. Scan to join:
 ## 🙏 Acknowledgements
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — Scientific research skills for Claude Code
+- [saadmsft/nanoresearch](https://github.com/saadmsft/nanoresearch) — Thanks for its open-source work and community contribution
 
 ---
 

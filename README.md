@@ -375,6 +375,20 @@ nanoresearch export --workspace ~/.nanoresearch/workspace/research/{session_id} 
 
 写作阶段只读取真实执行结果、分析报告和图表 artifact。若某类实验或指标没有真实产物，系统会降低证据范围或写入 limitation / future work，不会补 synthetic 数值。文献检索可匿名使用 OpenAlex；如需更高速率，可自行配置 `OPENALEX_API_KEY`。
 
+### SDPO adapter 训练
+
+Evo/RAM 运行产生的完整 `(x, y, feedback)` 三元组会保存在 `~/.nanoresearch/ram_data/`。安装可选训练依赖后，可训练或续训 RAM LoRA adapter：
+
+```bash
+pip install -e ".[sdpo]"
+nanoresearch ram-train \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --data-root ~/.nanoresearch/ram_data \
+  --output ~/.nanoresearch/adapters/ram-sdpo
+```
+
+训练完成后，将配置中的 `ram_checkpoint_path` 指向输出目录即可在后续 Evo 运行中加载该 adapter。
+
 ---
 
 ## 🤖 推荐模型
@@ -547,6 +561,7 @@ nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2
 | `nanoresearch config` | 打印当前配置（密钥已屏蔽） |
 | `nanoresearch inspect --workspace ...` | 检查工作空间产物 |
 | `nanoresearch health` | 运行环境/配置健康检查 |
+| `nanoresearch ram-train` | 使用已收集的反馈训练或续训 RAM LoRA adapter |
 | `nanoresearch delete <session_id>` | 删除指定会话 |
 
 ```bash
@@ -806,6 +821,7 @@ conda install -c conda-forge tectonic
 ## 🙏 致谢
 
 - [claude-scholar](https://github.com/Galaxy-Dawn/claude-scholar) — Claude Code 的科研技能扩展
+- [saadmsft/nanoresearch](https://github.com/saadmsft/nanoresearch) — 感谢其开源工作与社区贡献
 
 ---
 

@@ -30,6 +30,13 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "respx>=0.21.0",
 ]
+sdpo = [
+    "torch>=2.3.0",
+    "transformers>=4.46.0",
+    "peft>=0.13.0",
+    "accelerate>=1.0.0",
+    "safetensors>=0.4.0",
+]
 math = [
     "sympy>=1.12",
 ]

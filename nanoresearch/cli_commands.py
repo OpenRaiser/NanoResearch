@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -54,7 +53,6 @@ def show_config(
 ) -> None:
     """Show the current configuration (API keys are masked)."""
     config = _load_config_safe(config_path)
-    snapshot = config.snapshot()
 
     # Mask the base_url partially
     base_url = config.base_url
@@ -318,3 +316,113 @@ def select_env(
         title="Environment Selected",
         border_style="green",
     ))
+
+
+@app.command("ram-train")
+def ram_train(
+    model: str = typer.Option(
+        "Qwen/Qwen2.5-7B-Instruct",
+        "--model",
+        help="Hugging Face model name or local model path",
+    ),
+    data_root: Path = typer.Option(
+        Path.home() / ".nanoresearch" / "ram_data",
+        "--data-root",
+        help="Directory containing triples_*.jsonl",
+    ),
+    output: Path = typer.Option(
+        Path.home() / ".nanoresearch" / "adapters" / "ram-sdpo",
+        "--output",
+        "-o",
+        help="LoRA adapter output directory",
+    ),
+    subsystem: str | None = typer.Option(
+        None,
+        "--subsystem",
+        help="Optional subsystem filter: method_gen, code_impl, or paper_writing",
+    ),
+    max_steps: int = typer.Option(50, "--max-steps", min=1),
+    learning_rate: float = typer.Option(1e-4, "--learning-rate", min=1e-8),
+    max_sequence_length: int = typer.Option(2048, "--max-sequence-length", min=2),
+    max_trained_tokens: int = typer.Option(512, "--max-trained-tokens", min=1),
+    gradient_accumulation_steps: int = typer.Option(
+        1,
+        "--gradient-accumulation-steps",
+        min=1,
+    ),
+    device: str = typer.Option("auto", "--device", help="auto, cpu, cuda, or mps"),
+    dtype: str = typer.Option("bfloat16", "--dtype", help="float32, float16, or bfloat16"),
+    rank: int = typer.Option(16, "--rank", min=1),
+    alpha: int = typer.Option(32, "--alpha", min=1),
+    dropout: float = typer.Option(0.05, "--dropout", min=0.0, max=1.0),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Train or resume the RAM LoRA adapter with collected SDPO triples."""
+    _setup_logging(verbose)
+    try:
+        from nanoresearch.evolution.ram_data import RAMDataCollector
+        from nanoresearch.evolution.sdpo import (
+            SDPOConfig,
+            SDPOTrainer,
+            examples_from_triples,
+            load_model_for_sdpo,
+        )
+        from nanoresearch.evolution.sdpo_adapter import SDPOAdapterManager
+    except ImportError as exc:
+        console.print(
+            "[red]SDPO dependencies are missing.[/red] "
+            "Install them with `pip install -e \".[sdpo]\"`."
+        )
+        raise typer.Exit(1) from exc
+
+    collector = RAMDataCollector(root=data_root, enabled=True)
+    examples = examples_from_triples(collector.load_triples(subsystem))
+    if not examples:
+        console.print(f"[red]No completed SDPO triples found in:[/red] {data_root}")
+        raise typer.Exit(1)
+
+    adapter_manager = SDPOAdapterManager(output)
+    action = "Resuming" if adapter_manager.exists else "Creating"
+    console.print(Panel(
+        f"[bold]Model:[/bold] {model}\n"
+        f"[bold]Examples:[/bold] {len(examples)}\n"
+        f"[bold]Subsystem:[/bold] {subsystem or 'all'}\n"
+        f"[bold]Adapter:[/bold] {output}\n"
+        f"[bold]Action:[/bold] {action} trainable LoRA adapter",
+        title="RAM SDPO Training",
+        border_style="magenta",
+    ))
+
+    try:
+        trainable_model, tokenizer, resolved_device = load_model_for_sdpo(
+            model_name_or_path=model,
+            adapter_manager=adapter_manager,
+            device=device,
+            dtype=dtype,
+            rank=rank,
+            alpha=alpha,
+            dropout=dropout,
+        )
+        trainer = SDPOTrainer(
+            trainable_model,
+            tokenizer,
+            device=resolved_device,
+            adapter_manager=adapter_manager,
+            config=SDPOConfig(
+                learning_rate=learning_rate,
+                max_steps=max_steps,
+                max_sequence_length=max_sequence_length,
+                max_trained_tokens=max_trained_tokens,
+                gradient_accumulation_steps=gradient_accumulation_steps,
+            ),
+        )
+        summary = trainer.train(examples)
+    except (ImportError, RuntimeError, ValueError, OSError) as exc:
+        console.print(f"[red]SDPO training failed:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print_json(data={
+        "adapter_path": str(output.expanduser()),
+        "device": resolved_device,
+        **summary,
+    })
