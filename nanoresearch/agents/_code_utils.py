@@ -2,6 +2,21 @@
 
 from __future__ import annotations
 
+import re
+
+
+_THINK_BLOCK_RE = re.compile(r"<think\b[^>]*>.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+
+
+def _strip_think_blocks(content: str) -> str:
+    """Remove reasoning blocks accidentally returned with generated code.
+
+    Some model backends include ``<think>...</think>`` in their response even
+    when the caller requests code only.  Keeping those tags makes the result
+    invalid Python, so remove complete blocks before writing the file.
+    """
+    return _THINK_BLOCK_RE.sub("", content or "").strip()
+
 
 def _strip_code_fences(content: str) -> str:
     """Robustly strip markdown code fences from LLM-generated code.
