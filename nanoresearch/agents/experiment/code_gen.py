@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from nanoresearch.agents._code_utils import _strip_code_fences
+from nanoresearch.agents._code_utils import _strip_code_fences, _strip_think_blocks
 from . import (
     MAX_REFERENCE_REPOS,
     MAX_FILE_TREE_ENTRIES,
@@ -144,7 +144,7 @@ Generate the COMPLETE file content. Follow the interface contract exactly."""
         )
 
         # Robust fence stripping — handles LLM self-correction and multiple blocks
-        content = _strip_code_fences(content)
+        content = _strip_think_blocks(_strip_code_fences(content))
 
         return content
 
