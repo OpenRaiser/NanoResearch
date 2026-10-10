@@ -7,8 +7,10 @@ import json
 import logging
 from typing import Any
 
+import httpx
+
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +20,10 @@ _TIMEOUT = 30.0
 
 
 async def _search(query: str, max_results: int) -> list[dict[str, Any]]:
-    async with streamablehttp_client(
-        _ENDPOINT,
-        headers={"User-Agent": _USER_AGENT},
-        timeout=_TIMEOUT,
-        sse_read_timeout=_TIMEOUT,
+    async with httpx.AsyncClient(
+        headers={"User-Agent": _USER_AGENT}, timeout=_TIMEOUT,
+    ) as client, streamable_http_client(
+        _ENDPOINT, http_client=client,
     ) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
