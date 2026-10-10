@@ -117,7 +117,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
     },
     "search_web": {
-        "description": "Search the web using DuckDuckGo. Returns titles, URLs, and snippets.",
+        "description": "Search the web using the configured backend. Returns titles, URLs, and snippets.",
         "inputSchema": {
             "type": "object",
             "properties": {

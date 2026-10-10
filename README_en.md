@@ -616,6 +616,34 @@ The IDEATION stage uses OpenAlex and Semantic Scholar. Works without API keys (a
 | [OpenAlex](https://developers.openalex.org/) | Free | `openalex_api_key` | `OPENALEX_API_KEY` |
 | [Semantic Scholar](https://www.semanticscholar.org/product/api#api-key) | Free | `s2_api_key` | `S2_API_KEY` |
 
+### Optional Parallel web search
+
+After installing `pip install -e ".[dev]"`, select [Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)
+for the existing `search_web` tool:
+
+```bash
+export NANORESEARCH_WEB_SEARCH_PROVIDER=parallel
+python - <<'PYTHON'
+import asyncio
+from mcp_server.server import handle_tool_call
+print(asyncio.run(handle_tool_call("search_web", {
+    "query": "Python asyncio documentation", "max_results": 3,
+})))
+PYTHON
+```
+
+This uses the anonymous Streamable HTTP endpoint `https://search.parallel.ai/mcp`,
+with free Fast-mode search and no account or API key. Results retain the existing
+`title`, `url`, and `snippet` fields; `max_results` caps the returned list locally.
+Service errors and the 30-second timeout return an empty list. Free access has lower
+rate limits. This backend exposes search only, not Parallel's page-fetching tool.
+
+The setting applies to existing web-search callers, including writing and review.
+To enable web search in ideation, include `"web"` in `research.literature_sources`
+in your configuration (for example, `["openalex", "web"]`). OpenAlex remains the
+default literature source. Unset the environment variable or set it to `duckduckgo`
+to use the default web backend.
+
 ### Paper Formats
 
 Templates are auto-discovered from `nanoresearch/templates/`. Built-in formats:
