@@ -549,6 +549,32 @@ nanoresearch run --topic "Graph Foundation Models for Biology" --format neurips2
 
 ---
 
+### 可选 Parallel 网页搜索
+
+完成 `pip install -e ".[dev]"` 安装后，可为现有 `search_web` 工具启用
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp)：
+
+```bash
+export NANORESEARCH_WEB_SEARCH_PROVIDER=parallel
+python - <<'PYTHON'
+import asyncio
+from mcp_server.server import handle_tool_call
+print(asyncio.run(handle_tool_call("search_web", {
+    "query": "Python asyncio documentation", "max_results": 3,
+})))
+PYTHON
+```
+
+该后端通过 Streamable HTTP 访问匿名端点 `https://search.parallel.ai/mcp`，
+提供免费的 Fast 模式搜索，无需账户或 API key。返回值保留 `title`、`url`、
+`snippet` 字段；`max_results` 在本地限制返回数量。服务出错或超过 30 秒时
+返回空列表。免费访问有较低的速率限制；此后端仅提供搜索，不包含网页抓取工具。
+
+此设置适用于现有网页搜索调用，包括写作和审稿。若要在 ideation 阶段使用，
+请在配置的 `research.literature_sources` 中加入 `"web"`，例如
+`["openalex", "web"]`。默认文献来源仍为 OpenAlex。取消此环境变量或设置为
+`duckduckgo` 即可使用默认网页搜索后端。
+
 ## 💻 CLI 参考
 
 | 命令 | 用途 |

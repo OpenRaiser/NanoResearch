@@ -1,4 +1,4 @@
-"""Web search tool using duckduckgo_search library.
+"""Web search with DuckDuckGo by default and an opt-in Parallel MCP backend.
 
 The original HTML scraping approach was blocked by DuckDuckGo's CAPTCHA.
 This uses the `duckduckgo_search` (ddgs) package which works reliably.
@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from mcp_server.utils import RateLimiter
@@ -18,7 +19,7 @@ _limiter = RateLimiter(calls_per_second=1.0)
 
 
 async def search_web(query: str, max_results: int = 10) -> list[dict[str, Any]]:
-    """Search the web via DuckDuckGo.
+    """Search the web using the selected backend.
 
     Args:
         query: Search query string.
@@ -27,6 +28,13 @@ async def search_web(query: str, max_results: int = 10) -> list[dict[str, Any]]:
     Returns:
         List of dicts with keys: title, url, snippet.
     """
+    provider = os.environ.get("NANORESEARCH_WEB_SEARCH_PROVIDER", "duckduckgo").strip().lower()
+    if provider == "parallel":
+        from mcp_server.tools.parallel_search import search_parallel
+        return await search_parallel(query, max_results)
+    if provider != "duckduckgo":
+        raise ValueError(f"Unknown web search provider: {provider!r}")
+
     await _limiter.acquire()
 
     try:
